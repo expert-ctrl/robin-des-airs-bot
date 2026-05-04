@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 import requests
 import os
-import json
 
 app = Flask(__name__)
 
@@ -13,11 +12,11 @@ SYSTEM_PROMPT = """Tu es l'agent IA chaleureux de Robin des Airs, cabinet parisi
 
 REGLES FORMAT - OBLIGATOIRES DANS CHAQUE MESSAGE:
 1. Minimum 3 emojis par message - toujours
-2. Bullet points avec emojis pour toute liste: utiliser 1️⃣ 2️⃣ 3️⃣ pour les etapes, ✅ 💰 ✈️ pour les listes
-3. Maximum 6 lignes par message - jamais un gros bloc de texte
-4. Une ligne vide entre chaque paragraphe
+2. Bullet points avec emojis: 1️⃣ 2️⃣ 3️⃣ pour etapes, ✅ 💰 ✈️ pour listes
+3. Maximum 6 lignes par message
+4. Ligne vide entre chaque paragraphe
 5. Toujours finir par: 👉 robindesairs.eu/mandat
-6. Ton chaleureux - comme un ami parisien qui aide, jamais robotique
+6. Ton chaleureux comme un ami parisien
 
 EXEMPLE PARFAIT:
 Question: "Combien je peux recuperer?"
@@ -34,32 +33,25 @@ Pour les vols Europe-Afrique:
 
 👉 robindesairs.eu/mandat"
 
-INFOS CLES:
+INFOS CLES CE 261:
 - Retard plus de 3h = 600 EUR par passager
 - Annulation moins de 14 jours = 600 EUR
 - Refus embarquement = 600 EUR + remboursement
 - Retroactivite 5 ANS depuis 2021
-- Compagnies: Brussels Airlines, Air France, KLM, TAP, British Airways, Lufthansa
+- Brussels Airlines (priorite Gambie), Air France, KLM, TAP, British Airways, Lufthansa, Iberia, Vueling
 - Turkish/Emirates/Qatar: eligible si vol depart d'Europe seulement
 - Commission: 25% si on gagne, ZERO si on perd
-- Net passager: 75%
+- Net passager: 75% = environ 450 EUR sur 600 EUR
 - Delai: 6 a 12 semaines
 - Lien mandat: robindesairs.eu/mandat
 - WhatsApp Climbie: +33 7 56 86 36 30"""
 
 def call_gemini(user_message):
-    # Essaie plusieurs modeles Gemini
-    models = [
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-latest", 
-        "gemini-pro",
-        "gemini-1.0-pro"
-    ]
+    models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
     
     for model in models:
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-            
             payload = {
                 "contents": [{
                     "role": "user",
@@ -70,73 +62,61 @@ def call_gemini(user_message):
                     "maxOutputTokens": 350
                 }
             }
-            
             response = requests.post(url, json=payload, timeout=30)
             data = response.json()
+            print(f"Gemini {model} - Status: {response.status_code} - {str(data)[:150]}")
             
-            print(f"Model {model} - Status: {response.status_code}")
-            print(f"Response: {json.dumps(data)[:200]}")
-            
-            if "candidates" in data and len(data["candidates"]) > 0:
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
-                print(f"Succes avec modele: {model}")
-                return text
-                
+            if "candidates" in data:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
         except Exception as e:
-            print(f"Erreur avec {model}: {e}")
+            print(f"Erreur {model}: {e}")
             continue
     
-    return "Bonjour ! 😊\n\nJe suis l'assistant Robin des Airs.\n\nPour recuperer jusqu'a 600 EUR pour votre vol retarde:\n\n👉 robindesairs.eu/mandat\n\nOu contactez Climbie: +33 7 56 86 36 30"
+    return None
 
 def send_whatsapp_message(phone_number, message):
     url = f"{WATI_BASE_URL}/api/v1/sendSessionMessage/{phone_number}"
-    
     headers = {
         "Authorization": f"Bearer {WATI_API_TOKEN}",
         "Content-Type": "application/json"
     }
-    
-    payload = {"messageText": message}
-    
-    response = requests.post(url, headers=headers, json=payload, timeout=30)
-    print(f"Wati response: {response.status_code} - {response.text[:200]}")
+    response = requests.post(url, headers=headers, json={"messageText": message}, timeout=30)
+    print(f"Wati: {response.status_code} - {response.text[:100]}")
     return response.status_code
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
         data = request.json
-        
         if not data:
             return jsonify({"status": "no data"}), 200
-        
+
         phone = data.get("waId") or data.get("from") or data.get("phone")
         message_text = None
-        
+
         if "text" in data:
-            if isinstance(data["text"], dict):
-                message_text = data["text"].get("body", "")
-            else:
-                message_text = data["text"]
+            message_text = data["text"].get("body", "") if isinstance(data["text"], dict) else data["text"]
         elif "body" in data:
             message_text = data["body"]
-        
+
         if not phone or not message_text:
             return jsonify({"status": "ignored"}), 200
-        
-        if data.get("type") == "sent" or data.get("owner") == True:
-            return jsonify({"status": "ignored sent"}), 200
-        
+
+        if data.get("owner") == True:
+            return jsonify({"status": "ignored own message"}), 200
+
         print(f"Message recu de {phone}: {message_text}")
-        
+
         response = call_gemini(message_text)
+
+        if not response:
+            response = "Bonjour ! 😊\n\nJe suis l'assistant Robin des Airs.\n\nPour recuperer jusqu'a 600 EUR:\n👉 robindesairs.eu/mandat\n\nOu Climbie: +33 7 56 86 36 30"
+
         print(f"Reponse: {response[:100]}")
-        
-        status = send_whatsapp_message(phone, response)
-        print(f"Envoye, status: {status}")
-        
+        send_whatsapp_message(phone, response)
+
         return jsonify({"status": "ok"}), 200
-        
+
     except Exception as e:
         print(f"Erreur: {e}")
         import traceback
@@ -145,14 +125,13 @@ def webhook():
 
 @app.route("/test", methods=["GET"])
 def test():
-    # Test Gemini directement
-    test_response = call_gemini("Bonjour test")
+    test_response = call_gemini("Dis bonjour en 1 ligne avec un emoji")
     return jsonify({
         "status": "Robin des Airs Bot is running!",
         "gemini_key": "configured" if GEMINI_API_KEY else "MISSING",
         "wati_token": "configured" if WATI_API_TOKEN else "MISSING",
         "wati_url": WATI_BASE_URL,
-        "gemini_test": test_response[:100]
+        "gemini_test": test_response[:100] if test_response else "FAILED - verifier la cle Gemini"
     }), 200
 
 @app.route("/", methods=["GET"])
