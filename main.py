@@ -4,7 +4,7 @@ import os
 
 app = Flask(__name__)
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 WATI_API_TOKEN = os.environ.get("WATI_API_TOKEN", "")
 WATI_BASE_URL = os.environ.get("WATI_BASE_URL", "")
 
@@ -46,35 +46,36 @@ INFOS CLES CE 261:
 - Lien mandat: robindesairs.eu/mandat
 - WhatsApp Climbie: +33 7 56 86 36 30"""
 
-def call_gemini(user_message):
-    models = [
-        "gemini-1.5-flash",
-        "gemini-1.5-pro"
-    ]
-    
-    for model in models:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-            payload = {
-                "contents": [{
-                    "parts": [{"text": f"{SYSTEM_PROMPT}\n\nQuestion du client: {user_message}"}]
-                }]
-            }
-            response = requests.post(url, json=payload, timeout=30)
-            data = response.json()
-            print(f"Gemini {model} - Status: {response.status_code}")
-            
-            if "candidates" in data:
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
-                print(f"Succes avec: {model}")
-                return text
-            else:
-                print(f"Erreur {model}: {str(data)[:150]}")
-        except Exception as e:
-            print(f"Exception {model}: {e}")
-            continue
-    
-    return None
+def call_openai(user_message):
+    try:
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_message}
+            ],
+            "max_tokens": 350,
+            "temperature": 0.7
+        }
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        data = response.json()
+        print(f"OpenAI status: {response.status_code}")
+
+        if "choices" in data:
+            text = data["choices"][0]["message"]["content"].strip()
+            print(f"OpenAI succes: {text[:80]}")
+            return text
+        else:
+            print(f"OpenAI erreur: {str(data)[:150]}")
+            return None
+    except Exception as e:
+        print(f"OpenAI exception: {e}")
+        return None
 
 def send_whatsapp_message(phone_number, message):
     url = f"{WATI_BASE_URL}/api/v1/sendSessionMessage/{phone_number}"
@@ -82,8 +83,11 @@ def send_whatsapp_message(phone_number, message):
         "Authorization": f"Bearer {WATI_API_TOKEN}",
         "Content-Type": "application/json"
     }
-    # messageText avec T majuscule - correction bug Wati
-    payload = {"messageText": str(message).strip()}
+    message = message.strip()
+    if not message:
+        print("Message vide - abandon")
+        return 0
+    payload = {"messageText": message}
     response = requests.post(url, headers=headers, json=payload, timeout=30)
     print(f"Wati: {response.status_code} - {response.text[:100]}")
     return response.status_code
@@ -103,7 +107,7 @@ def webhook():
         elif "body" in data:
             message_text = data["body"]
 
-        if not phone or not message_text:
+        if not phone or not message_text or not message_text.strip():
             return jsonify({"status": "ignored"}), 200
 
         if data.get("owner") == True:
@@ -111,12 +115,12 @@ def webhook():
 
         print(f"Message recu de {phone}: {message_text}")
 
-        response = call_gemini(message_text)
+        response = call_openai(message_text)
 
         if not response:
-            response = "Bonjour ! 😊\n\nJe suis l'assistant Robin des Airs.\n\nPour recuperer jusqu'a 600 EUR:\n👉 robindesairs.eu/mandat\n\nOu Climbie: +33 7 56 86 36 30"
+            response = "Bonjour ! 😊\n\nJe suis l'assistant Robin des Airs.\n\nPour recuperer jusqu'a 600 EUR pour votre vol retarde:\n\n👉 robindesairs.eu/mandat\n\nOu Climbie direct: +33 7 56 86 36 30"
 
-        print(f"Reponse: {response[:100]}")
+        print(f"Reponse finale: {response[:100]}")
         send_whatsapp_message(phone, response)
 
         return jsonify({"status": "ok"}), 200
@@ -129,13 +133,13 @@ def webhook():
 
 @app.route("/test", methods=["GET"])
 def test():
-    test_response = call_gemini("Dis bonjour en 1 ligne avec un emoji")
+    test_response = call_openai("Dis bonjour en 1 ligne avec un emoji")
     return jsonify({
         "status": "Robin des Airs Bot is running!",
-        "gemini_key": "configured" if GEMINI_API_KEY else "MISSING",
+        "openai_key": "configured" if OPENAI_API_KEY else "MISSING",
         "wati_token": "configured" if WATI_API_TOKEN else "MISSING",
         "wati_url": WATI_BASE_URL,
-        "gemini_test": test_response[:100] if test_response else "FAILED"
+        "openai_test": test_response[:100] if test_response else "FAILED"
     }), 200
 
 @app.route("/", methods=["GET"])
