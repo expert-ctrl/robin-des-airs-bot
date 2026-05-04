@@ -65,38 +65,36 @@ def call_openai(user_message):
         response = requests.post(url, headers=headers, json=payload, timeout=30)
         data = response.json()
         print(f"OpenAI status: {response.status_code}")
-
         if "choices" in data:
             text = data["choices"][0]["message"]["content"].strip()
             print(f"OpenAI succes: {text[:80]}")
             return text
-        else:
-            print(f"OpenAI erreur: {str(data)[:150]}")
-            return None
+        return None
     except Exception as e:
         print(f"OpenAI exception: {e}")
         return None
 
 def send_whatsapp_message(phone_number, message):
-    url = f"{WATI_BASE_URL}/api/v1/sendSessionMessage/{phone_number}"
-    headers = {
-        "Authorization": f"Bearer {WATI_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    
-    # Nettoyage du message
+    """Wati sendSessionMessage - messageText est un QUERY PARAMETER, pas dans le body"""
     message = message.strip()
     if not message:
-        print("Message vide - abandon")
         return 0
     
+    # IMPORTANT : messageText va dans l'URL comme query param
+    url = f"{WATI_BASE_URL}/api/v1/sendSessionMessage/{phone_number}"
+    
+    headers = {
+        "Authorization": f"Bearer {WATI_API_TOKEN}",
+        "accept": "*/*"
+    }
+    
+    # messageText comme query parameter
+    params = {"messageText": message}
+    
     print(f"Envoi Wati - longueur: {len(message)} chars")
-    print(f"Contenu: {repr(message[:100])}")
     
-    payload = {"messageText": message}
-    
-    response = requests.post(url, headers=headers, json=payload, timeout=30)
-    print(f"Wati response: {response.status_code} - {response.text[:200]}")
+    response = requests.post(url, headers=headers, params=params, timeout=30)
+    print(f"Wati: {response.status_code} - {response.text[:200]}")
     return response.status_code
 
 @app.route("/webhook", methods=["POST"])
@@ -118,7 +116,7 @@ def webhook():
             return jsonify({"status": "ignored"}), 200
 
         if data.get("owner") == True:
-            return jsonify({"status": "ignored own message"}), 200
+            return jsonify({"status": "ignored own"}), 200
 
         print(f"Message recu de {phone}: {message_text}")
 
@@ -127,33 +125,27 @@ def webhook():
         if not response or not response.strip():
             response = "Bonjour ! 😊\n\nJe suis Robin des Airs.\n\n👉 robindesairs.eu/mandat"
 
-        print(f"Reponse finale ({len(response)} chars): {response[:100]}")
         send_whatsapp_message(phone, response)
-
         return jsonify({"status": "ok"}), 200
 
     except Exception as e:
         print(f"Erreur: {e}")
         import traceback
         traceback.print_exc()
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"status": "error"}), 500
+
+@app.route("/test_wati", methods=["GET"])
+def test_wati():
+    result = send_whatsapp_message("33677470122", "Test Robin des Airs ✅\n\nLe bot fonctionne ! 🎉\n\n👉 robindesairs.eu/mandat")
+    return jsonify({"wati_status": result}), 200
 
 @app.route("/test", methods=["GET"])
 def test():
     test_response = call_openai("Dis bonjour en 1 ligne avec un emoji")
     return jsonify({
-        "status": "Robin des Airs Bot is running!",
-        "openai_key": "configured" if OPENAI_API_KEY else "MISSING",
-        "wati_token": "configured" if WATI_API_TOKEN else "MISSING",
-        "wati_url": WATI_BASE_URL,
-        "openai_test": test_response[:100] if test_response else "FAILED"
+        "status": "running",
+        "openai_test": test_response[:80] if test_response else "FAILED"
     }), 200
-
-@app.route("/test_wati", methods=["GET"])
-def test_wati():
-    """Test direct envoi Wati avec message simple"""
-    result = send_whatsapp_message("33677470122", "Test Robin des Airs Bot ✅")
-    return jsonify({"status": "sent", "wati_status": result}), 200
 
 @app.route("/", methods=["GET"])
 def home():
