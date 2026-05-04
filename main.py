@@ -83,13 +83,20 @@ def send_whatsapp_message(phone_number, message):
         "Authorization": f"Bearer {WATI_API_TOKEN}",
         "Content-Type": "application/json"
     }
+    
+    # Nettoyage du message
     message = message.strip()
     if not message:
         print("Message vide - abandon")
         return 0
+    
+    print(f"Envoi Wati - longueur: {len(message)} chars")
+    print(f"Contenu: {repr(message[:100])}")
+    
     payload = {"messageText": message}
+    
     response = requests.post(url, headers=headers, json=payload, timeout=30)
-    print(f"Wati: {response.status_code} - {response.text[:100]}")
+    print(f"Wati response: {response.status_code} - {response.text[:200]}")
     return response.status_code
 
 @app.route("/webhook", methods=["POST"])
@@ -117,10 +124,10 @@ def webhook():
 
         response = call_openai(message_text)
 
-        if not response:
-            response = "Bonjour ! 😊\n\nJe suis l'assistant Robin des Airs.\n\nPour recuperer jusqu'a 600 EUR pour votre vol retarde:\n\n👉 robindesairs.eu/mandat\n\nOu Climbie direct: +33 7 56 86 36 30"
+        if not response or not response.strip():
+            response = "Bonjour ! 😊\n\nJe suis Robin des Airs.\n\n👉 robindesairs.eu/mandat"
 
-        print(f"Reponse finale: {response[:100]}")
+        print(f"Reponse finale ({len(response)} chars): {response[:100]}")
         send_whatsapp_message(phone, response)
 
         return jsonify({"status": "ok"}), 200
@@ -141,6 +148,12 @@ def test():
         "wati_url": WATI_BASE_URL,
         "openai_test": test_response[:100] if test_response else "FAILED"
     }), 200
+
+@app.route("/test_wati", methods=["GET"])
+def test_wati():
+    """Test direct envoi Wati avec message simple"""
+    result = send_whatsapp_message("33677470122", "Test Robin des Airs Bot ✅")
+    return jsonify({"status": "sent", "wati_status": result}), 200
 
 @app.route("/", methods=["GET"])
 def home():
