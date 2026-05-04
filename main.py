@@ -47,7 +47,12 @@ INFOS CLES CE 261:
 - WhatsApp Climbie: +33 7 56 86 36 30"""
 
 def call_gemini(user_message):
-    models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
+    models = [
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash-8b",
+        "gemini-2.5-flash-preview-04-17"
+    ]
     
     for model in models:
         try:
@@ -64,12 +69,16 @@ def call_gemini(user_message):
             }
             response = requests.post(url, json=payload, timeout=30)
             data = response.json()
-            print(f"Gemini {model} - Status: {response.status_code} - {str(data)[:150]}")
+            print(f"Gemini {model} - Status: {response.status_code}")
             
             if "candidates" in data:
-                return data["candidates"][0]["content"]["parts"][0]["text"]
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                print(f"Succes avec: {model}")
+                return text
+            else:
+                print(f"Erreur {model}: {str(data)[:150]}")
         except Exception as e:
-            print(f"Erreur {model}: {e}")
+            print(f"Exception {model}: {e}")
             continue
     
     return None
@@ -131,7 +140,7 @@ def test():
         "gemini_key": "configured" if GEMINI_API_KEY else "MISSING",
         "wati_token": "configured" if WATI_API_TOKEN else "MISSING",
         "wati_url": WATI_BASE_URL,
-        "gemini_test": test_response[:100] if test_response else "FAILED - verifier la cle Gemini"
+        "gemini_test": test_response[:100] if test_response else "FAILED"
     }), 200
 
 @app.route("/", methods=["GET"])
