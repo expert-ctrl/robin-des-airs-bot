@@ -47,11 +47,12 @@ INFOS CLES CE 261:
 - WhatsApp Climbie: +33 7 56 86 36 30"""
 
 def call_gemini(user_message):
+    # Modeles disponibles pour nouveaux utilisateurs 2026
     models = [
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
-        "gemini-1.5-flash-8b",
-        "gemini-2.5-flash-preview-04-17"
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-preview-05-20",
+        "gemini-3-flash-preview"
     ]
     
     for model in models:
