@@ -47,17 +47,17 @@ INFOS CLES CE 261:
 - WhatsApp Climbie: +33 7 56 86 36 30"""
 
 def call_gemini(user_message):
-    # Modeles disponibles pour nouveaux utilisateurs 2026
+    # Modeles valides et stables en 2026 - API v1 plus stable
     models = [
-        "gemini-2.5-flash-lite",
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-preview-05-20",
-        "gemini-3-flash-preview"
+        "gemini-3-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro"
     ]
     
     for model in models:
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+            # API v1 (pas v1beta)
+            url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={GEMINI_API_KEY}"
             payload = {
                 "contents": [{
                     "role": "user",
@@ -72,7 +72,7 @@ def call_gemini(user_message):
             data = response.json()
             print(f"Gemini {model} - Status: {response.status_code}")
             
-            if "candidates" in data:
+            if response.status_code == 200 and "candidates" in data:
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
                 print(f"Succes avec: {model}")
                 return text
