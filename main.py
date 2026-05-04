@@ -47,32 +47,24 @@ INFOS CLES CE 261:
 - WhatsApp Climbie: +33 7 56 86 36 30"""
 
 def call_gemini(user_message):
-    # Modeles valides et stables en 2026 - API v1 plus stable
     models = [
-        "gemini-3-flash",
         "gemini-1.5-flash",
         "gemini-1.5-pro"
     ]
     
     for model in models:
         try:
-            # API v1 (pas v1beta)
-            url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={GEMINI_API_KEY}"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
             payload = {
                 "contents": [{
-                    "role": "user",
                     "parts": [{"text": f"{SYSTEM_PROMPT}\n\nQuestion du client: {user_message}"}]
-                }],
-                "generationConfig": {
-                    "temperature": 0.7,
-                    "maxOutputTokens": 350
-                }
+                }]
             }
             response = requests.post(url, json=payload, timeout=30)
             data = response.json()
             print(f"Gemini {model} - Status: {response.status_code}")
             
-            if response.status_code == 200 and "candidates" in data:
+            if "candidates" in data:
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
                 print(f"Succes avec: {model}")
                 return text
@@ -90,7 +82,9 @@ def send_whatsapp_message(phone_number, message):
         "Authorization": f"Bearer {WATI_API_TOKEN}",
         "Content-Type": "application/json"
     }
-    response = requests.post(url, headers=headers, json={"messageText": message}, timeout=30)
+    # messageText avec T majuscule - correction bug Wati
+    payload = {"messageText": str(message).strip()}
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
     print(f"Wati: {response.status_code} - {response.text[:100]}")
     return response.status_code
 
