@@ -4,6 +4,7 @@ import os
 import json
 import base64
 import re
+import hashlib
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
@@ -15,9 +16,14 @@ MANDAT_BASE_URL = os.environ.get("MANDAT_BASE_URL", "https://robindesairs.eu/man
 
 # ===== MEMOIRE CONVERSATIONS =====
 conversations = {}
-last_message_time = {}
+recent_event_ids = {}
+recent_payload_keys = {}
+recent_outbound_sends = {}
 MEMORY_HOURS = 24
-MIN_SECONDS_BETWEEN = 2
+DEDUP_WINDOW_SECONDS = 25
+EVENT_ID_TTL_SECONDS = 900
+OUTBOUND_DEDUP_SECONDS = int(os.environ.get("OUTBOUND_DEDUP_SECONDS", "45"))
+OUTBOUND_CACHE_TTL_SECONDS = int(os.environ.get("OUTBOUND_CACHE_TTL_SECONDS", "900"))
 
 # ===== ETAPES DU FLUX GUIDE =====
 STEPS = [
@@ -85,29 +91,175 @@ def get_or_create_conversation(phone):
     
     return conversations[phone]
 
-def is_duplicate_message(phone):
+def _cleanup_dedup_caches(now):
+    """Nettoie les caches anti-doublon entrant (évite la croissance mémoire)."""
+    to_del_ids = [k for k, ts in recent_event_ids.items() if (now - ts).total_seconds() > EVENT_ID_TTL_SECONDS]
+    for k in to_del_ids:
+        recent_event_ids.pop(k, None)
+    to_del_payloads = [k for k, ts in recent_payload_keys.items() if (now - ts).total_seconds() > EVENT_ID_TTL_SECONDS]
+    for k in to_del_payloads:
+        recent_payload_keys.pop(k, None)
+
+def _extract_event_id(data):
+    """Récupère un identifiant webhook/message si présent (formats WATI variables)."""
+    if not isinstance(data, dict):
+        return ""
+
+    candidates = [
+        data.get("messageId"),
+        data.get("message_id"),
+        data.get("id"),
+        data.get("eventId"),
+        data.get("event_id"),
+        data.get("whatsappMessageId"),
+        data.get("whatsapp_message_id"),
+    ]
+
+    nested = [
+        data.get("buttonReply"),
+        data.get("interactiveButtonReply"),
+        data.get("listReply"),
+        data.get("interactiveListReply"),
+        data.get("button_reply"),
+        data.get("list_reply"),
+        data.get("interactive"),
+        data.get("text"),
+        data.get("image"),
+    ]
+    for obj in nested:
+        if isinstance(obj, dict):
+            candidates.extend([
+                obj.get("id"),
+                obj.get("messageId"),
+                obj.get("message_id"),
+                obj.get("contextId"),
+                obj.get("context_id"),
+            ])
+            reply = obj.get("button_reply") if isinstance(obj.get("button_reply"), dict) else None
+            if reply:
+                candidates.extend([reply.get("id"), reply.get("messageId")])
+            lreply = obj.get("list_reply") if isinstance(obj.get("list_reply"), dict) else None
+            if lreply:
+                candidates.extend([lreply.get("id"), lreply.get("messageId")])
+
+    for c in candidates:
+        if c:
+            return str(c).strip()
+    return ""
+
+def is_duplicate_event(phone, data, payload_signature):
+    """
+    Déduplication entrante robuste:
+    - priorité sur event/message ID (idempotence)
+    - fallback sur empreinte phone+payload pendant une courte fenêtre
+    """
     now = datetime.now()
-    if phone in last_message_time:
-        diff = (now - last_message_time[phone]).total_seconds()
-        if diff < MIN_SECONDS_BETWEEN:
+    _cleanup_dedup_caches(now)
+
+    event_id = _extract_event_id(data)
+    if event_id:
+        if event_id in recent_event_ids:
             return True
-    last_message_time[phone] = now
+        recent_event_ids[event_id] = now
+
+    sig = (payload_signature or "").strip()
+    if sig:
+        key_raw = f"{phone}|{sig.lower()}"
+        key = hashlib.sha256(key_raw.encode("utf-8")).hexdigest()
+        if key in recent_payload_keys:
+            age = (now - recent_payload_keys[key]).total_seconds()
+            if age < DEDUP_WINDOW_SECONDS:
+                return True
+        recent_payload_keys[key] = now
+
     return False
+
+def _conversation_step_for_phone(phone):
+    conv = conversations.get(phone)
+    if not conv:
+        return "none"
+    return str(conv.get("current_step") or "none")
+
+def _cleanup_outbound_cache(now):
+    to_del = [k for k, ts in recent_outbound_sends.items() if (now - ts).total_seconds() > OUTBOUND_CACHE_TTL_SECONDS]
+    for k in to_del:
+        recent_outbound_sends.pop(k, None)
+
+def _outbound_should_block(phone, step, kind, fingerprint):
+    """True si un envoi identique vient d'être fait avec succès récemment."""
+    now = datetime.now()
+    _cleanup_outbound_cache(now)
+    key_raw = f"{phone}|{step}|{kind}|{fingerprint}"
+    key = hashlib.sha256(key_raw.encode("utf-8")).hexdigest()
+    if key not in recent_outbound_sends:
+        return False
+    age = (now - recent_outbound_sends[key]).total_seconds()
+    if age < OUTBOUND_DEDUP_SECONDS:
+        print(f"[OUTBOUND_SKIP] phone={phone} step={step} kind={kind} age_s={age:.1f}")
+        return True
+    return False
+
+def _register_outbound_success(phone, step, kind, fingerprint):
+    """Enregistre un envoi réussi (HTTP 200) pour anti-doublon sortant."""
+    now = datetime.now()
+    _cleanup_outbound_cache(now)
+    key_raw = f"{phone}|{step}|{kind}|{fingerprint}"
+    key = hashlib.sha256(key_raw.encode("utf-8")).hexdigest()
+    recent_outbound_sends[key] = now
+
+def _fingerprint_text(message):
+    return hashlib.sha256(message.strip().encode("utf-8")).hexdigest()
+
+def _fingerprint_buttons(body_text, buttons, header_text, footer_text):
+    norm = json.dumps({
+        "body": (body_text or "").strip(),
+        "header": (header_text or "").strip(),
+        "footer": (footer_text or "").strip(),
+        "buttons": [b.get("title", "") for b in (buttons or [])[:3]],
+    }, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+def _fingerprint_list(body_text, button_label, sections, header_text, footer_text):
+    norm_sections = []
+    for sec in sections or []:
+        rows = []
+        for row in sec.get("rows", []):
+            rows.append({
+                "id": str(row.get("id") or row.get("rowId") or row.get("payload") or ""),
+                "title": row.get("title", ""),
+                "description": row.get("description", ""),
+            })
+        norm_sections.append({"title": sec.get("title", ""), "rows": rows})
+    norm = json.dumps({
+        "body": (body_text or "").strip(),
+        "buttonText": (button_label or "").strip(),
+        "header": (header_text or "").strip(),
+        "footer": (footer_text or "").strip(),
+        "sections": norm_sections,
+    }, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
 # ============================================
 # WATI - ENVOI MESSAGES
 # ============================================
 
-def send_whatsapp_text(phone, message):
+def send_whatsapp_text(phone, message, *, skip_outbound_dedup=False):
     """Envoie un message texte simple"""
     message = message.strip()
     if not message:
         return 0
+    step = _conversation_step_for_phone(phone)
+    fp = _fingerprint_text(message)
+    if not skip_outbound_dedup:
+        if _outbound_should_block(phone, step, "text", fp):
+            return 429
     url = f"{WATI_BASE_URL}/api/v1/sendSessionMessage/{phone}"
     headers = {"Authorization": f"Bearer {WATI_API_TOKEN}", "accept": "*/*"}
     params = {"messageText": message}
     response = requests.post(url, headers=headers, params=params, timeout=30)
     print(f"Wati TEXT: {response.status_code}")
+    if response.status_code == 200 and not skip_outbound_dedup:
+        _register_outbound_success(phone, step, "text", fp)
     return response.status_code
 
 def send_whatsapp_buttons(phone, body_text, buttons, header_text=None, footer_text=None):
@@ -131,6 +283,11 @@ def send_whatsapp_buttons(phone, body_text, buttons, header_text=None, footer_te
     if footer_text:
         payload["footer"] = footer_text
     
+    step = _conversation_step_for_phone(phone)
+    fp = _fingerprint_buttons(body_text, buttons, header_text, footer_text)
+    if _outbound_should_block(phone, step, "buttons", fp):
+        return 429
+
     response = requests.post(url, headers=headers, params=params, json=payload, timeout=30)
     print(f"Wati BUTTONS: {response.status_code} - {response.text[:200]}")
     
@@ -140,7 +297,9 @@ def send_whatsapp_buttons(phone, body_text, buttons, header_text=None, footer_te
         for i, btn in enumerate(buttons, 1):
             fallback += f"{i}. {btn['title']}\n"
         fallback += "\nRepondez avec le numero de votre choix."
-        send_whatsapp_text(phone, fallback)
+        send_whatsapp_text(phone, fallback, skip_outbound_dedup=True)
+    elif response.status_code == 200:
+        _register_outbound_success(phone, step, "buttons", fp)
     
     return response.status_code
 
@@ -183,6 +342,11 @@ def send_whatsapp_list(phone, body_text, button_label, sections, header_text=Non
     if footer_text:
         payload["footer"] = footer_text
     
+    step = _conversation_step_for_phone(phone)
+    fp = _fingerprint_list(body_text, button_label, sections, header_text, footer_text)
+    if _outbound_should_block(phone, step, "list", fp):
+        return 429
+
     response = requests.post(url, headers=headers, params=params, json=payload, timeout=30)
     print(f"Wati LIST: {response.status_code} - {response.text[:200]}")
     
@@ -195,7 +359,9 @@ def send_whatsapp_list(phone, body_text, button_label, sections, header_text=Non
                 fallback += f"{idx}. {row['title']}\n"
                 idx += 1
         fallback += "\nRepondez avec le numero de votre choix."
-        send_whatsapp_text(phone, fallback)
+        send_whatsapp_text(phone, fallback, skip_outbound_dedup=True)
+    elif response.status_code == 200:
+        _register_outbound_success(phone, step, "list", fp)
     
     return response.status_code
 
@@ -708,9 +874,6 @@ def webhook():
         if data.get("owner") == True:
             return jsonify({"status": "ignored own"}), 200
 
-        if is_duplicate_message(phone):
-            return jsonify({"status": "duplicate"}), 200
-
         conv = get_or_create_conversation(phone)
         
         # ===== DETECTION CLIC SUR BOUTON OU LISTE =====
@@ -746,6 +909,8 @@ def webhook():
                 or button_reply.get("body")
                 or ""
             )
+            if is_duplicate_event(phone, data, f"button|{btn_id}|{btn_title}"):
+                return jsonify({"status": "duplicate_button"}), 200
             process_button_reply(phone, btn_id, btn_title, conv)
             return jsonify({"status": "button processed"}), 200
         
@@ -767,6 +932,8 @@ def webhook():
                 or list_reply.get("description")
                 or ""
             )
+            if is_duplicate_event(phone, data, f"list|{row_id}|{row_title}"):
+                return jsonify({"status": "duplicate_list"}), 200
             process_button_reply(phone, row_id, row_title, conv)
             return jsonify({"status": "list processed"}), 200
         
@@ -795,6 +962,10 @@ def webhook():
 
         if not message_text and not image_data:
             return jsonify({"status": "ignored empty"}), 200
+
+        payload_sig = f"text|{message_text.strip().lower()}|img:{bool(image_data)}"
+        if is_duplicate_event(phone, data, payload_sig):
+            return jsonify({"status": "duplicate_message"}), 200
 
         print(f"Message de {phone}: {message_text[:80]} (image: {bool(image_data)})")
         
