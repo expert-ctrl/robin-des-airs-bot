@@ -156,10 +156,27 @@ def send_whatsapp_list(phone, body_text, button_label, sections, header_text=Non
     }
     params = {"whatsappNumber": phone}
     
+    # Normalisation defensive: certains endpoints WATI attendent rowId (pas id).
+    normalized_sections = []
+    for section in sections:
+        rows = []
+        for row in section.get("rows", []):
+            rid = row.get("id") or row.get("rowId") or row.get("payload") or ""
+            rows.append({
+                "id": rid,
+                "rowId": rid,
+                "title": row.get("title", ""),
+                "description": row.get("description", "")
+            })
+        normalized_sections.append({
+            "title": section.get("title", ""),
+            "rows": rows
+        })
+
     payload = {
         "body": body_text,
         "buttonText": button_label,
-        "sections": sections
+        "sections": normalized_sections
     }
     if header_text:
         payload["header"] = header_text
@@ -448,6 +465,24 @@ def process_button_reply(phone, button_id, button_title, conv):
     """Traite la reponse a un bouton/liste"""
     print(f"Bouton clique: {button_id} = {button_title}")
     
+    button_id = (button_id or "").strip()
+    button_title = (button_title or "").strip().lower()
+
+    # Fallback titre -> id (utile quand WATI renvoie le texte mais pas l'id).
+    if not button_id and button_title:
+        if "1 passager" in button_title or "1 passenger" in button_title:
+            button_id = "pax_1"
+        elif "2 passager" in button_title or "2 passenger" in button_title:
+            button_id = "pax_2"
+        elif "3 passager" in button_title or "3 passenger" in button_title:
+            button_id = "pax_3"
+        elif "4 passager" in button_title or "4 passenger" in button_title:
+            button_id = "pax_4"
+        elif "5 passager" in button_title or "5 passenger" in button_title:
+            button_id = "pax_5"
+        elif "6 ou plus" in button_title or "6 or more" in button_title:
+            button_id = "pax_more"
+
     # PASSAGERS
     if button_id.startswith("pax_"):
         if button_id == "pax_more":
@@ -653,6 +688,19 @@ def webhook():
         if not data:
             return jsonify({"status": "no data"}), 200
 
+        try:
+            print("[WEBHOOK_DEBUG] meta=", json.dumps({
+                "top_keys": list(data.keys())[:30],
+                "has_buttonReply": bool(data.get("buttonReply")),
+                "has_interactiveButtonReply": bool(data.get("interactiveButtonReply")),
+                "has_listReply": bool(data.get("listReply")),
+                "has_interactive": bool(data.get("interactive")),
+                "has_button_reply": bool(data.get("button_reply")),
+                "has_list_reply": bool(data.get("list_reply")),
+            }, ensure_ascii=False))
+        except Exception:
+            pass
+
         phone = data.get("waId") or data.get("from") or data.get("phone")
         if not phone:
             return jsonify({"status": "no phone"}), 200
@@ -666,18 +714,59 @@ def webhook():
         conv = get_or_create_conversation(phone)
         
         # ===== DETECTION CLIC SUR BOUTON OU LISTE =====
-        button_reply = data.get("buttonReply") or data.get("interactiveButtonReply")
-        list_reply = data.get("listReply")
+        # WATI peut varier les clés selon le type de message / version webhook.
+        button_reply = (
+            data.get("buttonReply")
+            or data.get("interactiveButtonReply")
+            or data.get("interactive", {}).get("button_reply")
+            or data.get("button_reply")
+        )
+        list_reply = (
+            data.get("listReply")
+            or data.get("interactiveListReply")
+            or data.get("interactive", {}).get("list_reply")
+            or data.get("list_reply")
+        )
         
         if button_reply:
-            btn_id = button_reply.get("id") or button_reply.get("payload") or ""
-            btn_title = button_reply.get("title") or button_reply.get("text") or ""
+            try:
+                print("[WEBHOOK_DEBUG] button_reply=", json.dumps(button_reply, ensure_ascii=False))
+            except Exception:
+                pass
+            btn_id = (
+                button_reply.get("id")
+                or button_reply.get("buttonId")
+                or button_reply.get("payload")
+                or button_reply.get("rowId")
+                or ""
+            )
+            btn_title = (
+                button_reply.get("title")
+                or button_reply.get("text")
+                or button_reply.get("body")
+                or ""
+            )
             process_button_reply(phone, btn_id, btn_title, conv)
             return jsonify({"status": "button processed"}), 200
         
         if list_reply:
-            row_id = list_reply.get("id") or list_reply.get("payload") or ""
-            row_title = list_reply.get("title") or list_reply.get("text") or ""
+            try:
+                print("[WEBHOOK_DEBUG] list_reply=", json.dumps(list_reply, ensure_ascii=False))
+            except Exception:
+                pass
+            row_id = (
+                list_reply.get("id")
+                or list_reply.get("rowId")
+                or list_reply.get("buttonId")
+                or list_reply.get("payload")
+                or ""
+            )
+            row_title = (
+                list_reply.get("title")
+                or list_reply.get("text")
+                or list_reply.get("description")
+                or ""
+            )
             process_button_reply(phone, row_id, row_title, conv)
             return jsonify({"status": "list processed"}), 200
         
