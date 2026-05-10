@@ -14,87 +14,60 @@ WATI_API_TOKEN = os.environ.get("WATI_API_TOKEN", "")
 WATI_BASE_URL = os.environ.get("WATI_BASE_URL", "")
 AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY", "")
 AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID", "appv72lKbQtjt7EIP")
-AIRTABLE_TABLE_ID = os.environ.get("AIRTABLE_TABLE_ID", "tblfg688AGxaywi7O")
+AIRTABLE_TABLE_NAME = os.environ.get("AIRTABLE_TABLE_NAME", "Dossiers Passagers")
 
-# Domaine unique — jamais d'autre lien
 RDA_DOMAIN = "https://robindesairs.eu"
 MANDAT_URL = f"{RDA_DOMAIN}/mandat-representation"
 DEPOT_URL = f"{RDA_DOMAIN}/depot-express"
-CALCUL_URL = f"{RDA_DOMAIN}/#funnel-box"
 SUIVI_URL = f"{RDA_DOMAIN}/suivi-dossier"
-PARRAINAGE_URL = f"{RDA_DOMAIN}/parrainage"
 BLOG_URL = f"{RDA_DOMAIN}/blog"
 
-# Sources officielles (lecture seule — pas de liens sortants)
-DGAC_URL = "https://droits-passagers-aeriens.aviation-civile.gouv.fr/public/je-m-informe"
-ECONOMIE_URL = "https://www.economie.gouv.fr/particuliers/voyager-et-se-deplacer/vol-annule-ou-retarde-quels-sont-vos-droits"
-
-# ===== MEMOIRE =====
+# Memoire conversations
 conversations = {}
 recent_event_ids = {}
-recent_payload_keys = {}
-recent_outbound_sends = {}
 MEMORY_HOURS = 24
-DEDUP_WINDOW_SECONDS = 25
-EVENT_ID_TTL_SECONDS = 900
-OUTBOUND_DEDUP_SECONDS = int(os.environ.get("OUTBOUND_DEDUP_SECONDS", "45"))
-OUTBOUND_CACHE_TTL_SECONDS = int(os.environ.get("OUTBOUND_CACHE_TTL_SECONDS", "900"))
 
 EU261_BANDS = {
-    "band_250": {"amount_eur": 250, "label_fr": "≤ 1500 km", "label_en": "≤ 1500 km"},
-    "band_400": {"amount_eur": 400, "label_fr": "1500–3500 km", "label_en": "1500–3500 km"},
-    "band_600": {"amount_eur": 600, "label_fr": "> 3500 km", "label_en": "> 3500 km"},
-    "band_unknown": {"amount_eur": None, "label_fr": "Distance inconnue", "label_en": "Unknown distance"},
+    "band_250": {"amount_eur": 250, "label": "≤ 1500 km"},
+    "band_400": {"amount_eur": 400, "label": "1500–3500 km"},
+    "band_600": {"amount_eur": 600, "label": "> 3500 km"},
+    "band_unknown": {"amount_eur": None, "label": "Distance inconnue"},
 }
 
-STEPS = [
-    "passengers",
-    "incident_type",
-    "flight_type",
-    "airline",
-    "flight_number",
-    "flight_date",
-    "distance_band",
-    "passenger_names",
-    "minor_check",
-    "summary",
-]
+STEPS = ["passengers", "incident_type", "flight_type", "airline", "airline_other_input",
+         "flight_number", "flight_date", "flight_month", "flight_day_input",
+         "distance_band", "passenger_names", "minor_check", "minors_count", "summary"]
 
-SYSTEM_PROMPT = f"""Tu es l'agent IA de ROBIN DES AIRS. Tu reponds dans la LANGUE DU CLIENT (FR/EN).
+AIRLINES_MAP = {
+    "1": "Air France", "2": "KLM", "3": "Brussels Airlines",
+    "4": "Lufthansa", "5": "TAP Portugal", "6": "Corsair",
+    "7": "Air Senegal", "8": "Royal Air Maroc",
+}
 
-REGLES FORMAT ABSOLUES :
-- Minimum 3 emojis par message
-- Bullet points avec emojis pour les listes
-- Maximum 6 lignes par message
-- Toujours finir par un lien robindesairs.eu
-- Ton chaleureux comme un ami
+INCIDENT_LABELS = {"delay": "Retard +3h", "cancel": "Annulation", "denied": "Refus embarquement"}
 
-LIENS AUTORISES — UNIQUEMENT ces liens (jamais d'autre domaine) :
+SYSTEM_PROMPT = f"""Tu es l'agent IA de ROBIN DES AIRS. Tu reponds dans la LANGUE DU CLIENT.
+
+REGLES FORMAT :
+- 3+ emojis par message
+- Bullet points avec emojis
+- Max 6 lignes
+- Toujours finir par lien {RDA_DOMAIN}
+
+LIENS AUTORISES (uniquement) :
 - Mandat : {MANDAT_URL}
-- Calculateur : {CALCUL_URL}
-- Depot express : {DEPOT_URL}
-- Suivi dossier : {SUIVI_URL}
-- Parrainage 20 EUR : {PARRAINAGE_URL}
-- Blog : {BLOG_URL}
+- Depot : {DEPOT_URL}
+- Suivi : {SUIVI_URL}
 
-REGLEMENT EU261/2004 :
-- Retard arrivee +3h = indemnisation
-- Annulation <14j avant = indemnisation
-- Refus embarquement = indemnisation
-- Montants : 250 EUR (≤1500km) / 400 EUR (1500-3500km) / 600 EUR (>3500km hors UE)
-- Commission RDA : 25% si succes UNIQUEMENT
+REGLEMENT EU261 :
+- Retard +3h, Annulation, Refus = indemnisation
+- 250/400/600 EUR selon distance
+- Commission 25% si succes uniquement
 - Net passager : 75%
-- Retroactivite : 5 ans
-- Mineurs = memes droits que adultes
+- Retroactivite 5 ans
 
-SOURCES OFFICIELLES (cite si question juridique precise) :
-- FAQ DGAC : {DGAC_URL}
-- Ministere Economie : {ECONOMIE_URL}
-
-ESCALADE A CLIMBIE +33 7 56 86 36 30 si :
-- Plus de 5 passagers / Deces / Question juridique complexe
+ESCALADE Climbie +33 7 56 86 36 30 si : 6+ pax / Deces / Juridique complexe
 """
-
 
 
 # ===== REFERENCE DOSSIER =====
@@ -106,153 +79,121 @@ def generate_ref_dossier(phone):
     return f"RDA-{today}-{suffix}"
 
 
-# ===== AIRTABLE MULTI-LIGNES =====
+# ===== AIRTABLE =====
 
-def save_lead_to_airtable(phone, conv_data, message_text="", force_complete=False):
+def airtable_headers():
+    return {
+        "Authorization": f"Bearer {AIRTABLE_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+
+def airtable_url():
+    table = requests.utils.quote(AIRTABLE_TABLE_NAME)
+    return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{table}"
+
+
+def airtable_find_records_by_ref(ref):
+    """Cherche les records existants par reference dossier"""
+    if not AIRTABLE_API_KEY or not ref:
+        return []
+    try:
+        # Filtre par formula : recherche dans le champ Remarques OU un champ Reference si existe
+        formula = f"OR(FIND('{ref}', {{Remarques}}), {{Reference Dossier}}='{ref}')"
+        url = f"{airtable_url()}?filterByFormula={requests.utils.quote(formula)}"
+        r = requests.get(url, headers=airtable_headers(), timeout=10)
+        if r.status_code == 200:
+            return r.json().get("records", [])
+    except Exception as e:
+        print(f"Airtable find error: {e}")
+    return []
+
+
+def airtable_save_progressive(phone, conv):
     """
-    Enregistre UN lead par passager dans Airtable.
-    - 1 passager = 1 ligne
-    - 2 passagers = 2 lignes avec le meme numero de dossier
-    - Montant total sur la 1ere ligne uniquement
-    - Remarques = notes supplementaires
+    Sauvegarde progressive : cree ou met a jour les records dans Airtable.
+    Cree 1 ligne par passager des qu'on connait pax.
+    Met a jour les champs au fur et a mesure de leur saisie.
     """
     if not AIRTABLE_API_KEY:
-        print("Airtable non configure - skip")
         return
 
     try:
-        d = conv_data.get("data", {})
-        pax = d.get("passengers") or 1
-        band_id = d.get("distance_band", "band_unknown")
-        per_pax = EU261_BANDS.get(band_id, EU261_BANDS["band_unknown"]).get("amount_eur")
-        total = (per_pax * pax) if per_pax else None
-        net_total = int(total * 0.75) if total else None
-
-        # Reference dossier unique pour ce groupe
-        ref = conv_data.get("ref_dossier")
+        d = conv.get("data", {})
+        ref = conv.get("ref_dossier")
         if not ref:
             ref = generate_ref_dossier(phone)
-            conv_data["ref_dossier"] = ref
+            conv["ref_dossier"] = ref
 
-        # Date du jour pour le dossier
-        date_dossier = datetime.now().strftime("%d/%m/%Y")
-
-        incident_map = {"delay": "Retard +3h", "cancel": "Annulation", "denied": "Refus embarquement"}
-        incident = incident_map.get(d.get("incident_type", ""), d.get("incident_type", ""))
-
+        pax = d.get("passengers") or 1
         names = d.get("passenger_names", [])
-        # Si pas encore de noms, on cree 1 ligne generique
-        if not names:
-            names = [f"Passager 1 - {phone}"]
 
-        url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_ID}"
-        headers = {
-            "Authorization": f"Bearer {AIRTABLE_API_KEY}",
-            "Content-Type": "application/json"
+        # Construit les champs disponibles
+        base_fields = {
+            "WhatsApp": str(phone),
+            "Reference Dossier": ref,
+            "Date Dossier": datetime.now().strftime("%Y-%m-%d"),
         }
 
-        # Cree une ligne par passager
-        for i, name in enumerate(names[:pax]):
-            is_first = (i == 0)
+        if d.get("flight_number"):
+            base_fields["Vol"] = d["flight_number"]
+        if d.get("airline"):
+            base_fields["Compagnie"] = d["airline"]
+        if d.get("flight_date"):
+            base_fields["Date"] = d["flight_date"]
+        if d.get("incident_type"):
+            base_fields["Incident"] = INCIDENT_LABELS.get(d["incident_type"], d["incident_type"])
 
-            fields = {
-                "fldCtJysGhTYF2LNf": name,                    # Nom passager
-                "fldsFH0PoWe3AV0sI": str(phone),              # WhatsApp
-                "fldqks5asIPXar8BD": f"Ref: {ref} | Passager {i+1}/{pax}" + (f" | {message_text[:200]}" if message_text and is_first else ""),
-            }
+        # Calcul montant
+        band_id = d.get("distance_band", "band_unknown")
+        per_pax = EU261_BANDS.get(band_id, EU261_BANDS["band_unknown"]).get("amount_eur")
+        total_brut = (per_pax * pax) if per_pax else 0
+        total_net = int(total_brut * 0.75) if total_brut else 0
 
-            # Vol + date + compagnie
-            if d.get("flight_number"):
-                fields["fldcVnS4B86eZntjr"] = d["flight_number"]
-            if d.get("airline"):
-                fields["fld8Ku1jGMOPWnrQc"] = d["airline"]
-            if d.get("flight_date"):
-                fields["flduDNEC3osPnTMAv"] = d["flight_date"]
-            if incident:
-                fields["fldci5VnHb0HpOoKL"] = incident
+        # Cherche records existants pour ce dossier
+        existing = airtable_find_records_by_ref(ref)
 
-            # Montant : total sur la 1ere ligne, 0 sur les suivantes (evite les doublons)
-            if per_pax:
-                if is_first:
-                    # 1ere ligne = montant total du groupe
-                    fields["fldlzkJOqqC8AYbIM"] = float(net_total) if net_total else float(per_pax * pax * 0.75)
+        if not existing:
+            # Premier enregistrement : cree N records (un par passager)
+            records_to_create = []
+            for i in range(pax):
+                fields = dict(base_fields)
+                if i < len(names):
+                    fields["Nom"] = names[i]
                 else:
-                    # Lignes suivantes = 0 (montant deja compte sur la 1ere)
-                    fields["fldlzkJOqqC8AYbIM"] = 0.0
+                    fields["Nom"] = f"Passager {i+1}"
+                fields["Remarques"] = f"Ref: {ref} | Passager {i+1}/{pax}"
+                # Montant total uniquement sur la 1ere ligne
+                if i == 0 and total_net:
+                    fields["Montant"] = float(total_net)
+                else:
+                    fields["Montant"] = 0.0
+                records_to_create.append({"fields": fields})
 
-            response = requests.post(url, headers=headers, json={"fields": fields}, timeout=10)
-            print(f"Airtable ligne {i+1}/{len(names)}: {response.status_code}")
+            payload = {"records": records_to_create, "typecast": True}
+            r = requests.post(airtable_url(), headers=airtable_headers(), json=payload, timeout=15)
+            print(f"Airtable CREATE {pax} records: {r.status_code} - {r.text[:200]}")
+
+        else:
+            # Update les records existants avec les nouvelles infos
+            updates = []
+            for i, rec in enumerate(existing[:pax]):
+                fields = dict(base_fields)
+                if i < len(names):
+                    fields["Nom"] = names[i]
+                if i == 0 and total_net:
+                    fields["Montant"] = float(total_net)
+                updates.append({"id": rec["id"], "fields": fields})
+
+            if updates:
+                payload = {"records": updates, "typecast": True}
+                r = requests.patch(airtable_url(), headers=airtable_headers(), json=payload, timeout=15)
+                print(f"Airtable UPDATE {len(updates)} records: {r.status_code}")
 
     except Exception as e:
-        print(f"Airtable error: {e}")
-
-
-
-
-# ===== DEDUP =====
-
-def _cleanup_dedup_caches(now):
-    to_del = [k for k, ts in recent_event_ids.items() if (now - ts).total_seconds() > EVENT_ID_TTL_SECONDS]
-    for k in to_del:
-        recent_event_ids.pop(k, None)
-    to_del2 = [k for k, ts in recent_payload_keys.items() if (now - ts).total_seconds() > EVENT_ID_TTL_SECONDS]
-    for k in to_del2:
-        recent_payload_keys.pop(k, None)
-
-
-def _extract_event_id(data):
-    if not isinstance(data, dict):
-        return ""
-    candidates = [data.get("messageId"), data.get("id"), data.get("whatsappMessageId")]
-    for c in candidates:
-        if c:
-            return str(c).strip()
-    return ""
-
-
-def is_duplicate_event(phone, data, payload_signature):
-    now = datetime.now()
-    _cleanup_dedup_caches(now)
-    event_id = _extract_event_id(data)
-    if event_id:
-        if event_id in recent_event_ids:
-            return True
-        recent_event_ids[event_id] = now
-    sig = (payload_signature or "").strip()
-    if sig:
-        key = hashlib.sha256(f"{phone}|{sig.lower()}".encode()).hexdigest()
-        if key in recent_payload_keys:
-            if (now - recent_payload_keys[key]).total_seconds() < DEDUP_WINDOW_SECONDS:
-                return True
-        recent_payload_keys[key] = now
-    return False
-
-
-def _cleanup_outbound_cache(now):
-    to_del = [k for k, ts in recent_outbound_sends.items() if (now - ts).total_seconds() > OUTBOUND_CACHE_TTL_SECONDS]
-    for k in to_del:
-        recent_outbound_sends.pop(k, None)
-
-
-def _conversation_step_for_phone(phone):
-    conv = conversations.get(phone)
-    return str(conv.get("current_step") or "none") if conv else "none"
-
-
-def _outbound_should_block(phone, step, kind, fingerprint):
-    now = datetime.now()
-    _cleanup_outbound_cache(now)
-    key = hashlib.sha256(f"{phone}|{step}|{kind}|{fingerprint}".encode()).hexdigest()
-    if key in recent_outbound_sends:
-        if (now - recent_outbound_sends[key]).total_seconds() < OUTBOUND_DEDUP_SECONDS:
-            return True
-    return False
-
-
-def _register_outbound_success(phone, step, kind, fingerprint):
-    now = datetime.now()
-    key = hashlib.sha256(f"{phone}|{step}|{kind}|{fingerprint}".encode()).hexdigest()
-    recent_outbound_sends[key] = now
+        print(f"Airtable save error: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 # ===== CONVERSATIONS =====
@@ -262,11 +203,13 @@ def get_or_create_conversation(phone):
         conversations[phone] = {
             "messages": [],
             "current_step": None,
+            "ref_dossier": None,
             "data": {
                 "passengers": None, "incident_type": None, "flight_type": None,
                 "airline": None, "flight_number": None, "flight_date": None,
                 "distance_band": None, "passenger_names": [], "has_minors": None,
-                "minors_count": 0, "language": "fr", "temp_year": None, "temp_month": None,
+                "minors_count": 0, "language": "fr",
+                "temp_year": None, "temp_month": None, "temp_years": [],
             },
             "created": datetime.now(),
         }
@@ -276,42 +219,56 @@ def get_or_create_conversation(phone):
     return conversations[phone]
 
 
+# ===== DEDUP =====
+
+def is_duplicate_event(phone, data, sig):
+    now = datetime.now()
+    # cleanup
+    to_del = [k for k, ts in recent_event_ids.items() if (now - ts).total_seconds() > 900]
+    for k in to_del:
+        recent_event_ids.pop(k, None)
+    
+    event_id = data.get("messageId") or data.get("id") or data.get("whatsappMessageId")
+    if event_id:
+        if event_id in recent_event_ids:
+            return True
+        recent_event_ids[event_id] = now
+    
+    key = hashlib.sha256(f"{phone}|{sig}".encode()).hexdigest()
+    if key in recent_event_ids:
+        if (now - recent_event_ids[key]).total_seconds() < 25:
+            return True
+    recent_event_ids[key] = now
+    return False
+
+
 # ===== ENVOI WATI =====
 
-def send_whatsapp_text(phone, message, *, skip_outbound_dedup=False):
+def send_whatsapp_text(phone, message):
     message = message.strip()
     if not message:
         return 0
-    step = _conversation_step_for_phone(phone)
-    fp = hashlib.sha256(message.encode()).hexdigest()
-    if not skip_outbound_dedup and _outbound_should_block(phone, step, "text", fp):
-        return 429
     url = f"{WATI_BASE_URL}/api/v1/sendSessionMessage/{phone}"
     headers = {"Authorization": f"Bearer {WATI_API_TOKEN}", "accept": "*/*"}
-    response = requests.post(url, headers=headers, params={"messageText": message}, timeout=30)
-    print(f"Wati TEXT: {response.status_code}")
-    if response.status_code == 200 and not skip_outbound_dedup:
-        _register_outbound_success(phone, step, "text", fp)
-    return response.status_code
+    try:
+        r = requests.post(url, headers=headers, params={"messageText": message}, timeout=30)
+        print(f"Wati: {r.status_code}")
+        return r.status_code
+    except Exception as e:
+        print(f"Wati error: {e}")
+        return 500
 
 
-# ===== FLUX GUIDE — MENUS TEXTE (sans boutons interactifs) =====
-# Remplacement de tous les boutons/listes par des menus numerotes
-# Le client repond avec 1, 2, 3 etc.
+# ===== QUESTIONS DU FLUX =====
 
 def ask_passengers(phone, lang="fr"):
-    conv = get_or_create_conversation(phone)
     if lang == "en":
         msg = (
             "👋 Hello! Welcome to Robin des Airs ✈️\n\n"
             "Let's check your eligibility in 2 min ⏱️\n\n"
             "👥 How many passengers were on the flight?\n\n"
-            "1️⃣ 1 passenger — up to 600 EUR\n"
-            "2️⃣ 2 passengers — up to 1200 EUR\n"
-            "3️⃣ 3 passengers — up to 1800 EUR\n"
-            "4️⃣ 4 passengers — up to 2400 EUR\n"
-            "5️⃣ 5 passengers — up to 3000 EUR\n"
-            "6️⃣ 6 or more — Climbie calls you\n\n"
+            "1️⃣ 1 passenger\n2️⃣ 2 passengers\n3️⃣ 3 passengers\n"
+            "4️⃣ 4 passengers\n5️⃣ 5 passengers\n6️⃣ 6 or more — Climbie calls you\n\n"
             "Reply with the number (1-6)"
         )
     else:
@@ -319,12 +276,8 @@ def ask_passengers(phone, lang="fr"):
             "👋 Bonjour ! Bienvenue chez Robin des Airs ✈️\n\n"
             "Verifions votre eligibilite en 2 min ⏱️\n\n"
             "👥 Combien de passagers sur le vol ?\n\n"
-            "1️⃣ 1 passager — jusqu'a 600 EUR\n"
-            "2️⃣ 2 passagers — jusqu'a 1200 EUR\n"
-            "3️⃣ 3 passagers — jusqu'a 1800 EUR\n"
-            "4️⃣ 4 passagers — jusqu'a 2400 EUR\n"
-            "5️⃣ 5 passagers — jusqu'a 3000 EUR\n"
-            "6️⃣ 6 ou plus — Climbie vous appelle\n\n"
+            "1️⃣ 1 passager\n2️⃣ 2 passagers\n3️⃣ 3 passagers\n"
+            "4️⃣ 4 passagers\n5️⃣ 5 passagers\n6️⃣ 6 ou plus — Climbie vous appelle\n\n"
             "Repondez avec le numero (1-6)"
         )
     send_whatsapp_text(phone, msg)
@@ -337,18 +290,14 @@ def ask_incident_type(phone, conv):
         msg = (
             f"Great! 🎉 {pax} passenger(s) noted.\n\n"
             "✈️ What happened with your flight?\n\n"
-            "1️⃣ Delay of more than 3 hours\n"
-            "2️⃣ Flight cancelled\n"
-            "3️⃣ Denied boarding (overbooking)\n\n"
+            "1️⃣ Delay over 3 hours\n2️⃣ Flight cancelled\n3️⃣ Denied boarding\n\n"
             "Reply with 1, 2 or 3"
         )
     else:
         msg = (
             f"Genial ! 🎉 {pax} passager(s) note(s).\n\n"
             "✈️ Que s'est-il passe avec votre vol ?\n\n"
-            "1️⃣ Retard de plus de 3 heures\n"
-            "2️⃣ Vol annule\n"
-            "3️⃣ Refus d'embarquement (surbooking)\n\n"
+            "1️⃣ Retard +3 heures\n2️⃣ Vol annule\n3️⃣ Refus d'embarquement\n\n"
             "Repondez avec 1, 2 ou 3"
         )
     send_whatsapp_text(phone, msg)
@@ -357,19 +306,9 @@ def ask_incident_type(phone, conv):
 def ask_flight_type(phone, conv):
     lang = conv["data"]["language"]
     if lang == "en":
-        msg = (
-            "✈️ Was your flight:\n\n"
-            "1️⃣ Direct flight\n"
-            "2️⃣ With connection(s)\n\n"
-            "Reply with 1 or 2"
-        )
+        msg = "✈️ Was your flight:\n\n1️⃣ Direct flight\n2️⃣ With connection(s)\n\nReply with 1 or 2"
     else:
-        msg = (
-            "✈️ Votre vol etait :\n\n"
-            "1️⃣ Vol direct\n"
-            "2️⃣ Avec correspondance(s)\n\n"
-            "Repondez avec 1 ou 2"
-        )
+        msg = "✈️ Votre vol etait :\n\n1️⃣ Vol direct\n2️⃣ Avec correspondance(s)\n\nRepondez avec 1 ou 2"
     send_whatsapp_text(phone, msg)
 
 
@@ -378,30 +317,18 @@ def ask_airline(phone, conv):
     if lang == "en":
         msg = (
             "🛫 Which airline?\n\n"
-            "1️⃣ Air France 🇫🇷\n"
-            "2️⃣ KLM 🇳🇱\n"
-            "3️⃣ Brussels Airlines 🇧🇪\n"
-            "4️⃣ Lufthansa 🇩🇪\n"
-            "5️⃣ TAP Portugal 🇵🇹\n"
-            "6️⃣ Corsair\n"
-            "7️⃣ Air Senegal\n"
-            "8️⃣ Royal Air Maroc\n"
-            "9️⃣ Other — type the name\n\n"
-            "Reply with 1-9 or type the airline name"
+            "1️⃣ Air France\n2️⃣ KLM\n3️⃣ Brussels Airlines\n"
+            "4️⃣ Lufthansa\n5️⃣ TAP Portugal\n6️⃣ Corsair\n"
+            "7️⃣ Air Senegal\n8️⃣ Royal Air Maroc\n9️⃣ Other (type the name)\n\n"
+            "Reply with 1-9 OR type the airline name directly"
         )
     else:
         msg = (
             "🛫 Quelle compagnie aerienne ?\n\n"
-            "1️⃣ Air France 🇫🇷\n"
-            "2️⃣ KLM 🇳🇱\n"
-            "3️⃣ Brussels Airlines 🇧🇪\n"
-            "4️⃣ Lufthansa 🇩🇪\n"
-            "5️⃣ TAP Portugal 🇵🇹\n"
-            "6️⃣ Corsair\n"
-            "7️⃣ Air Senegal\n"
-            "8️⃣ Royal Air Maroc\n"
-            "9️⃣ Autre — tapez le nom\n\n"
-            "Repondez avec 1-9 ou tapez le nom"
+            "1️⃣ Air France\n2️⃣ KLM\n3️⃣ Brussels Airlines\n"
+            "4️⃣ Lufthansa\n5️⃣ TAP Portugal\n6️⃣ Corsair\n"
+            "7️⃣ Air Senegal\n8️⃣ Royal Air Maroc\n9️⃣ Autre (tapez le nom)\n\n"
+            "Repondez avec 1-9 OU tapez directement le nom"
         )
     send_whatsapp_text(phone, msg)
 
@@ -410,79 +337,44 @@ def ask_flight_number(phone, conv):
     lang = conv["data"]["language"]
     airline = conv["data"]["airline"] or ""
     if lang == "en":
-        msg = (
-            f"📝 {airline} ✅\n\n"
-            "What is your flight number?\n\n"
-            "Example: AF718, KL563, SN271\n\n"
-            "Or send a photo of your boarding pass 📸"
-        )
+        msg = f"📝 {airline} ✅\n\nWhat is your flight number?\n\nExample: AF718, KL563, SN271\n\nOr send a photo of your boarding pass 📸"
     else:
-        msg = (
-            f"📝 {airline} ✅\n\n"
-            "Quel est votre numero de vol ?\n\n"
-            "Exemple : AF718, KL563, SN271\n\n"
-            "Ou envoyez une photo de votre carte d'embarquement 📸"
-        )
+        msg = f"📝 {airline} ✅\n\nQuel est votre numero de vol ?\n\nExemple : AF718, KL563, SN271\n\nOu envoyez une photo de votre carte d'embarquement 📸"
     send_whatsapp_text(phone, msg)
 
 
 def ask_flight_date(phone, conv):
     lang = conv["data"]["language"]
-    current_year = datetime.now().year
+    cy = datetime.now().year
+    conv["data"]["temp_years"] = [cy, cy-1, cy-2, cy-3, cy-4]
     if lang == "en":
         msg = (
-            "📅 What year was your flight?\n\n"
-            f"1️⃣ {current_year}\n"
-            f"2️⃣ {current_year-1}\n"
-            f"3️⃣ {current_year-2}\n"
-            f"4️⃣ {current_year-3}\n"
-            f"5️⃣ {current_year-4}\n"
-            "6️⃣ Before 2021 (outside 5-year limit)\n\n"
-            "Reply with 1-6"
+            f"📅 What year was your flight?\n\n"
+            f"1️⃣ {cy}\n2️⃣ {cy-1}\n3️⃣ {cy-2}\n4️⃣ {cy-3}\n5️⃣ {cy-4}\n"
+            f"6️⃣ Before {cy-4} (outside 5-year limit)\n\nReply with 1-6"
         )
     else:
         msg = (
-            "📅 De quelle annee etait votre vol ?\n\n"
-            f"1️⃣ {current_year}\n"
-            f"2️⃣ {current_year-1}\n"
-            f"3️⃣ {current_year-2}\n"
-            f"4️⃣ {current_year-3}\n"
-            f"5️⃣ {current_year-4}\n"
-            "6️⃣ Avant 2021 (hors retroactivite)\n\n"
-            "Repondez avec 1-6"
+            f"📅 De quelle annee etait votre vol ?\n\n"
+            f"1️⃣ {cy}\n2️⃣ {cy-1}\n3️⃣ {cy-2}\n4️⃣ {cy-3}\n5️⃣ {cy-4}\n"
+            f"6️⃣ Avant {cy-4} (hors retroactivite)\n\nRepondez avec 1-6"
         )
-    conv["data"]["temp_years"] = [current_year, current_year-1, current_year-2, current_year-3, current_year-4]
     send_whatsapp_text(phone, msg)
 
 
 def ask_flight_month(phone, conv):
     lang = conv["data"]["language"]
     if lang == "en":
-        msg = (
-            "📅 Which month?\n\n"
-            "1️⃣ Jan  2️⃣ Feb  3️⃣ Mar\n"
-            "4️⃣ Apr  5️⃣ May  6️⃣ Jun\n"
-            "7️⃣ Jul  8️⃣ Aug  9️⃣ Sep\n"
-            "🔟 Oct  1️⃣1️⃣ Nov  1️⃣2️⃣ Dec\n\n"
-            "Reply with the number (1-12)"
-        )
+        msg = "📅 Which month?\n\n1=Jan 2=Feb 3=Mar 4=Apr 5=May 6=Jun\n7=Jul 8=Aug 9=Sep 10=Oct 11=Nov 12=Dec\n\nReply with the number (1-12)"
     else:
-        msg = (
-            "📅 Quel mois ?\n\n"
-            "1️⃣ Jan  2️⃣ Fev  3️⃣ Mars\n"
-            "4️⃣ Avr  5️⃣ Mai  6️⃣ Juin\n"
-            "7️⃣ Juil 8️⃣ Aout 9️⃣ Sept\n"
-            "🔟 Oct  1️⃣1️⃣ Nov  1️⃣2️⃣ Dec\n\n"
-            "Repondez avec le numero (1-12)"
-        )
+        msg = "📅 Quel mois ?\n\n1=Jan 2=Fev 3=Mars 4=Avr 5=Mai 6=Juin\n7=Juil 8=Aout 9=Sept 10=Oct 11=Nov 12=Dec\n\nRepondez avec le numero (1-12)"
     send_whatsapp_text(phone, msg)
 
 
-def ask_flight_day_input(phone, conv):
+def ask_flight_day(phone, conv):
     lang = conv["data"]["language"]
     msg = "📅 Tapez le jour exact (1-31) :" if lang == "fr" else "📅 Type the exact day (1-31):"
     send_whatsapp_text(phone, msg)
-    conv["current_step"] = "flight_day_input"
 
 
 def ask_distance_band(phone, conv):
@@ -493,8 +385,7 @@ def ask_distance_band(phone, conv):
             "1️⃣ ≤ 1500 km — 250 EUR/passenger\n"
             "2️⃣ 1500–3500 km — 400 EUR/passenger\n"
             "3️⃣ > 3500 km (Europe-Africa) — 600 EUR/passenger\n"
-            "4️⃣ I don't know — we'll estimate later\n\n"
-            "Reply with 1, 2, 3 or 4"
+            "4️⃣ I don't know\n\nReply with 1, 2, 3 or 4"
         )
     else:
         msg = (
@@ -502,8 +393,7 @@ def ask_distance_band(phone, conv):
             "1️⃣ ≤ 1500 km — 250 EUR/passager\n"
             "2️⃣ 1500–3500 km — 400 EUR/passager\n"
             "3️⃣ > 3500 km (Europe-Afrique) — 600 EUR/passager\n"
-            "4️⃣ Je ne sais pas — on estimera\n\n"
-            "Repondez avec 1, 2, 3 ou 4"
+            "4️⃣ Je ne sais pas\n\nRepondez avec 1, 2, 3 ou 4"
         )
     send_whatsapp_text(phone, msg)
 
@@ -512,21 +402,9 @@ def ask_passenger_names(phone, conv):
     lang = conv["data"]["language"]
     pax = conv["data"]["passengers"] or 1
     if lang == "en":
-        msg = (
-            f"👤 Names of the {pax} passenger(s) please.\n\n"
-            "Send like this:\n"
-            "1. John Doe\n"
-            "2. Jane Doe\n\n"
-            "(First name + Last name for each)"
-        )
+        msg = f"👤 Names of the {pax} passenger(s) please.\n\nSend like this:\n1. John Doe\n2. Jane Doe\n\n(First + Last name each)"
     else:
-        msg = (
-            f"👤 Noms des {pax} passager(s) svp.\n\n"
-            "Envoyez comme ca :\n"
-            "1. Jean Dupont\n"
-            "2. Marie Dupont\n\n"
-            "(Prenom + Nom pour chacun)"
-        )
+        msg = f"👤 Noms des {pax} passager(s) svp.\n\nEnvoyez comme ca :\n1. Jean Dupont\n2. Marie Dupont\n\n(Prenom + Nom pour chacun)"
     send_whatsapp_text(phone, msg)
 
 
@@ -534,30 +412,21 @@ def ask_minors(phone, conv):
     lang = conv["data"]["language"]
     pax = conv["data"]["passengers"] or 1
     if pax == 1:
-        if lang == "en":
-            msg = "👤 Are you over 18?\n\n1️⃣ Yes, adult\n2️⃣ No, minor\n\nReply with 1 or 2"
-        else:
-            msg = "👤 Etes-vous majeur(e) (18+ ans) ?\n\n1️⃣ Oui, majeur\n2️⃣ Non, mineur\n\nRepondez avec 1 ou 2"
+        msg = "👤 Etes-vous majeur(e) (18+ ans) ?\n\n1️⃣ Oui, majeur\n2️⃣ Non, mineur\n\nRepondez avec 1 ou 2" if lang == "fr" else "👤 Are you over 18?\n\n1️⃣ Yes, adult\n2️⃣ No, minor\n\nReply with 1 or 2"
     else:
-        if lang == "en":
-            msg = f"👶 Among the {pax} passengers, any minors (under 18)?\n\n1️⃣ No, all adults\n2️⃣ Yes, there are minors\n\nReply with 1 or 2"
-        else:
-            msg = f"👶 Parmi les {pax} passagers, des mineurs (moins de 18 ans) ?\n\n1️⃣ Non, tous majeurs\n2️⃣ Oui, il y a des mineurs\n\nRepondez avec 1 ou 2"
+        msg = f"👶 Parmi les {pax} passagers, des mineurs (moins 18 ans) ?\n\n1️⃣ Non, tous majeurs\n2️⃣ Oui, il y a des mineurs\n\nRepondez avec 1 ou 2" if lang == "fr" else f"👶 Among {pax} passengers, any minors?\n\n1️⃣ No, all adults\n2️⃣ Yes, there are minors\n\nReply with 1 or 2"
     send_whatsapp_text(phone, msg)
 
 
 def ask_minors_count(phone, conv):
     lang = conv["data"]["language"]
     pax = conv["data"]["passengers"] or 1
-    opts = "\n".join([f"{i}️⃣ {i} mineur{'s' if i > 1 else ''}" if lang == "fr" else f"{i}️⃣ {i} minor{'s' if i > 1 else ''}" for i in range(1, min(pax, 5)+1)])
-    if lang == "en":
-        msg = f"👶 How many minors among the {pax} passengers?\n\n{opts}\n\nReply with the number"
-    else:
-        msg = f"👶 Combien de mineurs parmi les {pax} passagers ?\n\n{opts}\n\nRepondez avec le numero"
+    opts = "\n".join([f"{i}️⃣ {i} mineur{'s' if i > 1 else ''}" for i in range(1, min(pax, 5)+1)])
+    msg = f"👶 Combien de mineurs parmi les {pax} passagers ?\n\n{opts}\n\nRepondez avec le numero" if lang == "fr" else f"👶 How many minors among {pax}?\n\n{opts}\n\nReply with the number"
     send_whatsapp_text(phone, msg)
 
 
-def show_summary_and_mandat(phone, conv):
+def show_summary(phone, conv):
     lang = conv["data"]["language"]
     d = conv["data"]
     pax = d["passengers"] or 1
@@ -566,157 +435,152 @@ def show_summary_and_mandat(phone, conv):
     per_pax = band_info.get("amount_eur")
     total = (per_pax * pax) if per_pax else None
     net = int(total * 0.75) if total else None
-    band_label = band_info.get("label_fr" if lang == "fr" else "label_en")
+    band_label = band_info.get("label")
 
-    incident_labels = {
-        "delay": "Retard +3h" if lang == "fr" else "Delay +3h",
-        "cancel": "Annulation" if lang == "fr" else "Cancellation",
-        "denied": "Refus embarquement" if lang == "fr" else "Denied boarding",
-    }
-    incident = incident_labels.get(d.get("incident_type", ""), d.get("incident_type", "?"))
+    incident = INCIDENT_LABELS.get(d.get("incident_type", ""), d.get("incident_type", "?"))
+
+    ref = conv.get("ref_dossier") or generate_ref_dossier(phone)
+    conv["ref_dossier"] = ref
 
     names_str = "\n".join([f"  - {n}" for n in d.get("passenger_names", [])]) or "  - A completer"
 
-    # Reference dossier
-    ref = conv.get("ref_dossier")
-    if not ref:
-        ref = generate_ref_dossier(phone)
-        conv["ref_dossier"] = ref
-
-    # Lien mandat pre-rempli — uniquement robindesairs.eu
     params_dict = {
-        "pax": pax,
-        "vol": d.get("flight_number", ""),
-        "date": d.get("flight_date", ""),
-        "compagnie": d.get("airline", ""),
-        "incident": d.get("incident_type", ""),
-        "type_vol": d.get("flight_type", ""),
-        "distance": band_id,
-        "noms": ",".join(d.get("passenger_names", [])),
-        "mineurs": d.get("minors_count", 0),
-        "source": "whatsapp_bot",
+        "ref": ref, "pax": pax, "vol": d.get("flight_number", ""),
+        "date": d.get("flight_date", ""), "compagnie": d.get("airline", ""),
+        "incident": d.get("incident_type", ""), "type_vol": d.get("flight_type", ""),
+        "distance": band_id, "noms": ",".join(d.get("passenger_names", [])),
+        "mineurs": d.get("minors_count", 0), "source": "whatsapp_bot",
     }
     query = "&".join([f"{k}={requests.utils.quote(str(v))}" for k, v in params_dict.items() if v])
     mandat_link = f"{MANDAT_URL}?{query}"
 
     if per_pax:
-        if d.get("incident_type") == "delay" and band_id == "band_600":
-            money = f"💶 300 a 600 EUR/passager ({band_label})\n💰 TOTAL: {300*pax} a {600*pax} EUR\n✅ NET: {int(0.75*300*pax)} a {int(0.75*600*pax)} EUR"
-        else:
-            money = f"💶 {per_pax} EUR/passager ({band_label})\n💰 TOTAL: {total} EUR\n✅ NET POUR VOUS: {net} EUR"
+        money = f"💶 {per_pax} EUR/passager ({band_label})\n💰 TOTAL : {total} EUR\n✅ NET POUR VOUS : {net} EUR"
     else:
-        money = "💶 Montant a confirmer selon distance\n✅ Net: 75% si succes"
+        money = "💶 Montant a confirmer selon distance"
 
     if lang == "en":
         body = (
-            f"🎉 PERFECT! Here's your file summary:\n\n"
+            f"🎉 PERFECT!\n\n"
             f"📋 File ref: {ref}\n"
             f"✈️ Flight: {d.get('flight_number','?')} ({d.get('airline','?')})\n"
             f"📅 Date: {d.get('flight_date','?')}\n"
-            f"👥 Passengers: {pax}\n"
-            f"{names_str}\n"
+            f"👥 Passengers: {pax}\n{names_str}\n"
             f"👶 Minors: {d.get('minors_count',0)}\n"
-            f"⚠️ Incident: {incident}\n"
-            f"📏 Distance: {band_label}\n\n"
-            f"{money}\n\n"
-            f"👇 Sign your mandate (3 min, pre-filled):\n{mandat_link}"
+            f"⚠️ Incident: {incident}\n📏 Distance: {band_label}\n\n{money}\n\n"
+            f"👇 Sign your mandate (3 min):\n{mandat_link}"
         )
     else:
         body = (
-            f"🎉 PARFAIT ! Voici votre dossier :\n\n"
+            f"🎉 PARFAIT !\n\n"
             f"📋 Ref dossier : {ref}\n"
             f"✈️ Vol : {d.get('flight_number','?')} ({d.get('airline','?')})\n"
             f"📅 Date : {d.get('flight_date','?')}\n"
-            f"👥 Passagers : {pax}\n"
-            f"{names_str}\n"
+            f"👥 Passagers : {pax}\n{names_str}\n"
             f"👶 Mineurs : {d.get('minors_count',0)}\n"
-            f"⚠️ Incident : {incident}\n"
-            f"📏 Distance : {band_label}\n\n"
-            f"{money}\n\n"
-            f"👇 Signez votre mandat (3 min, pre-rempli) :\n{mandat_link}"
+            f"⚠️ Incident : {incident}\n📏 Distance : {band_label}\n\n{money}\n\n"
+            f"👇 Signez votre mandat (3 min) :\n{mandat_link}"
         )
-
     send_whatsapp_text(phone, body)
     
-    # Enregistre dans Airtable
-    save_lead_to_airtable(phone, conv, f"Dossier complet - {d.get('airline','')} {d.get('flight_number','')}")
-    
+    # Sauvegarde finale Airtable
+    airtable_save_progressive(phone, conv)
     conv["current_step"] = "completed"
 
 
-# ===== TRAITEMENT REPONSES NUMERIQUES =====
+# ===== TRAITEMENT REPONSES =====
 
-AIRLINES_MAP = {
-    "1": "Air France", "2": "KLM", "3": "Brussels Airlines",
-    "4": "Lufthansa", "5": "TAP Portugal", "6": "Corsair",
-    "7": "Air Senegal", "8": "Royal Air Maroc", "9": "AUTRE",
-}
-
-def process_text_menu(phone, text, conv):
-    """Traite les reponses numeriques aux menus texte"""
-    current_step = conv.get("current_step")
+def process_reply(phone, text, conv):
+    """Traite la reponse du client a chaque etape"""
+    step = conv.get("current_step")
     text = text.strip()
-    num = re.search(r"^\d+", text)
-    choice = num.group(0) if num else None
+    num_match = re.search(r"^(\d+)", text)
+    choice = num_match.group(1) if num_match else None
 
-    # PASSAGERS
-    if current_step == "passengers":
+    print(f"[REPLY] step={step} text='{text[:30]}' choice={choice}")
+
+    # ===== PASSAGERS =====
+    if step == "passengers":
         if choice in ["1","2","3","4","5"]:
             conv["data"]["passengers"] = int(choice)
             conv["current_step"] = "incident_type"
+            airtable_save_progressive(phone, conv)
             ask_incident_type(phone, conv)
             return True
         elif choice == "6":
-            send_whatsapp_text(phone, f"🙏 Pour les groupes de 6+, Climbie vous appelle directement.\n\n📱 +33 7 56 86 36 30\n\nOu : 👉 {DEPOT_URL}")
+            send_whatsapp_text(phone, f"🙏 Pour 6+ passagers, Climbie vous appelle.\n\n📱 +33 7 56 86 36 30\n\n👉 {DEPOT_URL}")
             return True
+        return False
 
-    # INCIDENT
-    if current_step == "incident_type":
+    # ===== INCIDENT =====
+    if step == "incident_type":
         mapping = {"1": "delay", "2": "cancel", "3": "denied"}
         if choice in mapping:
             conv["data"]["incident_type"] = mapping[choice]
             conv["current_step"] = "flight_type"
+            airtable_save_progressive(phone, conv)
             ask_flight_type(phone, conv)
             return True
+        return False
 
-    # TYPE VOL
-    if current_step == "flight_type":
+    # ===== TYPE VOL =====
+    if step == "flight_type":
         if choice == "1":
             conv["data"]["flight_type"] = "direct"
-            conv["current_step"] = "airline"
-            ask_airline(phone, conv)
-            return True
         elif choice == "2":
             conv["data"]["flight_type"] = "connection"
-            conv["current_step"] = "airline"
-            ask_airline(phone, conv)
-            return True
+        else:
+            return False
+        conv["current_step"] = "airline"
+        ask_airline(phone, conv)
+        return True
 
-    # COMPAGNIE
-    if current_step == "airline":
-        lang = conv["data"]["language"]
-        if choice in AIRLINES_MAP and choice != "9":
+    # ===== COMPAGNIE — TRES IMPORTANT =====
+    if step == "airline":
+        # Cas 1 : choix numerique 1-8
+        if choice and choice in AIRLINES_MAP:
             conv["data"]["airline"] = AIRLINES_MAP[choice]
             conv["current_step"] = "flight_number"
+            airtable_save_progressive(phone, conv)
             ask_flight_number(phone, conv)
             return True
-        elif choice == "9":
+        # Cas 2 : choix 9 = Autre
+        if choice == "9":
+            lang = conv["data"]["language"]
             send_whatsapp_text(phone, "✍️ Tapez le nom de votre compagnie :" if lang == "fr" else "✍️ Type your airline name:")
             conv["current_step"] = "airline_other_input"
             return True
-        elif text and len(text.strip()) > 2 and not text.strip().isdigit():
-            # Le client a tape directement le nom de la compagnie
-            conv["data"]["airline"] = text.strip()
+        # Cas 3 : le client a tape directement le nom (pas un chiffre)
+        if not choice and len(text) >= 3:
+            conv["data"]["airline"] = text
             conv["current_step"] = "flight_number"
+            airtable_save_progressive(phone, conv)
             ask_flight_number(phone, conv)
             return True
+        return False
 
-    # ANNEE
-    if current_step == "flight_date":
+    # ===== AIRLINE OTHER INPUT =====
+    if step == "airline_other_input":
+        conv["data"]["airline"] = text
+        conv["current_step"] = "flight_number"
+        airtable_save_progressive(phone, conv)
+        ask_flight_number(phone, conv)
+        return True
+
+    # ===== NUMERO DE VOL =====
+    if step == "flight_number":
+        m = re.search(r"\b([A-Z]{2}\d{2,4})\b", text.upper())
+        conv["data"]["flight_number"] = m.group(1) if m else text
+        conv["current_step"] = "flight_date"
+        airtable_save_progressive(phone, conv)
+        ask_flight_date(phone, conv)
+        return True
+
+    # ===== ANNEE =====
+    if step == "flight_date":
         years = conv["data"].get("temp_years", [])
         if choice == "6":
-            lang = conv["data"]["language"]
-            send_whatsapp_text(phone, f"😔 La retroactivite est de 5 ans max.\n\nVotre vol est trop ancien.\n\n👉 {BLOG_URL}" if lang == "fr" else f"😔 The 5-year limit has passed.\n\nYour flight is too old.\n\n👉 {BLOG_URL}")
+            send_whatsapp_text(phone, f"😔 Retroactivite 5 ans max.\nVotre vol est trop ancien.\n\n👉 {BLOG_URL}")
             return True
         idx = int(choice) - 1 if choice and choice.isdigit() else -1
         if 0 <= idx < len(years):
@@ -724,59 +588,85 @@ def process_text_menu(phone, text, conv):
             conv["current_step"] = "flight_month"
             ask_flight_month(phone, conv)
             return True
+        return False
 
-    # MOIS
-    if current_step == "flight_month":
+    # ===== MOIS =====
+    if step == "flight_month":
         if choice and choice.isdigit() and 1 <= int(choice) <= 12:
             conv["data"]["temp_month"] = f"{int(choice):02d}"
-            ask_flight_day_input(phone, conv)
+            conv["current_step"] = "flight_day_input"
+            ask_flight_day(phone, conv)
             return True
+        return False
 
-    # JOUR
-    if current_step == "flight_day_input":
+    # ===== JOUR =====
+    if step == "flight_day_input":
         if choice and choice.isdigit() and 1 <= int(choice) <= 31:
             day = f"{int(choice):02d}"
             year = conv["data"].get("temp_year", "")
             month = conv["data"].get("temp_month", "")
             conv["data"]["flight_date"] = f"{day}/{month}/{year}"
             conv["current_step"] = "distance_band"
+            airtable_save_progressive(phone, conv)
             ask_distance_band(phone, conv)
             return True
+        return False
 
-    # DISTANCE
-    if current_step == "distance_band":
+    # ===== DISTANCE =====
+    if step == "distance_band":
         band_map = {"1": "band_250", "2": "band_400", "3": "band_600", "4": "band_unknown"}
         if choice in band_map:
             conv["data"]["distance_band"] = band_map[choice]
             conv["current_step"] = "passenger_names"
+            airtable_save_progressive(phone, conv)
             ask_passenger_names(phone, conv)
             return True
+        return False
 
-    # MINEURS
-    if current_step == "minor_check":
+    # ===== NOMS PASSAGERS =====
+    if step == "passenger_names":
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        names = [re.sub(r"^[\d\.\)\-\s]+", "", l).strip() for l in lines]
+        names = [n for n in names if len(n) >= 3 and not n.isdigit()]
+        if names:
+            conv["data"]["passenger_names"] = names
+            conv["current_step"] = "minor_check"
+            airtable_save_progressive(phone, conv)
+            ask_minors(phone, conv)
+            return True
+        else:
+            lang = conv["data"]["language"]
+            send_whatsapp_text(phone, "👤 Format :\n1. Jean Dupont\n2. Marie Dupont")
+            return True
+
+    # ===== MINEURS =====
+    if step == "minor_check":
         if choice == "1":
             conv["data"]["has_minors"] = False
             conv["data"]["minors_count"] = 0
             conv["current_step"] = "summary"
-            show_summary_and_mandat(phone, conv)
+            show_summary(phone, conv)
             return True
         elif choice == "2":
             pax = conv["data"].get("passengers") or 1
             if pax == 1:
-                send_whatsapp_text(phone, "👶 Pour un mineur seul, un parent doit signer.\n\n📱 Climbie : +33 7 56 86 36 30")
-            else:
-                conv["data"]["has_minors"] = True
-                ask_minors_count(phone, conv)
+                send_whatsapp_text(phone, "👶 Mineur seul : un parent doit signer.\n\n📱 Climbie : +33 7 56 86 36 30")
+                return True
+            conv["data"]["has_minors"] = True
+            conv["current_step"] = "minors_count"
+            ask_minors_count(phone, conv)
             return True
+        return False
 
-    # NOMBRE MINEURS
-    if current_step == "minors_count":
+    # ===== NOMBRE MINEURS =====
+    if step == "minors_count":
         pax = conv["data"].get("passengers") or 1
         if choice and choice.isdigit() and 1 <= int(choice) <= pax:
             conv["data"]["minors_count"] = int(choice)
             conv["current_step"] = "summary"
-            show_summary_and_mandat(phone, conv)
+            show_summary(phone, conv)
             return True
+        return False
 
     return False
 
@@ -787,35 +677,26 @@ def call_openai(phone, user_message, image_data=None):
     try:
         conv = get_or_create_conversation(phone)
         if image_data:
-            user_content = [
-                {"type": "text", "text": user_message or "Voici ma carte d'embarquement"},
+            content = [
+                {"type": "text", "text": user_message or "Carte d'embarquement"},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}},
             ]
-            conv["messages"].append({"role": "user", "content": user_content})
+            conv["messages"].append({"role": "user", "content": content})
         else:
             conv["messages"].append({"role": "user", "content": user_message})
 
         if len(conv["messages"]) > 20:
             conv["messages"] = conv["messages"][-20:]
 
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        data_context = "\n\nDONNEES COLLECTEES:\n"
-        for k, v in conv["data"].items():
-            if v and k not in ["language", "temp_year", "temp_month", "temp_years"]:
-                data_context += f"- {k}: {v}\n"
-        if any(v for k, v in conv["data"].items() if k not in ["language", "temp_year", "temp_month", "temp_years"]):
-            messages[0]["content"] += data_context
-
-        messages.extend(conv["messages"])
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conv["messages"]
         model = "gpt-4o" if image_data else "gpt-4o-mini"
-
-        response = requests.post(
+        r = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
             json={"model": model, "messages": messages, "max_tokens": 400, "temperature": 0.7},
             timeout=45,
         )
-        data = response.json()
+        data = r.json()
         if "choices" in data:
             text = data["choices"][0]["message"]["content"].strip()
             conv["messages"].append({"role": "assistant", "content": text})
@@ -828,8 +709,8 @@ def call_openai(phone, user_message, image_data=None):
 
 def detect_language(text):
     text_lower = text.lower()
-    en_words = ["hello", "hi", "my", "flight", "delay", "cancel", "what", "how", "yes", "no", "thanks", "i", "was"]
-    fr_words = ["bonjour", "salut", "mon", "vol", "retard", "annul", "que", "comment", "oui", "non", "merci", "je"]
+    en_words = ["hello", "hi", "my", "flight", "delay", "yes", "no", "thanks"]
+    fr_words = ["bonjour", "salut", "mon", "vol", "retard", "oui", "non", "merci"]
     en_count = sum(1 for w in en_words if w in text_lower.split())
     fr_count = sum(1 for w in fr_words if w in text_lower.split())
     return "en" if en_count > fr_count else "fr"
@@ -847,16 +728,15 @@ def webhook():
         phone = data.get("waId") or data.get("from") or data.get("phone")
         if not phone:
             return jsonify({"status": "no phone"}), 200
-
         if data.get("owner") is True:
             return jsonify({"status": "ignored own"}), 200
 
         conv = get_or_create_conversation(phone)
 
-        # Images
-        message_type = data.get("type", "text")
+        # Image ou texte
         image_data = None
         message_text = ""
+        message_type = data.get("type", "text")
 
         if message_type == "image" or "image" in data:
             media_url = data.get("data") or data.get("mediaUrl")
@@ -865,9 +745,9 @@ def webhook():
                     r = requests.get(media_url, headers={"Authorization": f"Bearer {WATI_API_TOKEN}"}, timeout=30)
                     if r.status_code == 200:
                         image_data = base64.b64encode(r.content).decode("utf-8")
-                except Exception as e:
-                    print(f"Image download error: {e}")
-            message_text = data.get("caption", "") or "Voici ma carte d'embarquement"
+                except Exception:
+                    pass
+            message_text = data.get("caption", "") or "carte"
         else:
             if "text" in data:
                 message_text = data["text"].get("body", "") if isinstance(data["text"], dict) else data["text"]
@@ -877,83 +757,61 @@ def webhook():
         if not message_text and not image_data:
             return jsonify({"status": "ignored empty"}), 200
 
-        payload_sig = f"text|{message_text.strip().lower()}|img:{bool(image_data)}"
-        if is_duplicate_event(phone, data, payload_sig):
+        sig = f"text|{message_text.strip().lower()}|img:{bool(image_data)}"
+        if is_duplicate_event(phone, data, sig):
             return jsonify({"status": "duplicate"}), 200
 
-        print(f"Message de {phone}: {message_text[:80]}")
+        print(f"[MSG] from={phone} step={conv.get('current_step')} text='{message_text[:50]}'")
 
         # Detecte langue
-        if message_text:
-            lang = detect_language(message_text)
-            if lang != conv["data"].get("language"):
-                conv["data"]["language"] = lang
+        if message_text and not conv["data"].get("language_locked"):
+            conv["data"]["language"] = detect_language(message_text)
 
         current_step = conv.get("current_step")
 
-        # Image de carte d'embarquement
+        # Image carte d'embarquement
         if image_data and current_step == "flight_number":
-            response = call_openai(phone, "Extrait: numero de vol, date, compagnie. JSON: {flight_number:..., date:..., airline:...}", image_data)
+            response = call_openai(phone, "Extrait JSON: {flight_number, date, airline}", image_data)
             if response:
                 try:
                     m = re.search(r"\{[^}]+\}", response)
                     if m:
-                        extracted = json.loads(m.group())
-                        if extracted.get("flight_number"):
-                            conv["data"]["flight_number"] = extracted["flight_number"]
-                        if extracted.get("date"):
-                            conv["data"]["flight_date"] = extracted["date"]
-                        if extracted.get("airline"):
-                            conv["data"]["airline"] = extracted["airline"]
-                        send_whatsapp_text(phone, f"📸 Carte lue !\n\n✈️ Vol : {conv['data'].get('flight_number','?')}\n📅 Date : {conv['data'].get('flight_date','?')}\n✅ On continue...")
+                        ext = json.loads(m.group())
+                        if ext.get("flight_number"):
+                            conv["data"]["flight_number"] = ext["flight_number"]
+                        if ext.get("date"):
+                            conv["data"]["flight_date"] = ext["date"]
+                        if ext.get("airline"):
+                            conv["data"]["airline"] = ext["airline"]
+                        send_whatsapp_text(phone, f"📸 Carte lue !\n✈️ {conv['data'].get('flight_number','?')}\n📅 {conv['data'].get('flight_date','?')}")
                         conv["current_step"] = "distance_band"
+                        airtable_save_progressive(phone, conv)
                         ask_distance_band(phone, conv)
                         return jsonify({"status": "ok"}), 200
                 except Exception:
                     pass
 
-        # Saisie compagnie autre
-        if current_step == "airline_other_input":
-            conv["data"]["airline"] = message_text.strip()
-            conv["current_step"] = "flight_number"
-            ask_flight_number(phone, conv)
-            return jsonify({"status": "ok"}), 200
-
-        # Saisie noms passagers
-        if current_step == "passenger_names":
-            lines = [l.strip() for l in message_text.split("\n") if l.strip()]
-            names = [re.sub(r"^[\d\.\)\-\s]+", "", l).strip() for l in lines]
-            names = [n for n in names if len(n) >= 3 and not n.isdigit()]
-            if names:
-                conv["data"]["passenger_names"] = names
-                conv["current_step"] = "minor_check"
-                ask_minors(phone, conv)
-                # Enregistre le lead partiel dans Airtable
-                save_lead_to_airtable(phone, conv, message_text)
-            else:
-                lang = conv["data"]["language"]
-                send_whatsapp_text(phone, "👤 Envoyez les noms :\n1. Jean Dupont\n2. Marie Dupont" if lang == "fr" else "👤 Send names:\n1. John Doe\n2. Jane Doe")
-            return jsonify({"status": "ok"}), 200
-
-        # Menus numeriques — si flux en cours, on traite TOUJOURS ici
-        if current_step in STEPS:
-            if process_text_menu(phone, message_text, conv):
+        # FLUX EN COURS — toujours traiter ici en priorite
+        if current_step and current_step in STEPS:
+            handled = process_reply(phone, message_text, conv)
+            if handled:
                 return jsonify({"status": "ok"}), 200
-            # Si le menu n'a pas reconnu la reponse, on redemande
-            lang = conv["data"].get("language", "fr")
-            send_whatsapp_text(phone, "👆 Repondez avec le numero correspondant (ex: 1, 2, 3...)" if lang == "fr" else "👆 Please reply with the number (e.g. 1, 2, 3...)")
-            return jsonify({"status": "ok"}), 200
+            else:
+                # Reponse non reconnue
+                lang = conv["data"].get("language", "fr")
+                send_whatsapp_text(phone, "👆 Repondez avec le numero correspondant (ex: 1, 2, 3...)" if lang == "fr" else "👆 Reply with the number (e.g. 1, 2, 3...)")
+                return jsonify({"status": "ok"}), 200
 
-        # Demarrage flux — uniquement si pas de conversation en cours
-        trigger_words = ["vol", "retard", "annul", "indemn", "flight", "delay", "cancel", "compensation",
-                        "claim", "bonjour", "hello", "salut", "hi", "start", "commencer", "menu", "aide", "help"]
+        # Demarrage flux
+        trigger_words = ["vol", "retard", "annul", "indemn", "flight", "delay", "cancel",
+                        "compensation", "claim", "bonjour", "hello", "salut", "hi",
+                        "start", "commencer", "menu", "aide", "help"]
         is_trigger = any(w in message_text.lower() for w in trigger_words)
 
-        if conv.get("current_step") is None or current_step == "completed":
+        if current_step is None or current_step == "completed":
             if is_trigger or len(message_text) < 50:
                 conv["current_step"] = "passengers"
-                # Enregistre le premier contact dans Airtable
-                save_lead_to_airtable(phone, conv, message_text)
+                conv["ref_dossier"] = generate_ref_dossier(phone)
                 ask_passengers(phone, conv["data"]["language"])
                 return jsonify({"status": "flow started"}), 200
 
@@ -971,13 +829,12 @@ def webhook():
         return jsonify({"status": "error"}), 500
 
 
-# ===== ENDPOINTS =====
-
 @app.route("/test_flow/<phone>", methods=["GET"])
 def test_flow(phone):
     conv = get_or_create_conversation(phone)
     conv["current_step"] = "passengers"
     conv["data"]["language"] = "fr"
+    conv["ref_dossier"] = generate_ref_dossier(phone)
     ask_passengers(phone, "fr")
     return jsonify({"status": "flow started", "phone": phone}), 200
 
@@ -986,7 +843,11 @@ def test_flow(phone):
 def list_conversations():
     result = {}
     for phone, conv in conversations.items():
-        result[phone] = {"step": conv.get("current_step"), "data": conv["data"], "messages": len(conv["messages"])}
+        result[phone] = {
+            "step": conv.get("current_step"),
+            "ref": conv.get("ref_dossier"),
+            "data": conv["data"],
+        }
     return jsonify(result), 200
 
 
@@ -1001,18 +862,18 @@ def reset(phone):
 def test():
     return jsonify({
         "status": "running",
-        "version": "v7 - menus texte + Airtable direct + domaine unique robindesairs.eu",
+        "version": "v8 - sauvegarde progressive Airtable + ref dossier + bug airline fixe",
         "domain": RDA_DOMAIN,
-        "airtable": "configured" if AIRTABLE_API_KEY else "MISSING",
-        "openai": "configured" if OPENAI_API_KEY else "MISSING",
-        "wati": "configured" if WATI_API_TOKEN else "MISSING",
+        "airtable": "OK" if AIRTABLE_API_KEY else "MISSING",
+        "openai": "OK" if OPENAI_API_KEY else "MISSING",
+        "wati": "OK" if WATI_API_TOKEN else "MISSING",
         "active_conversations": len(conversations),
     }), 200
 
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Robin des Airs Bot v7 - Running!", 200
+    return "Robin des Airs Bot v8", 200
 
 
 if __name__ == "__main__":
