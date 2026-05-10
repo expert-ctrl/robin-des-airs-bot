@@ -29,6 +29,82 @@ conversations = {}
 recent_event_ids = {}
 MEMORY_HOURS = 24
 
+# Derniere erreur API Airtable (visible sur GET /test pour debug)
+last_airtable_error = None
+
+# Noms des champs Airtable = EXACTEMENT comme les titres de colonnes dans la base.
+# Defauts = intitules type liste client (anglais). Surcharge sans toucher au code :
+#   AIRTABLE_FIELD_REF="Référence dossier"  etc.
+# Cle logique absente ou defaut None => champ non envoye (evite UNKNOWN_FIELD_NAME).
+AIRTABLE_FIELD_DEFAULTS = {
+    "nom": "name of the passenger",
+    "ref": "reference file",
+    "date_dossier": "file date",
+    "montant": "customer amount",
+    "commission_rda": "RDA commission",
+    "commission_agence": "agency commission",
+    "agence_partenaire": "partner agency",
+    "dossier_client": "customer file",
+    "remarques": "remark",
+    "date_naissance": None,
+    "statut_mineur": "minor status",
+    "nom_non_rep": None,
+    "whatsapp": "phone number",
+    "compagnie": "airline number",
+    "vol": "flight number",
+    "date_vol": "Flight date",
+    "incident": None,
+    "montant_brut": None,
+    "copie_passeport": None,
+    "copie_cni": None,
+    "mandat_url": None,
+    "statut_dossier": "file status",
+    "iban": None,
+}
+
+
+def airtable_field(key):
+    """Nom de colonne Airtable pour une cle logique (env > defaut). Defaut None => desactive."""
+    return os.environ.get(f"AIRTABLE_FIELD_{key.upper()}", AIRTABLE_FIELD_DEFAULTS.get(key))
+
+
+def airtable_put(fields, key, value, skip_if_empty=True):
+    """Ajoute fields[nom_colonne]=value si la colonne est configuree et la valeur utilisable."""
+    col = airtable_field(key)
+    if not col:
+        return
+    if value is None or (skip_if_empty and value == ""):
+        return
+    fields[col] = value
+
+
+def airtable_escape_formula_str(s):
+    """Echappe les quotes simples pour filterByFormula (double '')."""
+    return str(s).replace("'", "''")
+
+
+def normalize_dossier_phone(raw):
+    """Numero pour dossier / Airtable (style +33612345678)."""
+    if not raw:
+        return None
+    t = str(raw).strip().replace(" ", "")
+    if t.startswith("+"):
+        d = re.sub(r"\D", "", t[1:])
+        return ("+" + d) if d else None
+    d = re.sub(r"\D", "", t)
+    if len(d) < 8:
+        return None
+    if d.startswith("00"):
+        d = d[2:]
+    if d.startswith("0") and len(d) == 10:
+        d = "33" + d[1:]
+    return "+" + d
+
+
+def parse_phone_input_line(text):
+    """Parse une saisie utilisateur (ligne unique) vers +..."""
+    return normalize_dossier_phone(text)
+
 EU261_BANDS = {
     "band_250": {"amount_eur": 250, "label": "≤ 1500 km"},
     "band_400": {"amount_eur": 400, "label": "1500–3500 km"},
@@ -52,6 +128,8 @@ def band_from_distance_km(km):
 
 STEPS = [
     "entry_intent",
+    "confirm_phone",
+    "phone_other_input",
     "passengers",
     "incident_type",
     "cancel_notice_period",
@@ -64,7 +142,7 @@ STEPS = [
     "flight_day_input",
     "departure_airport",
     "arrival_airport",
-    "passenger_names",
+    "passenger_name_collect",
     "minor_check",
     "minors_count",
     "mailing_address",
@@ -152,15 +230,20 @@ def airtable_url():
 
 
 def airtable_find_records_by_ref(ref):
-    """Cherche les records existants par reference dossier"""
+    """Cherche les records existants par reference dossier (egalite stricte sur le champ Ref)."""
+    global last_airtable_error
     if not AIRTABLE_API_KEY or not ref:
         return []
     try:
-        formula = f"OR(FIND('{ref}', {{Remarques}}), {{Reference Dossier}}='{ref}')"
+        ref_f = airtable_field("ref")
+        r_esc = airtable_escape_formula_str(ref)
+        formula = f"{{{ref_f}}}='{r_esc}'"
         url = f"{airtable_url()}?filterByFormula={requests.utils.quote(formula)}"
         r = requests.get(url, headers=airtable_headers(), timeout=10)
         if r.status_code == 200:
             return r.json().get("records", [])
+        last_airtable_error = f"airtable_find GET {r.status_code}: {r.text[:2000]}"
+        print(last_airtable_error)
     except Exception as e:
         print(f"Airtable find error: {e}")
     return []
@@ -171,7 +254,9 @@ def airtable_save_progressive(phone, conv):
     Sauvegarde progressive : cree ou met a jour les records dans Airtable.
     Cree 1 ligne par passager des qu'on connait pax.
     Met a jour les champs au fur et a mesure de leur saisie.
+    Utilise conv['data']['dossier_phone'] si defini (numero dossier), sinon le waId session.
     """
+    global last_airtable_error
     if not AIRTABLE_API_KEY:
         return
 
@@ -185,20 +270,8 @@ def airtable_save_progressive(phone, conv):
         pax = d.get("passengers") or 1
         names = d.get("passenger_names", [])
 
-        base_fields = {
-            "WhatsApp": str(phone),
-            "Reference Dossier": ref,
-            "Date Dossier": datetime.now().strftime("%Y-%m-%d"),
-        }
-
-        if d.get("flight_number"):
-            base_fields["Vol"] = d["flight_number"]
-        if d.get("airline"):
-            base_fields["Compagnie"] = d["airline"]
-        if d.get("flight_date"):
-            base_fields["Date"] = d["flight_date"]
-        if d.get("incident_type"):
-            base_fields["Incident"] = INCIDENT_LABELS.get(d["incident_type"], d["incident_type"])
+        contact_raw = d.get("dossier_phone") or phone
+        contact = normalize_dossier_phone(contact_raw) or str(contact_raw)
 
         dep = d.get("departure_airport")
         arr = d.get("arrival_airport")
@@ -224,53 +297,110 @@ def airtable_save_progressive(phone, conv):
         per_pax = EU261_BANDS.get(band_id, EU261_BANDS["band_unknown"]).get("amount_eur")
         total_brut = (per_pax * pax) if per_pax else 0
         total_net = int(total_brut * 0.75) if total_brut else 0
+        commission_rda_val = int(round(total_brut * 0.25)) if total_brut else 0
+        try:
+            commission_agence_val = float(os.environ.get("AIRTABLE_DEFAULT_AGENCY_COMMISSION", "0"))
+        except ValueError:
+            commission_agence_val = 0.0
+        partner_agency = os.environ.get("AIRTABLE_DEFAULT_PARTNER_AGENCY", "").strip()
+        file_status = os.environ.get("AIRTABLE_DEFAULT_FILE_STATUS", "WhatsApp — intake").strip()
+
+        if d.get("has_minors") is True or (d.get("minors_count") or 0) > 0:
+            mc = d.get("minors_count") or 0
+            statut_mineur_txt = f"{mc} mineur(s)" if mc else "Mineur(s)"
+        elif d.get("has_minors") is False:
+            statut_mineur_txt = "Aucun mineur / tous majeurs"
+        else:
+            statut_mineur_txt = ""
+
+        common = {}
+        airtable_put(common, "ref", ref, skip_if_empty=False)
+        airtable_put(common, "date_dossier", datetime.now().strftime("%Y-%m-%d"), skip_if_empty=False)
+        airtable_put(common, "whatsapp", contact, skip_if_empty=False)
+        airtable_put(common, "vol", d.get("flight_number"))
+        airtable_put(common, "compagnie", d.get("airline"))
+        airtable_put(common, "date_vol", d.get("flight_date"))
+        if d.get("incident_type") and airtable_field("incident"):
+            airtable_put(common, "incident", INCIDENT_LABELS.get(d["incident_type"], d["incident_type"]))
+        airtable_put(common, "dossier_client", f"WhatsApp | {ref}", skip_if_empty=False)
+        airtable_put(common, "agence_partenaire", partner_agency)
+        airtable_put(common, "statut_dossier", file_status, skip_if_empty=False)
+        airtable_put(common, "commission_agence", commission_agence_val, skip_if_empty=False)
+        if statut_mineur_txt:
+            airtable_put(common, "statut_mineur", statut_mineur_txt, skip_if_empty=False)
 
         existing = airtable_find_records_by_ref(ref)
 
         if not existing:
             records_to_create = []
             for i in range(pax):
-                fields = dict(base_fields)
-                if i < len(names):
-                    fields["Nom"] = names[i]
-                else:
-                    fields["Nom"] = f"Passager {i+1}"
-                fields["Remarques"] = f"Ref: {ref} | Passager {i+1}/{pax}{route_suffix}{addr_suffix}"
+                fields = dict(common)
+                nom_val = names[i] if i < len(names) else f"Passager {i+1}"
+                airtable_put(fields, "nom", nom_val, skip_if_empty=False)
+                rem = f"Ref: {ref} | Passager {i+1}/{pax}{route_suffix}{addr_suffix}"
+                airtable_put(fields, "remarques", rem, skip_if_empty=False)
                 if i == 0 and total_net:
-                    fields["Montant"] = float(total_net)
+                    airtable_put(fields, "montant", float(total_net), skip_if_empty=False)
+                    if commission_rda_val:
+                        airtable_put(fields, "commission_rda", commission_rda_val, skip_if_empty=False)
+                    if total_brut and airtable_field("montant_brut"):
+                        airtable_put(fields, "montant_brut", float(total_brut), skip_if_empty=False)
                 else:
-                    fields["Montant"] = 0.0
+                    airtable_put(fields, "montant", 0.0, skip_if_empty=False)
+                    airtable_put(fields, "commission_rda", 0, skip_if_empty=False)
                 records_to_create.append({"fields": fields})
 
             payload = {"records": records_to_create, "typecast": True}
             r = requests.post(airtable_url(), headers=airtable_headers(), json=payload, timeout=15)
-            print(f"Airtable CREATE {pax} records: {r.status_code} - {r.text[:200]}")
+            if r.status_code not in (200, 201):
+                last_airtable_error = f"CREATE {r.status_code}: {r.text[:2500]}"
+                print(f"Airtable CREATE {pax} records: {r.status_code} - {r.text[:500]}")
+            else:
+                last_airtable_error = None
+                print(f"Airtable CREATE {pax} records: {r.status_code} OK")
 
         else:
             updates = []
+            rem_col = airtable_field("remarques")
             for i, rec in enumerate(existing[:pax]):
-                fields = dict(base_fields)
-                if i < len(names):
-                    fields["Nom"] = names[i]
+                fields = dict(common)
+                nom_val = names[i] if i < len(names) else f"Passager {i+1}"
+                airtable_put(fields, "nom", nom_val, skip_if_empty=False)
                 if i == 0 and total_net:
-                    fields["Montant"] = float(total_net)
+                    airtable_put(fields, "montant", float(total_net), skip_if_empty=False)
+                    if commission_rda_val:
+                        airtable_put(fields, "commission_rda", commission_rda_val, skip_if_empty=False)
+                    if total_brut and airtable_field("montant_brut"):
+                        airtable_put(fields, "montant_brut", float(total_brut), skip_if_empty=False)
+                else:
+                    airtable_put(fields, "montant", 0.0, skip_if_empty=False)
+                    airtable_put(fields, "commission_rda", 0, skip_if_empty=False)
                 if route_suffix or addr_suffix:
-                    prev = rec.get("fields", {}).get("Remarques") or ""
-                    merged = prev
-                    if route_suffix and route_suffix.strip(" |") not in prev.replace(" · ", " "):
-                        merged = (merged + route_suffix) if merged else f"Ref: {ref}{route_suffix}"
-                    if addr_suffix and "Adr:" not in merged:
-                        merged = (merged + addr_suffix) if merged else f"Ref: {ref}{addr_suffix}"
-                    if merged != prev:
-                        fields["Remarques"] = merged[:8000]
+                    if not rem_col:
+                        pass
+                    else:
+                        prev = (rec.get("fields") or {}).get(rem_col) or ""
+                        merged = prev
+                        if route_suffix and route_suffix.strip(" |") not in prev.replace(" · ", " "):
+                            merged = (merged + route_suffix) if merged else f"Ref: {ref}{route_suffix}"
+                        if addr_suffix and "Adr:" not in merged:
+                            merged = (merged + addr_suffix) if merged else f"Ref: {ref}{addr_suffix}"
+                        if merged != prev:
+                            fields[rem_col] = merged[:8000]
                 updates.append({"id": rec["id"], "fields": fields})
 
             if updates:
                 payload = {"records": updates, "typecast": True}
                 r = requests.patch(airtable_url(), headers=airtable_headers(), json=payload, timeout=15)
-                print(f"Airtable UPDATE {len(updates)} records: {r.status_code}")
+                if r.status_code != 200:
+                    last_airtable_error = f"PATCH {r.status_code}: {r.text[:2500]}"
+                    print(f"Airtable UPDATE {len(updates)} records: {r.status_code} - {r.text[:500]}")
+                else:
+                    last_airtable_error = None
+                    print(f"Airtable UPDATE {len(updates)} records: OK")
 
     except Exception as e:
+        last_airtable_error = f"EXC airtable_save: {e}"
         print(f"Airtable save error: {e}")
         import traceback
 
@@ -296,6 +426,7 @@ def fresh_dossier_data(lang="fr"):
         "route_distance_km": None,
         "distance_band": None,
         "passenger_names": [],
+        "passenger_name_collect_index": None,
         "has_minors": None,
         "minors_count": 0,
         "language": lang,
@@ -303,6 +434,8 @@ def fresh_dossier_data(lang="fr"):
         "temp_month": None,
         "temp_years": [],
         "mailing_address": None,
+        "wa_id": None,
+        "dossier_phone": None,
     }
 
 
@@ -387,6 +520,31 @@ def ask_entry_intent(phone, lang="fr"):
             "2️⃣ **Remplir mon dossier sur le site** (si vous avez tous vos documents)\n"
             "3️⃣ **J'ai une question specifique**\n\n"
             "Repondez **1**, **2** ou **3**"
+        )
+    send_whatsapp_text(phone, msg)
+
+
+def ask_confirm_phone(phone, conv):
+    """Demande si le numero WhatsApp (waId) est bien le contact dossier."""
+    lang = conv["data"].get("language", "fr")
+    ref = conv.get("ref_dossier") or "..."
+    disp = normalize_dossier_phone(phone) or str(phone)
+    conv["data"]["wa_id"] = phone
+    if lang == "en":
+        msg = (
+            f"📱 For file **{ref}**, is this the number we should use to reach you?\n\n"
+            f"👉 **{disp}**\n\n"
+            "1️⃣ Yes — this is my number for the claim\n"
+            "2️⃣ No — I'll send another number\n\n"
+            "Reply **1** or **2**"
+        )
+    else:
+        msg = (
+            f"📱 Pour le dossier **{ref}**, on utilise quel numero pour vous joindre ?\n\n"
+            f"Numero WhatsApp detecte :\n👉 **{disp}**\n\n"
+            "1️⃣ Oui — c'est bien mon numero pour le dossier\n"
+            "2️⃣ Non — j'envoie un autre numero\n\n"
+            "Repondez **1** ou **2**"
         )
     send_whatsapp_text(phone, msg)
 
@@ -606,47 +764,22 @@ def format_prenom_nom(clean_line):
     return f"{prenom} {nom}"
 
 
-def parse_passenger_names_block(text, expected_pax):
-    """
-    Une ligne par passager : Prenom NOM (au moins 2 mots).
-    Retourne (liste_normalisee, None) ou (None, code_erreur).
-    """
-    names = []
-    for raw in text.split("\n"):
-        stripped = raw.strip()
-        if not stripped:
-            continue
-        clean = re.sub(r"^[\d\.\)\-\s]+", "", stripped).strip()
-        if not clean or clean.isdigit():
-            return None, "format"
-        formatted = format_prenom_nom(clean)
-        if not formatted:
-            return None, "format"
-        names.append(formatted)
-    if len(names) < expected_pax:
-        return None, "not_enough"
-    return names[:expected_pax], None
-
-
-def ask_passenger_names(phone, conv):
+def ask_single_passenger_name(phone, conv):
+    """Demande le nom du passager i/pax (un par un)."""
     lang = conv["data"]["language"]
     pax = conv["data"]["passengers"] or 1
+    idx = conv["data"].get("passenger_name_collect_index") or 1
     if lang == "en":
         msg = (
-            f"👤 **{pax} passenger(s)** — one line each, format **First LAST** (last name in capitals).\n\n"
-            "Example:\n"
-            "1. John DOE\n"
-            "2. Jane SMITH\n\n"
-            "Same order as the number of tickets/passengers."
+            f"👤 Passenger **{idx} of {pax}** — send **First LAST** (last name in CAPS).\n\n"
+            "Example: John DOE\n\n"
+            "One line only for this passenger."
         )
     else:
         msg = (
-            f"👤 **{pax} passager(s)** — **une ligne par personne**, format **Prénom NOM** "
-            "(nom de famille tout en MAJUSCULES).\n\n"
-            "Exemple :\n"
-            "1. Jean DUPONT\n"
-            "2. Marie MARTIN\n\n"
-            "Meme ordre que sur les billets / la reservation."
+            f"👤 Passager **{idx} sur {pax}** — envoyez **Prénom NOM** (nom de famille en MAJUSCULES).\n\n"
+            "Exemple : Jean DUPONT\n\n"
+            "Une seule ligne pour ce passager."
         )
     send_whatsapp_text(phone, msg)
 
@@ -809,9 +942,11 @@ def finalize_route_after_arrival(phone, conv):
             line = "📏 Distance non estimee automatiquement — montants a verifier au dossier."
 
     send_whatsapp_text(phone, line)
-    conv["current_step"] = "passenger_names"
+    conv["data"]["passenger_names"] = []
+    conv["data"]["passenger_name_collect_index"] = 1
+    conv["current_step"] = "passenger_name_collect"
     airtable_save_progressive(phone, conv)
-    ask_passenger_names(phone, conv)
+    ask_single_passenger_name(phone, conv)
 
 
 def show_summary(phone, conv):
@@ -881,6 +1016,7 @@ def show_summary(phone, conv):
         "noms": ",".join(d.get("passenger_names", [])),
         "mineurs": d.get("minors_count", 0),
         "adresse": (d.get("mailing_address") or "").replace("\n", ", ")[:500],
+        "tel": (normalize_dossier_phone(d.get("dossier_phone")) or d.get("dossier_phone") or "")[:32],
         "source": "whatsapp_bot",
     }
     query = "&".join([f"{k}={requests.utils.quote(str(v))}" for k, v in params_dict.items() if v])
@@ -894,11 +1030,15 @@ def show_summary(phone, conv):
     addr_show = (d.get("mailing_address") or "").strip()
     addr_line_en = f"📮 Address: {addr_show}\n" if addr_show else ""
     addr_line_fr = f"📮 Adresse : {addr_show}\n" if addr_show else ""
+    tel_disp = normalize_dossier_phone(d.get("dossier_phone")) or (d.get("dossier_phone") or "")
+    tel_line_en = f"📱 Contact: {tel_disp}\n" if tel_disp else ""
+    tel_line_fr = f"📱 Contact dossier : {tel_disp}\n" if tel_disp else ""
 
     if lang == "en":
         body = (
             f"🎉 PERFECT!\n\n"
             f"📋 File ref: {ref}\n"
+            f"{tel_line_en}"
             f"✈️ Flight: {d.get('flight_number','?')} ({d.get('airline','?')})\n"
             f"📅 Date: {d.get('flight_date','?')}\n"
             f"{route_line_en}"
@@ -913,6 +1053,7 @@ def show_summary(phone, conv):
         body = (
             f"🎉 PARFAIT !\n\n"
             f"📋 Ref dossier : {ref}\n"
+            f"{tel_line_fr}"
             f"✈️ Vol : {d.get('flight_number','?')} ({d.get('airline','?')})\n"
             f"📅 Date : {d.get('flight_date','?')}\n"
             f"{route_line_fr}"
@@ -946,8 +1087,9 @@ def process_reply(phone, text, conv):
             lang = conv["data"].get("language", "fr")
             conv["data"] = fresh_dossier_data(lang)
             conv["ref_dossier"] = generate_ref_dossier(phone)
-            conv["current_step"] = "passengers"
-            ask_passengers(phone, lang)
+            conv["data"]["wa_id"] = phone
+            conv["current_step"] = "confirm_phone"
+            ask_confirm_phone(phone, conv)
             return True
         if choice == "2":
             lang = conv["data"].get("language", "fr")
@@ -997,6 +1139,40 @@ def process_reply(phone, text, conv):
             send_whatsapp_text(phone, msg)
             return True
         return False
+
+    if step == "confirm_phone":
+        if choice == "1":
+            conv["data"]["dossier_phone"] = normalize_dossier_phone(phone) or str(phone)
+            conv["current_step"] = "passengers"
+            ask_passengers(phone, conv["data"]["language"])
+            return True
+        if choice == "2":
+            lang = conv["data"].get("language", "fr")
+            send_whatsapp_text(
+                phone,
+                "📱 Envoyez votre numero en **international** (ex : +33 6 12 34 56 78 ou +225...), une seule ligne."
+                if lang == "fr"
+                else "📱 Send your number in **international** format (e.g. +33 6 12 34 56 78), one line.",
+            )
+            conv["current_step"] = "phone_other_input"
+            return True
+        return False
+
+    if step == "phone_other_input":
+        parsed = parse_phone_input_line(text)
+        if parsed:
+            conv["data"]["dossier_phone"] = parsed
+            conv["current_step"] = "passengers"
+            ask_passengers(phone, conv["data"]["language"])
+            return True
+        lang = conv["data"].get("language", "fr")
+        send_whatsapp_text(
+            phone,
+            "📱 Numero non reconnu. Exemple : +33 6 12 34 56 78"
+            if lang == "fr"
+            else "📱 Number not recognized. Example: +33 6 12 34 56 78",
+        )
+        return True
 
     if step == "passengers":
         if choice in ["1", "2", "3", "4", "5"]:
@@ -1150,35 +1326,32 @@ def process_reply(phone, text, conv):
             return True
         return False
 
-    if step == "passenger_names":
+    if step == "passenger_name_collect":
         pax = conv["data"].get("passengers") or 1
-        names, err = parse_passenger_names_block(text, pax)
-        if names:
-            conv["data"]["passenger_names"] = names
-            conv["current_step"] = "minor_check"
-            airtable_save_progressive(phone, conv)
-            ask_minors(phone, conv)
+        idx = conv["data"].get("passenger_name_collect_index") or 1
+        first_line = text.split("\n", 1)[0].strip()
+        clean = re.sub(r"^[\d\.\)\-\s]+", "", first_line).strip()
+        formatted = format_prenom_nom(clean) if clean and not clean.isdigit() else None
+        if not formatted:
+            lang = conv["data"].get("language", "fr")
+            send_whatsapp_text(
+                phone,
+                f"👤 Passager {idx}/{pax} : envoyez **Prénom NOM** (2 mots min., ex. Jean DUPONT)."
+                if lang == "fr"
+                else f"👤 Passenger {idx}/{pax}: send **First LAST** (2+ words, e.g. John DOE).",
+            )
             return True
-        lang = conv["data"]["language"]
-        if err == "not_enough":
-            hint = (
-                f"👤 Il manque des lignes : envoyez **{pax} lignes** (une par passager).\n\n"
-                "Format : Prénom NOM\n"
-                "Ex : Jean DUPONT"
-                if lang == "fr"
-                else f"👤 Missing lines: send **{pax} lines** (one per passenger).\n\n"
-                "Format: First LAST\n"
-                "e.g. John DOE"
-            )
+        names = list(conv["data"].get("passenger_names") or [])
+        names.append(formatted)
+        conv["data"]["passenger_names"] = names
+        airtable_save_progressive(phone, conv)
+        if len(names) >= pax:
+            conv["data"]["passenger_name_collect_index"] = None
+            conv["current_step"] = "minor_check"
+            ask_minors(phone, conv)
         else:
-            hint = (
-                "👤 Chaque ligne = **Prénom** + **NOM** (2 mots minimum, NOM en majuscules).\n\n"
-                "Exemple :\n1. Jean DUPONT\n2. Marie MARTIN"
-                if lang == "fr"
-                else "👤 Each line = **First** + **LAST** name (2+ words, LAST in capitals).\n\n"
-                "Example:\n1. John DOE\n2. Jane SMITH"
-            )
-        send_whatsapp_text(phone, hint)
+            conv["data"]["passenger_name_collect_index"] = idx + 1
+            ask_single_passenger_name(phone, conv)
         return True
 
     if step == "minor_check":
@@ -1386,8 +1559,9 @@ def webhook():
             if user_wants_start_dossier_from_faq(message_text):
                 conv["data"] = fresh_dossier_data(lang)
                 conv["ref_dossier"] = generate_ref_dossier(phone)
-                conv["current_step"] = "passengers"
-                ask_passengers(phone, lang)
+                conv["data"]["wa_id"] = phone
+                conv["current_step"] = "confirm_phone"
+                ask_confirm_phone(phone, conv)
                 return jsonify({"status": "faq to dossier"}), 200
             ans = call_openai_faq(message_text, lang)
             if not ans:
@@ -1484,11 +1658,14 @@ def webhook():
 @app.route("/test_flow/<phone>", methods=["GET"])
 def test_flow(phone):
     conv = get_or_create_conversation(phone)
-    conv["current_step"] = "entry_intent"
+    conv["ref_dossier"] = generate_ref_dossier(phone)
     conv["data"]["language"] = "fr"
     conv["data"]["flow_mode"] = "dossier"
-    ask_entry_intent(phone, "fr")
-    return jsonify({"status": "menu", "phone": phone}), 200
+    conv["data"]["wa_id"] = phone
+    conv["data"]["dossier_phone"] = normalize_dossier_phone(phone) or str(phone)
+    conv["current_step"] = "passengers"
+    ask_passengers(phone, "fr")
+    return jsonify({"status": "flow passengers (tel pre-rempli test)", "phone": phone}), 200
 
 
 @app.route("/conversations", methods=["GET"])
@@ -1515,19 +1692,23 @@ def test():
     return jsonify(
         {
             "status": "running",
-            "version": "v12 - adresse postale derniere etape + durees indiquees",
+            "version": "v15 - Airtable mapping etendu (colonnes type liste client)",
             "domain": RDA_DOMAIN,
             "airtable": "OK" if AIRTABLE_API_KEY else "MISSING",
+            "airtable_last_error": (last_airtable_error[:500] + "…")
+            if last_airtable_error and len(last_airtable_error) > 500
+            else last_airtable_error,
             "openai": "OK" if OPENAI_API_KEY else "MISSING",
             "wati": "OK" if WATI_API_TOKEN else "MISSING",
             "active_conversations": len(conversations),
+            "airtable_field_hint": "AIRTABLE_FIELD_<CLE> ex: NOM, REF, MONTANT, REMARQUES, COMMISSION_RDA, STATUT_DOSSIER, IBAN... + AIRTABLE_DEFAULT_PARTNER_AGENCY, AIRTABLE_DEFAULT_FILE_STATUS, AIRTABLE_DEFAULT_AGENCY_COMMISSION",
         }
     ), 200
 
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Robin des Airs Bot v12", 200
+    return "Robin des Airs Bot v15", 200
 
 
 if __name__ == "__main__":
