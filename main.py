@@ -876,12 +876,16 @@ def webhook():
                 send_whatsapp_text(phone, "👤 Envoyez les noms :\n1. Jean Dupont\n2. Marie Dupont" if lang == "fr" else "👤 Send names:\n1. John Doe\n2. Jane Doe")
             return jsonify({"status": "ok"}), 200
 
-        # Menus numeriques
+        # Menus numeriques — si flux en cours, on traite TOUJOURS ici
         if current_step in STEPS:
             if process_text_menu(phone, message_text, conv):
                 return jsonify({"status": "ok"}), 200
+            # Si le menu n'a pas reconnu la reponse, on redemande
+            lang = conv["data"].get("language", "fr")
+            send_whatsapp_text(phone, "👆 Repondez avec le numero correspondant (ex: 1, 2, 3...)" if lang == "fr" else "👆 Please reply with the number (e.g. 1, 2, 3...)")
+            return jsonify({"status": "ok"}), 200
 
-        # Demarrage flux
+        # Demarrage flux — uniquement si pas de conversation en cours
         trigger_words = ["vol", "retard", "annul", "indemn", "flight", "delay", "cancel", "compensation",
                         "claim", "bonjour", "hello", "salut", "hi", "start", "commencer", "menu", "aide", "help"]
         is_trigger = any(w in message_text.lower() for w in trigger_words)
