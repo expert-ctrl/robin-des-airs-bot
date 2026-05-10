@@ -96,46 +96,97 @@ ESCALADE A CLIMBIE +33 7 56 86 36 30 si :
 """
 
 
-# ===== AIRTABLE =====
 
-def save_lead_to_airtable(phone, conv_data, message_text=""):
-    """Enregistre ou met a jour un lead dans Airtable"""
+# ===== REFERENCE DOSSIER =====
+
+def generate_ref_dossier(phone):
+    """Genere une reference unique : RDA-YYYYMMDD-XXXX"""
+    today = datetime.now().strftime("%Y%m%d")
+    suffix = hashlib.md5(f"{phone}{today}".encode()).hexdigest()[:4].upper()
+    return f"RDA-{today}-{suffix}"
+
+
+# ===== AIRTABLE MULTI-LIGNES =====
+
+def save_lead_to_airtable(phone, conv_data, message_text="", force_complete=False):
+    """
+    Enregistre UN lead par passager dans Airtable.
+    - 1 passager = 1 ligne
+    - 2 passagers = 2 lignes avec le meme numero de dossier
+    - Montant total sur la 1ere ligne uniquement
+    - Remarques = notes supplementaires
+    """
     if not AIRTABLE_API_KEY:
         print("Airtable non configure - skip")
         return
+
     try:
         d = conv_data.get("data", {})
         pax = d.get("passengers") or 1
         band_id = d.get("distance_band", "band_unknown")
         per_pax = EU261_BANDS.get(band_id, EU261_BANDS["band_unknown"]).get("amount_eur")
         total = (per_pax * pax) if per_pax else None
+        net_total = int(total * 0.75) if total else None
 
-        fields = {
-            "fldsFH0PoWe3AV0sI": str(phone),  # Numero WhatsApp
-            "fldCtJysGhTYF2LNf": d.get("passenger_names", [{}])[0] if d.get("passenger_names") else "Inconnu",
-            "fldqks5asIPXar8BD": message_text[:500] if message_text else "",  # Remarques
-        }
-        if d.get("flight_number"):
-            fields["fldcVnS4B86eZntjr"] = d["flight_number"]
-        if d.get("airline"):
-            fields["fld8Ku1jGMOPWnrQc"] = d["airline"]
-        if d.get("flight_date"):
-            fields["flduDNEC3osPnTMAv"] = d["flight_date"]
-        if d.get("incident_type"):
-            incident_map = {"delay": "Retard +3h", "cancel": "Annulation", "denied": "Refus embarquement"}
-            fields["fldci5VnHb0HpOoKL"] = incident_map.get(d["incident_type"], d["incident_type"])
-        if total:
-            fields["fldlzkJOqqC8AYbIM"] = float(total)
+        # Reference dossier unique pour ce groupe
+        ref = conv_data.get("ref_dossier")
+        if not ref:
+            ref = generate_ref_dossier(phone)
+            conv_data["ref_dossier"] = ref
+
+        # Date du jour pour le dossier
+        date_dossier = datetime.now().strftime("%d/%m/%Y")
+
+        incident_map = {"delay": "Retard +3h", "cancel": "Annulation", "denied": "Refus embarquement"}
+        incident = incident_map.get(d.get("incident_type", ""), d.get("incident_type", ""))
+
+        names = d.get("passenger_names", [])
+        # Si pas encore de noms, on cree 1 ligne generique
+        if not names:
+            names = [f"Passager 1 - {phone}"]
 
         url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_ID}"
         headers = {
             "Authorization": f"Bearer {AIRTABLE_API_KEY}",
             "Content-Type": "application/json"
         }
-        response = requests.post(url, headers=headers, json={"fields": fields}, timeout=10)
-        print(f"Airtable: {response.status_code}")
+
+        # Cree une ligne par passager
+        for i, name in enumerate(names[:pax]):
+            is_first = (i == 0)
+
+            fields = {
+                "fldCtJysGhTYF2LNf": name,                    # Nom passager
+                "fldsFH0PoWe3AV0sI": str(phone),              # WhatsApp
+                "fldqks5asIPXar8BD": f"Ref: {ref} | Passager {i+1}/{pax}" + (f" | {message_text[:200]}" if message_text and is_first else ""),
+            }
+
+            # Vol + date + compagnie
+            if d.get("flight_number"):
+                fields["fldcVnS4B86eZntjr"] = d["flight_number"]
+            if d.get("airline"):
+                fields["fld8Ku1jGMOPWnrQc"] = d["airline"]
+            if d.get("flight_date"):
+                fields["flduDNEC3osPnTMAv"] = d["flight_date"]
+            if incident:
+                fields["fldci5VnHb0HpOoKL"] = incident
+
+            # Montant : total sur la 1ere ligne, 0 sur les suivantes (evite les doublons)
+            if per_pax:
+                if is_first:
+                    # 1ere ligne = montant total du groupe
+                    fields["fldlzkJOqqC8AYbIM"] = float(net_total) if net_total else float(per_pax * pax * 0.75)
+                else:
+                    # Lignes suivantes = 0 (montant deja compte sur la 1ere)
+                    fields["fldlzkJOqqC8AYbIM"] = 0.0
+
+            response = requests.post(url, headers=headers, json={"fields": fields}, timeout=10)
+            print(f"Airtable ligne {i+1}/{len(names)}: {response.status_code}")
+
     except Exception as e:
         print(f"Airtable error: {e}")
+
+
 
 
 # ===== DEDUP =====
@@ -526,6 +577,12 @@ def show_summary_and_mandat(phone, conv):
 
     names_str = "\n".join([f"  - {n}" for n in d.get("passenger_names", [])]) or "  - A completer"
 
+    # Reference dossier
+    ref = conv.get("ref_dossier")
+    if not ref:
+        ref = generate_ref_dossier(phone)
+        conv["ref_dossier"] = ref
+
     # Lien mandat pre-rempli — uniquement robindesairs.eu
     params_dict = {
         "pax": pax,
@@ -553,6 +610,7 @@ def show_summary_and_mandat(phone, conv):
     if lang == "en":
         body = (
             f"🎉 PERFECT! Here's your file summary:\n\n"
+            f"📋 File ref: {ref}\n"
             f"✈️ Flight: {d.get('flight_number','?')} ({d.get('airline','?')})\n"
             f"📅 Date: {d.get('flight_date','?')}\n"
             f"👥 Passengers: {pax}\n"
@@ -566,6 +624,7 @@ def show_summary_and_mandat(phone, conv):
     else:
         body = (
             f"🎉 PARFAIT ! Voici votre dossier :\n\n"
+            f"📋 Ref dossier : {ref}\n"
             f"✈️ Vol : {d.get('flight_number','?')} ({d.get('airline','?')})\n"
             f"📅 Date : {d.get('flight_date','?')}\n"
             f"👥 Passagers : {pax}\n"
@@ -590,7 +649,7 @@ def show_summary_and_mandat(phone, conv):
 AIRLINES_MAP = {
     "1": "Air France", "2": "KLM", "3": "Brussels Airlines",
     "4": "Lufthansa", "5": "TAP Portugal", "6": "Corsair",
-    "7": "Air Senegal", "8": "Royal Air Maroc",
+    "7": "Air Senegal", "8": "Royal Air Maroc", "9": "AUTRE",
 }
 
 def process_text_menu(phone, text, conv):
@@ -635,19 +694,19 @@ def process_text_menu(phone, text, conv):
 
     # COMPAGNIE
     if current_step == "airline":
-        if choice in AIRLINES_MAP:
+        lang = conv["data"]["language"]
+        if choice in AIRLINES_MAP and choice != "9":
             conv["data"]["airline"] = AIRLINES_MAP[choice]
             conv["current_step"] = "flight_number"
             ask_flight_number(phone, conv)
             return True
         elif choice == "9":
-            lang = conv["data"]["language"]
             send_whatsapp_text(phone, "✍️ Tapez le nom de votre compagnie :" if lang == "fr" else "✍️ Type your airline name:")
             conv["current_step"] = "airline_other_input"
             return True
-        elif len(text) > 2:
-            # Le client a tape directement le nom
-            conv["data"]["airline"] = text
+        elif text and len(text.strip()) > 2 and not text.strip().isdigit():
+            # Le client a tape directement le nom de la compagnie
+            conv["data"]["airline"] = text.strip()
             conv["current_step"] = "flight_number"
             ask_flight_number(phone, conv)
             return True
