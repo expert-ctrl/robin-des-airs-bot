@@ -1,11 +1,13 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 import requests
 import os
 import json
 import base64
+import zlib
 import re
 import hashlib
 from datetime import datetime, timedelta
+from urllib.parse import urlencode, urlparse
 
 app = Flask(__name__)
 
@@ -270,6 +272,33 @@ def _decode_mandat_html():
 _MANDAT_HTML_BODY = _decode_mandat_html()
 MANDAT_URL = os.environ.get("MANDAT_URL", f"{RDA_DOMAIN.rstrip('/')}/mandat.html")
 DEPOT_URL   = f"{RDA_DOMAIN.rstrip('/')}/depot-express"
+
+
+def _mandat_public_origin():
+    """Origine (schéma + hôte) pour le lien court /m — alignée sur MANDAT_URL."""
+    pu = urlparse(MANDAT_URL)
+    if pu.scheme and pu.netloc:
+        return f"{pu.scheme}://{pu.netloc}".rstrip("/")
+    return RDA_DOMAIN.rstrip("/")
+
+
+def mandat_link_compressed(params):
+    """
+    Lien /m?c=… (JSON + zlib + base64url) → redirection 302 vers mandat.html?…
+    """
+    filtered = {k: v for k, v in params.items() if v}
+    raw = json.dumps(filtered, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    blob = zlib.compress(raw, level=9)
+    c = base64.urlsafe_b64encode(blob).decode("ascii").rstrip("=")
+    return f"{_mandat_public_origin()}/m?c={c}", filtered
+
+
+def mandat_signing_link(params):
+    """Lien mandat le plus court : forme compressée /m si elle gagne, sinon query classique."""
+    short_url, filtered = mandat_link_compressed(params)
+    long_q = urlencode({k: str(v) for k, v in filtered.items()})
+    long_url = f"{MANDAT_URL}?{long_q}" if long_q else MANDAT_URL
+    return short_url if len(short_url) <= len(long_url) else long_url
 SUIVI_URL   = f"{RDA_DOMAIN.rstrip('/')}/suivi-dossier"
 CLIMBIE_TEL = "+33756863630"
 
@@ -327,6 +356,59 @@ AIRLINES_MAP = {
     "8": "Royal Air Maroc",
 }
 
+# Préfixes IATA courants (3 lettres testées avant 2) → nom affiché / Airtable
+FLIGHT_PREFIX_TO_AIRLINE = {
+    "EJU": "easyJet",
+    "BZZ": "Buzz",
+    "TUI": "TUI fly",
+    "AF": "Air France",
+    "KL": "KLM",
+    "SN": "Brussels Airlines",
+    "LH": "Lufthansa",
+    "TP": "TAP Portugal",
+    "SS": "Corsair",
+    "HC": "Air Senegal",
+    "HF": "Air Senegal",
+    "AT": "Royal Air Maroc",
+    "UX": "Air Europa",
+    "IB": "Iberia",
+    "BA": "British Airways",
+    "U2": "easyJet",
+    "FR": "Ryanair",
+    "W6": "Wizz Air",
+    "VY": "Vueling",
+    "EI": "Aer Lingus",
+    "LX": "Swiss",
+    "OS": "Austrian",
+    "EW": "Eurowings",
+    "DE": "Condor",
+    "TO": "Transavia France",
+    "HV": "Transavia",
+    "PC": "Pegasus Airlines",
+    "TK": "Turkish Airlines",
+    "MS": "EgyptAir",
+    "ET": "Ethiopian Airlines",
+    "SK": "SAS",
+    "DY": "Norwegian",
+    "XQ": "SunExpress",
+    "XQG": "SunExpress",
+}
+
+
+def airline_guess_from_flight_number(fn):
+    """Devine la compagnie à partir du préfixe IATA du n° de vol (ex. SN271 → Brussels Airlines)."""
+    fn = (fn or "").strip().upper()
+    m = re.match(r"^([A-Z]{2,3})\d", fn)
+    if not m:
+        return None
+    p = m.group(1)
+    for plen in (3, 2):
+        if len(p) >= plen:
+            code = p[:plen]
+            if code in FLIGHT_PREFIX_TO_AIRLINE:
+                return FLIGHT_PREFIX_TO_AIRLINE[code]
+    return None
+
 MONTH_NAMES_FR = (
     "", "janvier", "février", "mars", "avril", "mai", "juin",
     "juillet", "août", "septembre", "octobre", "novembre", "décembre",
@@ -371,14 +453,14 @@ def split_itinerary_for_mandat(itin):
 # 2. boarding_after_pax   → montant + photo carte (ou *1* sans photo)
 # 3. incident_type        → retard / annulation / refus
 # 4. airline              → compagnie (ou photo)
-# …
+# … puis date du vol → itinerary_dep / itinerary_arr (itinéraire billet déjà fusionné : saut)
 
 STEPS = [
     "passengers", "boarding_after_pax", "incident_type", "airline", "airline_other",
     "pnr_input", "flight_number",
     "flight_date", "flight_month", "flight_day",
-    "itinerary",
-    "passenger_names", "minor_check",
+    "itinerary_dep", "itinerary_arr",
+    "passenger_names", "passenger_names_confirm", "minor_check",
     "summary", "completed",
 ]
 
@@ -403,6 +485,8 @@ def fresh_data(lang="fr"):
         "pax_collect_idx": 1,
         "has_minors": None,
         "itinerary": None,
+        "temp_itin_dep": None,
+        "pending_ticket_dm": None,  # ("DD","MM") si jour/mois lus sur billet sans année
     }
 
 def get_conv(phone):
@@ -673,8 +757,7 @@ def q_boarding_after_pax(phone, lang, pax):
             f"✅ *{pax} passenger(s).*\n\n"
             f"Indicative **net up to {net} €** for your group (75% after our 25% fee if we win — tier shown below).\n\n"
             f"{box}\n\n"
-            "📸 *The easy way:* one **clear photo** of your boarding pass or e-ticket — we auto-fill flight, date, airline, PNR, route. "
-            "It keeps the process light before we go further.\n\n"
+            "📸 *The easy way:* one **clear photo** of your boarding pass or e-ticket — we auto-fill flight, date, airline, PNR, route.\n\n"
             "1️⃣  *I'll send the photo* — reply *1*, then send the image (or send the image right now)\n"
             "2️⃣  *I'd rather answer step by step* — reply *2* (no photo for now — next: what happened to your flight)"
         )
@@ -682,8 +765,7 @@ def q_boarding_after_pax(phone, lang, pax):
         msg = (
             f"✅ *{pax} passager(s) noté(s).* Voici l'estimation indicative (**net jusqu'à {net} €** pour le groupe si succès, après commission RDA 25 % — palier ci-dessous).\n\n"
             f"{box}\n\n"
-            "📸 *Le plus simple :* une **photo nette** de votre carte d'embarquement ou billet — on remplit vol, date, compagnie, PNR, trajet pour vous. "
-            "C'est souvent ce petit « gadget » qui rend la démarche **facile et naturelle** avant d'aller plus loin.\n\n"
+            "📸 *Le plus simple :* une **photo nette** de votre carte d'embarquement ou billet — on remplit vol, date, compagnie, PNR, trajet pour vous.\n\n"
             "1️⃣  *J'envoie la photo* — répondez *1* puis envoyez l'image *(ou envoyez la photo directement)*\n"
             "2️⃣  *Je préfère répondre aux questions* une par une — répondez *2* (sans photo pour l'instant — ensuite : retard / annulation / refus)"
         )
@@ -749,35 +831,55 @@ def q_pnr(phone, lang, airline):
         )
     send(phone, msg)
 
+
+def next_after_airline_pick(phone, lang, conv):
+    """Après choix de la compagnie : ne redemande pas le PNR s'il est déjà sur le billet (fusion)."""
+    d = conv["data"]
+    air = d.get("airline") or ""
+    pnr_clean = re.sub(r"[^A-Za-z0-9]", "", (d.get("pnr") or "").upper())
+    if len(pnr_clean) >= 5:
+        d["pnr"] = pnr_clean[:8]
+        conv["step"] = "flight_number"
+        q_flight_number(phone, lang)
+    else:
+        conv["step"] = "pnr_input"
+        q_pnr(phone, lang, air)
+
+
 def q_flight_number(phone, lang):
     if lang == "en":
-        msg = (
-            "✈️ *Flight number?*\n\n"
-            "Example: *AF718 · SN271 · KL563*\n\n"
-            "📸 Or send a photo of your boarding pass"
-        )
+        msg = "✈️ *Flight number?*\nE.g. *SN271* — or send a boarding pass photo."
     else:
-        msg = (
-            "✈️ *Numéro de vol ?*\n\n"
-            "Exemple : *AF718 · SN271 · KL563*\n\n"
-            "📸 Ou envoyez une photo de votre carte d'embarquement"
-        )
+        msg = "✈️ *Numéro de vol ?*\nEx. *SN271* — ou une photo de carte d'embarquement."
     send(phone, msg)
 
 def q_flight_date(phone, lang, conv):
     cy = datetime.now().year
-    conv["data"]["temp_years"] = [cy, cy-1, cy-2, cy-3, cy-4]
+    conv["data"]["temp_years"] = [cy, cy - 1, cy - 2, cy - 3, cy - 4]
+    dm = conv["data"].get("pending_ticket_dm")
+    intro_en = intro_fr = ""
+    if dm and isinstance(dm, (list, tuple)) and len(dm) == 2:
+        day_s, mon_s = dm[0], dm[1]
+        try:
+            mw = month_word(mon_s, lang)
+            di = int(day_s.lstrip("0") or "0")
+        except ValueError:
+            mw, di = mon_s, day_s
+        if lang == "en":
+            intro_en = f"🎫 *{mw} {di}* on the ticket — *which year?*\n\n"
+        else:
+            intro_fr = f"🎫 *{di} {mw}* sur le billet — *quelle année ?*\n\n"
     if lang == "en":
         msg = (
-            "📅 *Year of the flight?*\n\n"
-            f"1️⃣  {cy}\n2️⃣  {cy-1}\n3️⃣  {cy-2}\n4️⃣  {cy-3}\n5️⃣  {cy-4}\n"
-            f"6️⃣  Before {cy-4} _(outside 5-year limit)_"
+            (intro_en or "📅 *Year of the flight?*\n\n")
+            + f"1️⃣  {cy}\n2️⃣  {cy-1}\n3️⃣  {cy-2}\n4️⃣  {cy-3}\n5️⃣  {cy-4}\n"
+            + f"6️⃣  Before {cy-4} _(outside 5-year limit)_"
         )
     else:
         msg = (
-            "📅 *Année du vol ?*\n\n"
-            f"1️⃣  {cy}\n2️⃣  {cy-1}\n3️⃣  {cy-2}\n4️⃣  {cy-3}\n5️⃣  {cy-4}\n"
-            f"6️⃣  Avant {cy-4} _(hors rétroactivité 5 ans)_"
+            (intro_fr or "📅 *Année du vol ?*\n\n")
+            + f"1️⃣  {cy}\n2️⃣  {cy-1}\n3️⃣  {cy-2}\n4️⃣  {cy-3}\n5️⃣  {cy-4}\n"
+            + f"6️⃣  Avant {cy-4} _(hors rétroactivité 5 ans)_"
         )
     send(phone, msg)
 
@@ -785,16 +887,14 @@ def q_flight_month(phone, lang, year):
     y = (year or "").strip() or "?"
     if lang == "en":
         msg = (
-            f"📌 *Year selected: {y}*\n\n"
-            "📅 *Month of the flight?*\n\n"
+            f"📅 *Month?* ({y})\n\n"
             "1️⃣ Jan  2️⃣ Feb  3️⃣ Mar  4️⃣ Apr\n"
             "5️⃣ May  6️⃣ Jun  7️⃣ Jul  8️⃣ Aug\n"
             "9️⃣ Sep  *10* Oct  *11* Nov  *12* Dec"
         )
     else:
         msg = (
-            f"📌 *Année retenue : {y}*\n\n"
-            "📅 *Mois du vol ?*\n\n"
+            f"📅 *Mois ?* ({y})\n\n"
             "1️⃣ Jan  2️⃣ Fév  3️⃣ Mar  4️⃣ Avr\n"
             "5️⃣ Mai  6️⃣ Juin  7️⃣ Juil  8️⃣ Août\n"
             "9️⃣ Sep  *10* Oct  *11* Nov  *12* Déc"
@@ -805,38 +905,28 @@ def q_flight_day(phone, lang, year, month_mm):
     y = (year or "").strip() or "?"
     mw = month_word(month_mm, lang)
     if lang == "en":
-        msg = (
-            f"📌 *So far: {mw} {y}*\n\n"
-            "📅 *Exact day of the flight?* _(1–31)_"
-        )
+        msg = f"📅 *Day?* ({mw} {y}) — reply *1–31*"
     else:
-        msg = (
-            f"📌 *Déjà choisi : {mw} {y}*\n\n"
-            "📅 *Jour du vol ?* _(1–31)_"
-        )
+        msg = f"📅 *Jour ?* ({mw} {y}) — *1 à 31*"
     send(phone, msg)
 
 
-def q_itinerary(phone, lang, conv):
-    """Demande le tracé du vol (préremplit départ / arrivée / escales sur le mandat)."""
+def q_itinerary_departure(phone, lang, conv):
     fd = conv["data"].get("flight_date") or "?"
     fn = conv["data"].get("flight_number") or "?"
     if lang == "en":
-        msg = (
-            f"🛤️ *Flight route* (vol *{fn}* · {fd})\n\n"
-            "Send **departure → final arrival** (cities or airport codes).\n"
-            "If you had stopovers: **A → B → C** (in order).\n\n"
-            "Examples: *Brussels BRU → Abidjan ABJ*\n"
-            "*Paris CDG → Casablanca CMN → Dakar DSS*"
-        )
+        msg = f"🛫 *Departure city or airport code?*\n_(flight *{fn}* · {fd})_"
     else:
-        msg = (
-            f"🛤️ *Itinéraire du vol* (vol *{fn}* · {fd})\n\n"
-            "Indiquez **départ → arrivée finale** (villes ou codes aéroports).\n"
-            "Avec escales, dans l'ordre : **A → B → C**.\n\n"
-            "Ex. : *Bruxelles BRU → Abidjan ABJ*\n"
-            "*Paris CDG → Casablanca CMN → Dakar DSS*"
-        )
+        msg = f"🛫 *Ville ou code aéroport de départ ?*\n_(vol *{fn}* · {fd})_"
+    send(phone, msg)
+
+
+def q_itinerary_arrival(phone, lang, conv):
+    dep = (conv["data"].get("temp_itin_dep") or "").strip() or "?"
+    if lang == "en":
+        msg = f"🛬 *Arrival city or airport code?*\n_From: {dep}_"
+    else:
+        msg = f"🛬 *Ville ou code aéroport d'arrivée ?*\n_Départ : {dep}_"
     send(phone, msg)
 
 
@@ -859,6 +949,53 @@ def q_passenger_name(phone, lang, idx, pax, names_so_far):
             "Exemple : *Jean DUPONT*"
         )
     send(phone, msg)
+
+
+def q_passenger_names_confirm(phone, lang, conv):
+    """Après le 3ᵉ passager (si pax>3) ou après le dernier : liste à valider avant la suite."""
+    d = conv["data"]
+    names = d.get("passenger_names") or []
+    pax = d.get("passengers") or 1
+    lines = "\n".join(f"  {i+1}. *{n}*" for i, n in enumerate(names))
+    n_done = len(names)
+    partial = n_done < pax
+    if lang == "en":
+        if partial:
+            msg = (
+                f"👥 *Check passengers 1–{n_done}* (of {pax})\n\n"
+                f"{lines}\n\n"
+                f"1️⃣  *OK* — enter passenger *{n_done + 1}*\n"
+                f"2️⃣  *Fix* — re-enter passenger *{n_done}*"
+            )
+        else:
+            msg = (
+                f"👥 *All {pax} passenger(s) — confirm*\n\n"
+                f"{lines}\n\n"
+                "1️⃣  *All correct* — continue\n"
+                "2️⃣  *Fix last name* — re-enter the last passenger"
+            )
+    else:
+        if partial:
+            msg = (
+                f"👥 *Vérifiez les passagers 1 à {n_done}* (sur {pax})\n\n"
+                f"{lines}\n\n"
+                f"1️⃣  *C'est bon* — saisie du passager *{n_done + 1}*\n"
+                f"2️⃣  *Corriger* — resaisir le passager *{n_done}*"
+            )
+        else:
+            msg = (
+                f"👥 *Les {pax} passagers — confirmez*\n\n"
+                f"{lines}\n\n"
+                "1️⃣  *Tout est correct* — on continue\n"
+                "2️⃣  *Corriger le dernier nom* — resaisir le dernier passager"
+            )
+    send(phone, msg)
+
+
+def goto_passenger_names_confirm(phone, conv, lang):
+    conv["step"] = "passenger_names_confirm"
+    q_passenger_names_confirm(phone, lang, conv)
+
 
 def q_minors(phone, lang, pax):
     if lang == "en":
@@ -911,8 +1048,7 @@ def show_summary(phone, conv):
         params["esc1"] = via
     if d.get("has_minors"):
         params["mineurs"] = "1"
-    query       = "&".join(f"{k}={requests.utils.quote(str(v))}" for k, v in params.items() if v)
-    mandat_link = f"{MANDAT_URL}?{query}"
+    mandat_link = mandat_signing_link(params)
 
     box = (
         f"╔══════════════════════╗\n"
@@ -970,20 +1106,33 @@ def _extract_json_from_gpt(txt):
         return None
 
 
+def _pnr_from_vision_info(info):
+    """PNR / record locator depuis le JSON vision (plusieurs clés possibles)."""
+    if not info or not isinstance(info, dict):
+        return ""
+    raw = (info.get("pnr") or info.get("booking_reference") or info.get("record_locator") or "")
+    return re.sub(r"[^A-Za-z0-9]", "", (raw or "").upper())
+
+
 def gpt_read_boarding_pass(image_b64):
     if not OPENAI_API_KEY:
         return {}
     prompt = (
         "Extract data from this boarding pass, mobile boarding pass, or e-ticket screenshot. "
         "Reply with ONLY a JSON object (no markdown), keys:\n"
-        '{"flight_number":"","date":"DD/MM/YYYY","airline":"","pnr":"","departure":"","arrival":"","route":""}\n'
+        '{"flight_number":"","date":"","flight_day":null,"flight_month":null,"airline":"","pnr":"","booking_reference":"","departure":"","arrival":"","route":"","passenger_names":[]}\n'
         "- flight_number: e.g. SN271, AF047 (letters+digits)\n"
-        "- date: as printed, European DD/MM/YYYY if visible\n"
-        "- airline: carrier name\n"
-        "- pnr: 6-7 character booking code if visible\n"
+        "- date: ONLY if the full calendar date with year is printed, as DD/MM/YYYY (European). "
+        "If the ticket shows day+month but NO year (very common), set date to \"\" and set flight_day + flight_month as integers.\n"
+        "- flight_day / flight_month: integers 1-31 and 1-12 when day and month are visible but year is missing or unclear; else null.\n"
+        "- airline: printed carrier / marketing airline name if readable; else \"\".\n"
+        '- pnr: 6-character record locator if visible. Use booking_reference only if the label on the ticket says so; otherwise put the code in pnr (same value in both is OK).\n'
         "- departure / arrival: city or IATA if readable\n"
         "- route: one line e.g. BRU → ABJ if the full routing is clear, else empty string\n"
-        'Use "" for unknown fields.'
+        "- passenger_names: array of ALL passenger names visible on the document, each as \"FirstName LASTNAME\" "
+        "(Latin script; if 2 passengers on same pass, two strings; if only surname visible, still include best guess). "
+        "Use [] if none readable.\n"
+        'Use "" for unknown string fields; null for unknown flight_day/flight_month; [] for passenger_names if unknown.'
     )
     try:
         r = requests.post(
@@ -998,7 +1147,7 @@ def gpt_read_boarding_pass(image_b64):
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
                     ]
                 }],
-                "max_tokens": 400,
+                "max_tokens": 520,
             },
             timeout=45,
         )
@@ -1017,27 +1166,184 @@ def boarding_pass_info_usable(info):
     dt = (info.get("date") or "").strip()
     if dt and re.match(r"^\d{2}/\d{2}/\d{4}$", dt):
         return True
+    fd = info.get("flight_day")
+    if fd is None:
+        fd = info.get("day")
+    fm = info.get("flight_month")
+    if fm is None:
+        fm = info.get("month")
+    try:
+        if fd is not None and fm is not None and 1 <= int(fd) <= 31 and 1 <= int(fm) <= 12:
+            return True
+    except (TypeError, ValueError):
+        pass
+    if dt and re.match(r"^\d{1,2}/\d{1,2}$", dt):
+        return True
     if len((info.get("airline") or "").strip()) > 2:
         return True
-    pnr = re.sub(r"[^A-Za-z0-9]", "", (info.get("pnr") or "").upper())
+    pnr = _pnr_from_vision_info(info)
     return len(pnr) >= 5
+
+
+def _format_passenger_name_token(s):
+    """Une ligne 'Prénom NOM' / 'FIRST LAST' → même format que le tunnel manuel."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    parts = re.split(r"\s+", s)
+    if len(parts) < 2:
+        return None
+    prenom = parts[0].title()
+    nom    = " ".join(parts[1:]).upper()
+    return f"{prenom} {nom}"
+
+
+def _passenger_names_from_vision(info, max_pax):
+    """Extrait 0..max_pax noms depuis le JSON vision (liste, dicts, ou chaîne)."""
+    out = []
+    raw = info.get("passenger_names")
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                f = _format_passenger_name_token(item)
+                if f:
+                    out.append(f)
+            elif isinstance(item, dict):
+                fn = (item.get("first") or item.get("firstName") or item.get("prenom") or "").strip()
+                ln = (item.get("last") or item.get("lastName") or item.get("nom") or "").strip()
+                if fn and ln:
+                    out.append(f"{fn.title()} {ln.upper()}")
+                elif (item.get("full") or item.get("name") or "").strip():
+                    f = _format_passenger_name_token(str(item.get("full") or item.get("name")))
+                    if f:
+                        out.append(f)
+    elif isinstance(raw, str) and raw.strip():
+        for part in re.split(r"[,;/]|(?:\s+et\s+)", raw, flags=re.I):
+            part = part.strip()
+            if part:
+                f = _format_passenger_name_token(part)
+                if f:
+                    out.append(f)
+    seen = set()
+    uniq = []
+    for n in out:
+        k = n.lower()
+        if k not in seen:
+            seen.add(k)
+            uniq.append(n)
+        if len(uniq) >= max_pax:
+            break
+    return uniq[:max_pax]
+
+
+def _passenger_names_complete(data):
+    pax   = data.get("passengers") or 1
+    names = data.get("passenger_names") or []
+    return len(names) >= pax
+
+
+def _parse_date_from_vision(info):
+    """
+    Retourne ("full", "DD/MM/YYYY") | ("partial", ("DD","MM")) | (None, None).
+    Beaucoup de billets n'affichent pas l'année : jour/mois seuls → partial.
+    """
+    date = (info.get("date") or "").strip()
+    if date:
+        m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})\s*$", date)
+        if m:
+            d, mo, y = m.groups()
+            return "full", f"{int(d):02d}/{int(mo):02d}/{y}"
+        m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{2})\s*$", date)
+        if m:
+            d, mo, yy = m.groups()
+            yi = int(yy)
+            yi = 2000 + yi if yi < 70 else 1900 + yi
+            return "full", f"{int(d):02d}/{int(mo):02d}/{yi}"
+        m = re.match(r"^(\d{1,2})/(\d{1,2})\s*$", date)
+        if m:
+            return "partial", (f"{int(m.group(1)):02d}", f"{int(m.group(2)):02d}")
+    fd = info.get("flight_day")
+    if fd is None:
+        fd = info.get("day")
+    fm = info.get("flight_month")
+    if fm is None:
+        fm = info.get("month")
+    try:
+        if fd is not None and fm is not None:
+            d = int(fd)
+            mo = int(fm)
+            if 1 <= d <= 31 and 1 <= mo <= 12:
+                return "partial", (f"{d:02d}", f"{mo:02d}")
+    except (TypeError, ValueError):
+        pass
+    return None, None
+
+
+def advance_after_itinerary_collected(phone, conv, lang):
+    """Itinéraire complet : noms passagers ou question mineurs."""
+    d = conv["data"]
+    pax = d.get("passengers") or 1
+    if _passenger_names_complete(d):
+        goto_passenger_names_confirm(phone, conv, lang)
+    else:
+        names = list(d.get("passenger_names") or [])
+        conv["step"] = "passenger_names"
+        if names:
+            nxt = len(names) + 1
+            d["pax_collect_idx"] = nxt
+            q_passenger_name(phone, lang, nxt, pax, names)
+        else:
+            d["pax_collect_idx"] = 1
+            q_passenger_name(phone, lang, 1, pax, [])
+
+
+def advance_after_flight_date_complete(phone, conv, lang):
+    """Vol + date complètes : enchaîne itinéraire / noms / mineurs selon le remplissage."""
+    d = conv["data"]
+    if not (d.get("flight_number") and d.get("flight_date")):
+        return
+    route_ok = d.get("itinerary") and len(d["itinerary"].strip()) >= 4
+    pax = d.get("passengers") or 1
+    names = d.get("passenger_names") or []
+    if route_ok:
+        if _passenger_names_complete(d):
+            goto_passenger_names_confirm(phone, conv, lang)
+        elif names:
+            conv["step"] = "passenger_names"
+            nxt = len(names) + 1
+            conv["data"]["pax_collect_idx"] = nxt
+            q_passenger_name(phone, lang, nxt, pax, names)
+        else:
+            conv["step"] = "passenger_names"
+            conv["data"]["pax_collect_idx"] = 1
+            q_passenger_name(phone, lang, 1, pax, [])
+    else:
+        conv["step"] = "itinerary_dep"
+        q_itinerary_departure(phone, lang, conv)
 
 
 def merge_boarding_pass_info(conv, info):
     """Fusionne les champs reconnus (écrase si la vision renvoie une valeur non vide)."""
     d = conv["data"]
-    air = (info.get("airline") or "").strip()
-    if air:
-        d["airline"] = air
     fn = (info.get("flight_number") or "").strip().upper()
     fn = re.sub(r"[\s]+", "", fn)
     if fn:
         m = re.search(r"\b([A-Z]{1,3}\d{1,4}[A-Z]?)\b", fn)
         d["flight_number"] = m.group(1) if m else fn[:12]
-    date = (info.get("date") or "").strip()
-    if date and re.match(r"^\d{2}/\d{2}/\d{4}$", date):
-        d["flight_date"] = date
-    pnr = re.sub(r"[^A-Za-z0-9]", "", (info.get("pnr") or "").upper())
+    air = (info.get("airline") or "").strip()
+    if air:
+        d["airline"] = air
+    elif d.get("flight_number"):
+        guess = airline_guess_from_flight_number(d["flight_number"])
+        if guess:
+            d["airline"] = guess
+    d.pop("pending_ticket_dm", None)
+    kind, dval = _parse_date_from_vision(info)
+    if kind == "full":
+        d["flight_date"] = dval
+    elif kind == "partial":
+        d["pending_ticket_dm"] = dval
+    pnr = _pnr_from_vision_info(info)
     if len(pnr) >= 5:
         d["pnr"] = pnr[:8]
     dep = (info.get("departure") or "").strip()
@@ -1045,8 +1351,21 @@ def merge_boarding_pass_info(conv, info):
     rt = (info.get("route") or "").strip()
     if rt and len(rt) >= 4:
         d["itinerary"] = rt
+        d.pop("temp_itin_dep", None)
     elif dep and arr:
         d["itinerary"] = f"{dep} → {arr}"
+        d.pop("temp_itin_dep", None)
+    # Noms passagers (1 ou plusieurs sur la même carte)
+    max_pax = int(d.get("passengers") or 6)
+    if max_pax < 1:
+        max_pax = 1
+    vis_names = _passenger_names_from_vision(info, max_pax)
+    if vis_names:
+        d["passenger_names"] = vis_names
+        if len(vis_names) < max_pax:
+            d["pax_collect_idx"] = len(vis_names) + 1
+        else:
+            d["pax_collect_idx"] = max_pax
 
 
 def apply_boarding_pass_image(phone, conv, image_b64, lang, after_passengers=False):
@@ -1068,12 +1387,27 @@ def apply_boarding_pass_image(phone, conv, image_b64, lang, after_passengers=Fal
         bits.append(str(d["airline"]))
     if d.get("flight_date"):
         bits.append(f"📅 {d['flight_date']}")
+    elif d.get("pending_ticket_dm"):
+        dm = d["pending_ticket_dm"]
+        if isinstance(dm, (list, tuple)) and len(dm) == 2:
+            try:
+                di = int(dm[0].lstrip("0") or "0")
+                mw = month_word(dm[1], lang)
+                bits.append(
+                    f"📅 {di} {mw} — " + ("année ?" if lang == "fr" else "year?")
+                )
+            except (ValueError, TypeError):
+                bits.append("📅 …")
     if d.get("pnr"):
         bits.append(f"📋 {d['pnr']}")
     if d.get("itinerary"):
         bits.append(f"🛤️ {d['itinerary']}")
+    pax_names = d.get("passenger_names") or []
+    for n in pax_names:
+        bits.append(f"👤 {n}")
     head = "📸 *Carte / billet lu !*" if lang == "fr" else "📸 *Boarding pass read!*"
-    send(phone, head + ("\n" + " · ".join(bits) if bits else ""))
+    body = "\n".join(bits) if bits else ""
+    send(phone, f"{head}\n{body}" if body else head)
 
     if after_passengers:
         conv["step"] = "incident_type"
@@ -1082,12 +1416,7 @@ def apply_boarding_pass_image(phone, conv, image_b64, lang, after_passengers=Fal
         return True
 
     if d.get("flight_number") and d.get("flight_date"):
-        if d.get("itinerary") and len(d["itinerary"].strip()) >= 4:
-            conv["step"] = "passenger_names"
-            q_passenger_name(phone, lang, 1, d.get("passengers") or 1, [])
-        else:
-            conv["step"] = "itinerary"
-            q_itinerary(phone, lang, conv)
+        advance_after_flight_date_complete(phone, conv, lang)
     elif d.get("flight_number"):
         conv["step"] = "flight_date"
         q_flight_date(phone, lang, conv)
@@ -1271,8 +1600,7 @@ def handle_reply(phone, text, conv, image_b64=None):
         d1    = m_key.group(1) if m_key else None
         if d1 and d1 in AIRLINES_MAP:
             conv["data"]["airline"] = AIRLINES_MAP[d1]
-            conv["step"] = "pnr_input"
-            q_pnr(phone, lang, conv["data"]["airline"])
+            next_after_airline_pick(phone, lang, conv)
             at_save(phone, conv)
             return True
         if d1 == "9" or low in ("autre", "other", "others", "otr"):
@@ -1292,8 +1620,7 @@ def handle_reply(phone, text, conv, image_b64=None):
         has_alpha = bool(re.search(r"[A-Za-zÀ-ÿ]", u))
         if has_alpha and len(u) >= 2:
             conv["data"]["airline"] = u
-            conv["step"] = "pnr_input"
-            q_pnr(phone, lang, u)
+            next_after_airline_pick(phone, lang, conv)
             at_save(phone, conv)
             return True
         return False
@@ -1311,8 +1638,7 @@ def handle_reply(phone, text, conv, image_b64=None):
             )
             return True
         conv["data"]["airline"] = t
-        conv["step"] = "pnr_input"
-        q_pnr(phone, lang, t)
+        next_after_airline_pick(phone, lang, conv)
         at_save(phone, conv)
         return True
 
@@ -1367,6 +1693,17 @@ def handle_reply(phone, text, conv, image_b64=None):
         idx = int(choice) - 1 if choice and choice.isdigit() else -1
         if 0 <= idx < len(years):
             conv["data"]["temp_year"] = str(years[idx])
+            dm = conv["data"].get("pending_ticket_dm")
+            if dm and isinstance(dm, (list, tuple)) and len(dm) == 2:
+                day_s, month_s = dm[0], dm[1]
+                y = conv["data"]["temp_year"]
+                conv["data"]["flight_date"] = f"{day_s}/{month_s}/{y}"
+                conv["data"].pop("pending_ticket_dm", None)
+                conv["data"].pop("temp_year", None)
+                conv["data"].pop("temp_years", None)
+                advance_after_flight_date_complete(phone, conv, lang)
+                at_save(phone, conv)
+                return True
             conv["step"] = "flight_month"
             q_flight_month(phone, lang, conv["data"]["temp_year"])
             return True
@@ -1388,21 +1725,66 @@ def handle_reply(phone, text, conv, image_b64=None):
             year  = conv["data"].get("temp_year", "")
             month = conv["data"].get("temp_month", "")
             conv["data"]["flight_date"] = f"{day}/{month}/{year}"
-            conv["step"] = "itinerary"
-            q_itinerary(phone, lang, conv)
+            advance_after_flight_date_complete(phone, conv, lang)
             at_save(phone, conv)
             return True
         return False
 
-    # ── ÉTAPE 7 : ITINÉRAIRE (mandat) ───────────────────────────────
-    if step == "itinerary":
-        if len(t) >= 5:
-            conv["data"]["itinerary"] = t
-            conv["step"] = "passenger_names"
-            q_passenger_name(phone, lang, 1, conv["data"]["passengers"] or 1, [])
-            at_save(phone, conv)
+    # ── ITINÉRAIRE (sans carte : départ puis arrivée ; avec carte déjà fusionné → étape sautée) ──
+    if step == "itinerary_dep":
+        if image_b64:
+            if apply_boarding_pass_image(phone, conv, image_b64, lang):
+                conv["data"].pop("temp_itin_dep", None)
+                return True
+            send(
+                phone,
+                "📸 Photo non reconnue comme billet. Tapez la *ville ou code* de départ (ex. *BRU*)."
+                if lang == "fr"
+                else "📸 Not read as a boarding pass. Type *departure* city or code (e.g. *BRU*).",
+            )
             return True
-        return False
+        u = t.strip()
+        if len(u) < 2:
+            send(
+                phone,
+                "🛫 Indiquez au moins le nom de la ville ou le code IATA (ex. *Bruxelles* ou *BRU*)."
+                if lang == "fr"
+                else "🛫 Please enter a city or IATA code (e.g. *Brussels* or *BRU*).",
+            )
+            return True
+        conv["data"]["temp_itin_dep"] = u
+        conv["step"] = "itinerary_arr"
+        q_itinerary_arrival(phone, lang, conv)
+        at_save(phone, conv)
+        return True
+
+    if step == "itinerary_arr":
+        if image_b64:
+            if apply_boarding_pass_image(phone, conv, image_b64, lang):
+                conv["data"].pop("temp_itin_dep", None)
+                return True
+            send(
+                phone,
+                "📸 Photo non reconnue. Tapez la *ville ou code* d'arrivée (ex. *ABJ*)."
+                if lang == "fr"
+                else "📸 Not recognized. Type *arrival* city or code (e.g. *ABJ*).",
+            )
+            return True
+        u = t.strip()
+        if len(u) < 2:
+            send(
+                phone,
+                "🛬 Indiquez la ville ou le code d'arrivée (ex. *Abidjan* ou *ABJ*)."
+                if lang == "fr"
+                else "🛬 Enter arrival city or code (e.g. *Abidjan* or *ABJ*).",
+            )
+            return True
+        dep = (conv["data"].get("temp_itin_dep") or "").strip()
+        conv["data"]["itinerary"] = f"{dep} → {u}"
+        conv["data"]["temp_itin_dep"] = None
+        advance_after_itinerary_collected(phone, conv, lang)
+        at_save(phone, conv)
+        return True
 
     # ── ÉTAPE 9 : NOMS PASSAGERS ─────────────────────────────────────
     if step == "passenger_names":
@@ -1429,14 +1811,41 @@ def handle_reply(phone, text, conv, image_b64=None):
         conv["data"]["passenger_names"] = names
 
         if len(names) >= pax:
-            # Tous les noms collectés → mineurs
-            conv["step"] = "minor_check"
-            q_minors(phone, lang, pax)
+            goto_passenger_names_confirm(phone, conv, lang)
+        elif len(names) == 3 and pax > 3:
+            goto_passenger_names_confirm(phone, conv, lang)
         else:
             conv["data"]["pax_collect_idx"] = idx + 1
             q_passenger_name(phone, lang, idx + 1, pax, names)
         at_save(phone, conv)
         return True
+
+    if step == "passenger_names_confirm":
+        names = list(conv["data"].get("passenger_names") or [])
+        pax = conv["data"].get("passengers") or 1
+        partial = len(names) < pax
+        if choice == "1":
+            if partial:
+                conv["step"] = "passenger_names"
+                nxt = len(names) + 1
+                conv["data"]["pax_collect_idx"] = nxt
+                q_passenger_name(phone, lang, nxt, pax, names)
+            else:
+                conv["step"] = "minor_check"
+                q_minors(phone, lang, pax)
+            at_save(phone, conv)
+            return True
+        if choice == "2":
+            if not names:
+                return False
+            names.pop()
+            conv["data"]["passenger_names"] = names
+            conv["data"]["pax_collect_idx"] = len(names) + 1
+            conv["step"] = "passenger_names"
+            q_passenger_name(phone, lang, len(names) + 1, pax, names)
+            at_save(phone, conv)
+            return True
+        return False
 
     # ── ÉTAPE 10 : MINEURS ───────────────────────────────────────────
     if step == "minor_check":
@@ -1565,7 +1974,7 @@ def webhook():
 def test():
     return jsonify({
         "status":  "running",
-        "version": "v9 — post-pax choix 1 photo / 2 questions + gadget photo",
+        "version": "v9 — post-pax photo ou questions",
         "airtable": "OK" if AIRTABLE_API_KEY else "MISSING",
         "openai":   "OK" if OPENAI_API_KEY else "MISSING",
         "wati":     "OK" if WATI_API_TOKEN else "MISSING",
@@ -1593,6 +2002,26 @@ def test_flow(phone):
 @app.route("/", methods=["GET"])
 def home():
     return "Robin des Airs Bot v9 + mandat integre", 200
+
+
+@app.route("/m", methods=["GET"])
+def mandat_compressed_redirect():
+    """Décompresse ?c=… et redirige vers mandat.html avec les mêmes paramètres qu'avant."""
+    c = (request.args.get("c") or "").strip().replace(" ", "+")
+    if not c:
+        return redirect(MANDAT_URL, code=302)
+    pad = "=" * ((4 - len(c) % 4) % 4)
+    try:
+        raw = zlib.decompress(base64.urlsafe_b64decode(c.encode("ascii") + pad.encode("ascii")))
+        loaded = json.loads(raw.decode("utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError("payload not an object")
+        query = urlencode({k: str(v) for k, v in loaded.items() if v not in (None, "")})
+        target = f"{MANDAT_URL}?{query}" if query else MANDAT_URL
+        return redirect(target, code=302)
+    except Exception as ex:
+        print(f"mandat /m decode error: {ex}")
+        return redirect(MANDAT_URL, code=302)
 
 
 @app.route("/mandat.html", methods=["GET"])
