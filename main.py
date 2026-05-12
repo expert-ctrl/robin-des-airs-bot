@@ -319,6 +319,8 @@ F_PNR               = "fld7scWE20q3DRPUa"  # PNR
 F_TYPE_INCIDENT     = "fldci5VnHb0HpOoKL"  # Type d'incident (singleSelect)
 F_MONTANT_INDEMNITE = "fldlzkJOqqC8AYbIM"  # Montant de l'indemnité
 F_STATUT_SUIVI      = "fldUnBUQFKeoKf8LL"  # Statut du Dossier Suivi
+# Carte d'embarquement (champ Attachment Airtable) — renseigner l'ID fld… dans AIRTABLE_F_CARTE_EMB
+F_CARTE_EMBARQUEMENT = os.environ.get("AIRTABLE_F_CARTE_EMB", "").strip()
 
 # Options singleSelect EXACTES dans Airtable
 INCIDENT_AT = {
@@ -356,7 +358,7 @@ AIRLINES_MAP = {
     "8": "Royal Air Maroc",
 }
 
-# Préfixes IATA courants (3 lettres testées avant 2) → nom affiché / Airtable
+# Codes IATA (2–3 lettres) : Europe↔Afrique, hub Proche-Orient, Amériques + code-share fréquents
 FLIGHT_PREFIX_TO_AIRLINE = {
     "EJU": "easyJet",
     "BZZ": "Buzz",
@@ -368,7 +370,7 @@ FLIGHT_PREFIX_TO_AIRLINE = {
     "TP": "TAP Portugal",
     "SS": "Corsair",
     "HC": "Air Senegal",
-    "HF": "Air Senegal",
+    "HF": "Air Côte d'Ivoire",
     "AT": "Royal Air Maroc",
     "UX": "Air Europa",
     "IB": "Iberia",
@@ -392,7 +394,63 @@ FLIGHT_PREFIX_TO_AIRLINE = {
     "DY": "Norwegian",
     "XQ": "SunExpress",
     "XQG": "SunExpress",
+    "TS": "Air Transat",
+    "UA": "United Airlines",
+    "DL": "Delta Air Lines",
+    "AA": "American Airlines",
+    "AC": "Air Canada",
+    "QR": "Qatar Airways",
+    "EK": "Emirates",
+    "GF": "Gulf Air",
+    "WY": "Oman Air",
+    "SV": "Saudia",
+    "RJ": "Royal Jordanian",
+    "TU": "Tunisair",
+    "AH": "Air Algérie",
+    "MD": "Air Madagascar",
+    "KP": "ASKY",
+    "WB": "RwandAir",
+    "KQ": "Kenya Airways",
+    "SA": "South African Airways",
+    "BT": "airBaltic",
+    "LO": "LOT Polish Airlines",
+    "OK": "Czech Airlines",
+    "RO": "TAROM",
+    "FB": "Bulgaria Air",
+    "A3": "Aegean Airlines",
+    "CY": "Cyprus Airways",
+    "KM": "Air Malta",
+    "LG": "Luxair",
+    # Afrique & vols transcontinentaux vers l’Afrique
+    "DT": "TAAG Angola Airlines",
+    "W3": "Arik Air",
+    "P4": "Air Peace",
+    "TM": "LAM Mozambique",
+    "UR": "Uganda Airlines",
+    "4Y": "Eurowings Discover",
+    "BF": "French Bee",
+    "J9": "Jazeera Airways",
+    "SM": "Air Cairo",
+    "NP": "Nile Air",
+    "NE": "Nesma Airlines",
+    "ZN": "Zambia Airways",
+    "G9": "Air Arabia",
+    "3O": "Air Arabia Maroc",
+    "TX": "Air Caraïbes",
 }
+
+
+def airline_from_iata(code):
+    """Code compagnie seul (AF, KL, SS, EJU…) → nom. Base locale uniquement."""
+    c = re.sub(r"[^A-Z]", "", (code or "").upper())
+    if not c:
+        return None
+    for plen in (3, 2):
+        if len(c) >= plen:
+            pref = c[:plen]
+            if pref in FLIGHT_PREFIX_TO_AIRLINE:
+                return FLIGHT_PREFIX_TO_AIRLINE[pref]
+    return None
 
 
 def airline_guess_from_flight_number(fn):
@@ -401,13 +459,7 @@ def airline_guess_from_flight_number(fn):
     m = re.match(r"^([A-Z]{2,3})\d", fn)
     if not m:
         return None
-    p = m.group(1)
-    for plen in (3, 2):
-        if len(p) >= plen:
-            code = p[:plen]
-            if code in FLIGHT_PREFIX_TO_AIRLINE:
-                return FLIGHT_PREFIX_TO_AIRLINE[code]
-    return None
+    return airline_from_iata(m.group(1))
 
 MONTH_NAMES_FR = (
     "", "janvier", "février", "mars", "avril", "mai", "juin",
@@ -630,6 +682,8 @@ def at_save(phone, conv):
         extra_bits = []
         if d.get("itinerary"):
             extra_bits.append(f"Itinéraire: {d['itinerary']}")
+        if d.get("codeshare_note"):
+            extra_bits.append(d["codeshare_note"])
         if d.get("has_minors"):
             extra_bits.append("Mineur(s): oui")
         rem_extra = (" | " + " ; ".join(extra_bits)) if extra_bits else ""
@@ -682,6 +736,117 @@ def at_save(phone, conv):
         print(f"❌ Airtable exception: {e}")
         import traceback
         traceback.print_exc()
+
+
+def _boarding_image_bytes(image_b64):
+    if not image_b64:
+        return None
+    try:
+        return base64.b64decode(image_b64, validate=False)
+    except Exception:
+        return None
+
+
+def _guess_image_suffix(raw_bytes):
+    if not raw_bytes or len(raw_bytes) < 8:
+        return ".jpg", "image/jpeg"
+    if raw_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png", "image/png"
+    if raw_bytes[:2] == b"\xff\xd8":
+        return ".jpg", "image/jpeg"
+    if raw_bytes[:4] == b"GIF8":
+        return ".gif", "image/gif"
+    if raw_bytes[:4] == b"RIFF" and len(raw_bytes) >= 12 and raw_bytes[8:12] == b"WEBP":
+        return ".webp", "image/webp"
+    return ".jpg", "image/jpeg"
+
+
+def at_upload_boarding_attachment(record_id, raw_bytes, ref_tag, pax_index):
+    """POST uploadAttachment (API Airtable) sur le champ F_CARTE_EMBARQUEMENT."""
+    fid = F_CARTE_EMBARQUEMENT
+    if not AIRTABLE_API_KEY or not fid or not record_id or not raw_bytes:
+        return False
+    if len(raw_bytes) > 5 * 1024 * 1024:
+        print("at_upload_boarding_attachment: fichier > 5 Mo (limite Airtable)")
+        return False
+    ext, mime = _guess_image_suffix(raw_bytes)
+    fname = f"carte_{ref_tag or 'dossier'}_p{int(pax_index) + 1}{ext}"
+    b64 = base64.b64encode(raw_bytes).decode("ascii")
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{record_id}/{fid}/uploadAttachment"
+    try:
+        r = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"},
+            json={"contentType": mime, "file": b64, "filename": fname},
+            timeout=90,
+        )
+        if r.status_code not in (200, 201):
+            print(f"Airtable uploadAttachment {r.status_code}: {r.text[:500]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"at_upload_boarding_attachment: {e}")
+        return False
+
+
+def at_pick_record_id_for_passenger(recs, names, i_0based):
+    """Record Airtable pour le passager i (0-based)."""
+    if not recs or i_0based < 0:
+        return None
+    target = ""
+    if isinstance(names, list) and i_0based < len(names):
+        target = str(names[i_0based]).strip()
+    if target:
+        for r in recs:
+            fn = (r.get("fields") or {}).get(F_NOM_PASSAGER)
+            if fn and str(fn).strip() == target:
+                return r.get("id")
+    if i_0based < len(recs):
+        return recs[i_0based].get("id")
+    return None
+
+
+def at_boarding_attach_to_indices(phone, conv, image_b64, indices_0based, lang):
+    """
+    Enregistre la même image sur les lignes passagers indiquées (indices 0-based).
+    Crée les lignes Airtable si le dossier n'existe pas encore.
+    Retourne le nombre d'uploads réussis.
+    """
+    if not F_CARTE_EMBARQUEMENT or not image_b64:
+        return 0
+    raw = _boarding_image_bytes(image_b64)
+    if not raw:
+        return 0
+    d = conv["data"]
+    ref = conv.get("ref") or make_ref(phone)
+    conv["ref"] = ref
+    names = list(d.get("passenger_names") or [])
+    clean = []
+    seen = set()
+    for x in indices_0based or []:
+        try:
+            i = int(x)
+        except (TypeError, ValueError):
+            continue
+        if i < 0 or i in seen:
+            continue
+        seen.add(i)
+        clean.append(i)
+    if not clean:
+        return 0
+    recs = at_find(ref)
+    if not recs:
+        at_save(phone, conv)
+        recs = at_find(ref)
+    if not recs:
+        return 0
+    n_ok = 0
+    for i in sorted(clean):
+        rid = at_pick_record_id_for_passenger(recs, names, i)
+        if rid and at_upload_boarding_attachment(rid, raw, ref, i):
+            n_ok += 1
+    return n_ok
+
 
 # ===== MESSAGES DU FLUX =====
 
@@ -866,18 +1031,24 @@ def q_flight_date(phone, lang, conv):
         except ValueError:
             mw, di = mon_s, day_s
         if lang == "en":
-            intro_en = f"🎫 *{mw} {di}* on the ticket — *which year?*\n\n"
+            intro_en = (
+                f"🎫 Your boarding pass shows *{mw} {di}*, but **not the year**.\n"
+                f"*Which calendar year* was this flight?\n\n"
+            )
         else:
-            intro_fr = f"🎫 *{di} {mw}* sur le billet — *quelle année ?*\n\n"
+            intro_fr = (
+                f"🎫 *{di} {mw}* est indiqué sur votre carte d'embarquement, **sans l'année**.\n"
+                f"*De quelle année* s'agit-il ?\n\n"
+            )
     if lang == "en":
         msg = (
-            (intro_en or "📅 *Year of the flight?*\n\n")
+            (intro_en or "📅 *Which year* did you take this flight?\n\n")
             + f"1️⃣  {cy}\n2️⃣  {cy-1}\n3️⃣  {cy-2}\n4️⃣  {cy-3}\n5️⃣  {cy-4}\n"
             + f"6️⃣  Before {cy-4} _(outside 5-year limit)_"
         )
     else:
         msg = (
-            (intro_fr or "📅 *Année du vol ?*\n\n")
+            (intro_fr or "📅 *Quelle année* avez-vous pris ce vol ?\n\n")
             + f"1️⃣  {cy}\n2️⃣  {cy-1}\n3️⃣  {cy-2}\n4️⃣  {cy-3}\n5️⃣  {cy-4}\n"
             + f"6️⃣  Avant {cy-4} _(hors rétroactivité 5 ans)_"
         )
@@ -1120,12 +1291,15 @@ def gpt_read_boarding_pass(image_b64):
     prompt = (
         "Extract data from this boarding pass, mobile boarding pass, or e-ticket screenshot. "
         "Reply with ONLY a JSON object (no markdown), keys:\n"
-        '{"flight_number":"","date":"","flight_day":null,"flight_month":null,"airline":"","pnr":"","booking_reference":"","departure":"","arrival":"","route":"","passenger_names":[]}\n'
-        "- flight_number: e.g. SN271, AF047 (letters+digits)\n"
+        '{"flight_number":"","date":"","flight_day":null,"flight_month":null,"airline":"","airline_iata":"","marketing_carrier_iata":"","operating_carrier_iata":"","pnr":"","booking_reference":"","departure":"","arrival":"","route":"","passenger_names":[]}\n'
+        "- flight_number: as printed (marketing flight number if codeshare).\n"
         "- date: ONLY if the full calendar date with year is printed, as DD/MM/YYYY (European). "
         "If the ticket shows day+month but NO year (very common), set date to \"\" and set flight_day + flight_month as integers.\n"
         "- flight_day / flight_month: integers 1-31 and 1-12 when day and month are visible but year is missing or unclear; else null.\n"
-        "- airline: printed carrier / marketing airline name if readable; else \"\".\n"
+        "- airline: printed carrier / marketing name if readable; else \"\".\n"
+        "- airline_iata: 2-letter code of the **marketing** (ticketing) carrier if visible.\n"
+        "- marketing_carrier_iata: same as airline_iata if codeshare; else \"\".\n"
+        "- operating_carrier_iata: if **codeshare** (\"operated by / opéré par\"), 2-letter code of the **operating** carrier; else \"\".\n"
         '- pnr: 6-character record locator if visible. Use booking_reference only if the label on the ticket says so; otherwise put the code in pnr (same value in both is OK).\n'
         "- departure / arrival: city or IATA if readable\n"
         "- route: one line e.g. BRU → ABJ if the full routing is clear, else empty string\n"
@@ -1158,6 +1332,66 @@ def gpt_read_boarding_pass(image_b64):
         return {}
 
 
+def try_decode_bcbp_from_image_b64(image_b64):
+    """
+    Tente de lire un QR / code-barres IATA (BCBP type M1/M2) sur l'image.
+    Nécessite pyzbar + Pillow (pip install pyzbar pillow). Aucun appel Internet.
+    Extraction conservatrice : vol + éventuellement un nom ; le reste reste à la vision IA.
+    """
+    out = {}
+    try:
+        import io
+        from PIL import Image
+        from pyzbar.pyzbar import decode as zdecode
+    except ImportError:
+        return out
+    try:
+        raw = base64.b64decode(image_b64, validate=False)
+        im = Image.open(io.BytesIO(raw))
+        for sym in zdecode(im):
+            try:
+                pdata = sym.data.decode("utf-8", "replace")
+            except Exception:
+                continue
+            if "M1" not in pdata and "M2" not in pdata:
+                continue
+            for m in re.finditer(r"\b([A-Z]{2})(\d{3,4})\b", pdata):
+                if airline_from_iata(m.group(1)):
+                    out["flight_number"] = m.group(1) + m.group(2)
+                    break
+            mname = re.search(r"M[12]([A-Z]+)/([A-Z]+)", pdata)
+            if mname:
+                last, first = mname.group(1).strip(), mname.group(2).strip()
+                if len(last) >= 2 and len(first) >= 1:
+                    nm = f"{first.title()} {last.upper()}"
+                    lst = out.setdefault("passenger_names", [])
+                    if nm not in lst:
+                        lst.append(nm)
+    except Exception as e:
+        print(f"QR/BCBP scan: {e}")
+    return out
+
+
+def read_boarding_pass_merged(image_b64):
+    """Vision OpenAI + complément QR local (pyzbar si dispo)."""
+    qr = try_decode_bcbp_from_image_b64(image_b64)
+    gpt = gpt_read_boarding_pass(image_b64) if OPENAI_API_KEY else {}
+    merged = dict(gpt) if isinstance(gpt, dict) else {}
+    for k, v in (qr or {}).items():
+        if v in (None, "", [], {}):
+            continue
+        if k not in merged or merged.get(k) in (None, "", []):
+            merged[k] = v
+        elif k == "passenger_names" and isinstance(v, list):
+            combined, seen = [], set()
+            for n in (merged.get("passenger_names") or []) + v:
+                if n and str(n).strip().lower() not in seen:
+                    seen.add(str(n).strip().lower())
+                    combined.append(n)
+            merged["passenger_names"] = combined
+    return merged
+
+
 def boarding_pass_info_usable(info):
     if not info or not isinstance(info, dict):
         return False
@@ -1180,6 +1414,13 @@ def boarding_pass_info_usable(info):
     if dt and re.match(r"^\d{1,2}/\d{1,2}$", dt):
         return True
     if len((info.get("airline") or "").strip()) > 2:
+        return True
+    for key in ("airline_iata", "marketing_carrier_iata", "operating_carrier_iata"):
+        raw = re.sub(r"[^A-Z]", "", (info.get(key) or "").upper())
+        if len(raw) >= 2 and airline_from_iata(raw):
+            return True
+    air_short = re.sub(r"[^A-Za-z]", "", (info.get("airline") or "").upper())
+    if 2 <= len((info.get("airline") or "").strip()) <= 3 and len(air_short) <= 3 and airline_from_iata(air_short):
         return True
     pnr = _pnr_from_vision_info(info)
     return len(pnr) >= 5
@@ -1330,13 +1571,32 @@ def merge_boarding_pass_info(conv, info):
     if fn:
         m = re.search(r"\b([A-Z]{1,3}\d{1,4}[A-Z]?)\b", fn)
         d["flight_number"] = m.group(1) if m else fn[:12]
+    d.pop("codeshare_note", None)
+    mark_raw = re.sub(r"[^A-Za-z]", "", (info.get("marketing_carrier_iata") or info.get("airline_iata") or "").upper())
+    op_raw = re.sub(r"[^A-Za-z]", "", (info.get("operating_carrier_iata") or "").upper())
     air = (info.get("airline") or "").strip()
     if air:
-        d["airline"] = air
-    elif d.get("flight_number"):
+        al = re.sub(r"[^A-Za-z]", "", air).upper()
+        if len(al) <= 3 and len(air) <= 4 and air.replace(" ", "").upper() == al:
+            d["airline"] = airline_from_iata(al) or air
+        else:
+            d["airline"] = air
+    elif len(mark_raw) >= 2:
+        g = airline_from_iata(mark_raw)
+        if g:
+            d["airline"] = g
+    elif len(op_raw) >= 2:
+        g = airline_from_iata(op_raw)
+        if g:
+            d["airline"] = g
+    if not d.get("airline") and d.get("flight_number"):
         guess = airline_guess_from_flight_number(d["flight_number"])
         if guess:
             d["airline"] = guess
+    if mark_raw and op_raw and mark_raw[:2] != op_raw[:2]:
+        mn = airline_from_iata(mark_raw) or mark_raw[:2]
+        on = airline_from_iata(op_raw) or op_raw[:2]
+        d["codeshare_note"] = f"Code-share : commercial {mn} ({mark_raw[:2]}) / opéré par {on} ({op_raw[:2]})"
     d.pop("pending_ticket_dm", None)
     kind, dval = _parse_date_from_vision(info)
     if kind == "full":
@@ -1375,7 +1635,9 @@ def apply_boarding_pass_image(phone, conv, image_b64, lang, after_passengers=Fal
     puis on impose l'étape « incident » (obligatoire) avant la suite.
     Retourne True si au moins une info exploitable a été extraite.
     """
-    info = gpt_read_boarding_pass(image_b64)
+    step_before = conv.get("step")
+    idx_for_attach = max(0, (conv["data"].get("pax_collect_idx") or 1) - 1)
+    info = read_boarding_pass_merged(image_b64)
     if not boarding_pass_info_usable(info):
         return False
     merge_boarding_pass_info(conv, info)
@@ -1385,6 +1647,8 @@ def apply_boarding_pass_image(phone, conv, image_b64, lang, after_passengers=Fal
         bits.append(f"✈️ *{d['flight_number']}*")
     if d.get("airline"):
         bits.append(str(d["airline"]))
+    if d.get("codeshare_note"):
+        bits.append(d["codeshare_note"])
     if d.get("flight_date"):
         bits.append(f"📅 {d['flight_date']}")
     elif d.get("pending_ticket_dm"):
@@ -1394,7 +1658,7 @@ def apply_boarding_pass_image(phone, conv, image_b64, lang, after_passengers=Fal
                 di = int(dm[0].lstrip("0") or "0")
                 mw = month_word(dm[1], lang)
                 bits.append(
-                    f"📅 {di} {mw} — " + ("année ?" if lang == "fr" else "year?")
+                    f"🎫 *{di} {mw}* " + ("sur la carte — année à préciser ci-dessous" if lang == "fr" else "on pass — pick year below")
                 )
             except (ValueError, TypeError):
                 bits.append("📅 …")
@@ -1405,6 +1669,33 @@ def apply_boarding_pass_image(phone, conv, image_b64, lang, after_passengers=Fal
     pax_names = d.get("passenger_names") or []
     for n in pax_names:
         bits.append(f"👤 {n}")
+
+    n_att = 0
+    if F_CARTE_EMBARQUEMENT and image_b64:
+        max_p = int(d.get("passengers") or 6)
+        if max_p < 1:
+            max_p = 1
+        pax = int(d.get("passengers") or 1)
+        vis_list = _passenger_names_from_vision(info, max_p)
+        if step_before == "passenger_names":
+            idx_plan = [min(idx_for_attach, max(0, pax - 1))]
+        elif step_before == "passenger_names_confirm":
+            nm = d.get("passenger_names") or []
+            idx_plan = list(range(min(len(nm), pax)))
+        elif after_passengers:
+            idx_plan = [0]
+        elif vis_list:
+            idx_plan = list(range(min(len(vis_list), pax)))
+        else:
+            idx_plan = [0]
+        n_att = at_boarding_attach_to_indices(phone, conv, image_b64, idx_plan, lang)
+    if n_att:
+        bits.append(
+            f"📎 Carte enregistrée dans Airtable ({n_att} ligne{'s' if n_att > 1 else ''})."
+            if lang == "fr"
+            else f"📎 Boarding pass saved to Airtable ({n_att} row{'s' if n_att > 1 else ''})."
+        )
+
     head = "📸 *Carte / billet lu !*" if lang == "fr" else "📸 *Boarding pass read!*"
     body = "\n".join(bits) if bits else ""
     send(phone, f"{head}\n{body}" if body else head)
@@ -1791,6 +2082,26 @@ def handle_reply(phone, text, conv, image_b64=None):
         pax = conv["data"].get("passengers") or 1
         idx = conv["data"].get("pax_collect_idx") or 1
 
+        if image_b64:
+            merged = read_boarding_pass_merged(image_b64)
+            usable = boarding_pass_info_usable(merged)
+            if usable:
+                if apply_boarding_pass_image(phone, conv, image_b64, lang):
+                    return True
+            n_att = at_boarding_attach_to_indices(phone, conv, image_b64, [max(0, idx - 1)], lang)
+            if n_att:
+                send(
+                    phone,
+                    (
+                        "📎 *Photo / carte* enregistrée sur votre ligne passager dans Airtable.\n\n"
+                        "_(Envoyez *Prénom NOM* pour ce passager si besoin.)_"
+                        if lang == "fr"
+                        else "📎 *Photo / boarding pass* saved to your passenger row in Airtable.\n\n"
+                        "_(Send *First LAST* for this passenger if needed.)_"
+                    ),
+                )
+                return True
+
         # Nettoie la ligne
         first = t.split("\n")[0].strip()
         clean = re.sub(r"^[\d\.\)\-\s]+", "", first).strip()
@@ -1816,6 +2127,15 @@ def handle_reply(phone, text, conv, image_b64=None):
             goto_passenger_names_confirm(phone, conv, lang)
         else:
             conv["data"]["pax_collect_idx"] = idx + 1
+            if len(names) == 1 and pax > 1:
+                send(
+                    phone,
+                    "📸 Vous pouvez envoyer les *cartes d'embarquement* des autres passagers (*une photo à la fois*, facultatif).\n\n"
+                    "Sinon, complétez le *Prénom NOM* du passager suivant 👇"
+                    if lang == "fr"
+                    else "📸 You may send the *other passengers' boarding passes* (*one photo at a time*, optional).\n\n"
+                    "Otherwise, send the next passenger's *First LAST* 👇",
+                )
             q_passenger_name(phone, lang, idx + 1, pax, names)
         at_save(phone, conv)
         return True
@@ -1823,6 +2143,23 @@ def handle_reply(phone, text, conv, image_b64=None):
     if step == "passenger_names_confirm":
         names = list(conv["data"].get("passenger_names") or [])
         pax = conv["data"].get("passengers") or 1
+        if image_b64:
+            merged = read_boarding_pass_merged(image_b64)
+            if boarding_pass_info_usable(merged):
+                if apply_boarding_pass_image(phone, conv, image_b64, lang):
+                    return True
+            idxs = list(range(min(len(names), pax)))
+            n_att = at_boarding_attach_to_indices(phone, conv, image_b64, idxs, lang) if idxs else 0
+            if n_att:
+                send(
+                    phone,
+                    (
+                        f"📎 *{n_att}* enregistrement(s) carte / photo sur les passagers dans Airtable."
+                        if lang == "fr"
+                        else f"📎 *{n_att}* boarding pass / photo attachment(s) saved to passenger rows in Airtable."
+                    ),
+                )
+                return True
         partial = len(names) < pax
         if choice == "1":
             if partial:
