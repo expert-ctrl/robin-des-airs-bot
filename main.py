@@ -310,7 +310,10 @@ SUIVI_URL   = f"{RDA_DOMAIN.rstrip('/')}/suivi-dossier"
 # Politique de confidentialité (URL complète possible via env).
 # Optionnel : PRIVACY_HIDE_SHORT_NOTICE=1 (rien sur le 1er écran),
 #             PRIVACY_HIDE_DETAILED_BANNER=1 (pas le bloc long avant photo / questions).
+#             RDA_TERMS_URL=https://... (sinon URL dérivée de RDA_DOMAIN + /conditions-generales)
 PRIVACY_POLICY_URL = os.environ.get("PRIVACY_POLICY_URL", "").strip() or f"{RDA_DOMAIN.rstrip('/')}/politique-confidentialite"
+# Conditions générales (CGU) — même logique qu’AirHelp : lien vers le site officiel.
+TERMS_URL = os.environ.get("RDA_TERMS_URL", "").strip() or f"{RDA_DOMAIN.rstrip('/')}/conditions-generales"
 CLIMBIE_TEL = "+33756863630"
 
 # ===== IDs CHAMPS AIRTABLE (récupérés directement depuis l'API) =====
@@ -671,14 +674,14 @@ def split_itinerary_for_mandat(itin):
 
 
 # ===== FLUX (étapes) =====
-# 1. passengers           → nombre de passagers
-# 2. boarding_after_pax   → montant + photo carte (ou *1* sans photo)
-# 3. incident_type        → retard / annulation / refus
+# 1. passengers           → nombre de passagers (1–6) ou 7+ (Climbie)
+# 2. incident_type        → retard / annulation / refus
+# 3. boarding_after_pax   → photo carte / billet (ou 2 = saisie manuelle)
 # 4. airline              → compagnie (ou photo)
 # … puis date du vol → itinerary_dep / itinerary_arr (itinéraire billet déjà fusionné : saut)
 
 STEPS = [
-    "passengers", "boarding_after_pax", "incident_type", "airline", "airline_other",
+    "passengers", "incident_type", "boarding_after_pax", "airline", "airline_other",
     "pnr_input", "flight_number",
     "flight_date", "flight_month", "flight_day",
     "itinerary_dep", "itinerary_arr",
@@ -766,6 +769,22 @@ def calc_amounts(pax, band="band_600"):
     net     = round(brut * NET_PCT)
     com     = round(brut * COMMISSION_PCT)
     return brut, net, com, per_pax
+
+
+def fmt_money_space(n):
+    """Montants entiers avec espaces milliers (ex. 1 350)."""
+    n = int(round(n))
+    neg = n < 0
+    s = str(abs(n))
+    parts = []
+    while len(s) > 3:
+        parts.insert(0, s[-3:])
+        s = s[:-3]
+    if s:
+        parts.insert(0, s)
+    r = " ".join(parts)
+    return ("-" if neg else "") + r
+
 
 def fmt_date_for_airtable(date_str):
     """JJ/MM/AAAA → AAAA-MM-JJ"""
@@ -1065,29 +1084,63 @@ def at_boarding_attach_to_indices(phone, conv, image_b64, indices_0based, lang):
 # ===== MESSAGES DU FLUX =====
 
 def _privacy_consent_footer(lang):
-    """Bloc détaillé confidentialité / consentement (affiché quand la collecte utile commence)."""
+    """
+    Bloc légal + confidentialité au démarrage de la collecte « utile » (après choix passagers).
+    Structure inspirée des plateformes type AirHelp : nature du service, honoraires, alternatives,
+    droit de rétractation, données — adapté Robin des Airs / robindesairs.eu (pas un copier-coller).
+    """
     if lang == "en":
         return (
             "──────────────\n"
-            "🔒 *Privacy & security*\n\n"
-            "We are about to open your claim file. Robin des Airs attaches *great importance* "
-            "to protecting your *personal data*.\n\n"
-            "Your data are *encrypted* and stored on our secure servers, *in line with GDPR* "
-            "(European rules). They will *never be sold* and are only shared *with the airline* "
-            "as needed for your claim.\n\n"
-            "By continuing, you agree that Robin des Airs processes your data to handle your claim.\n\n"
-            f"👉 *Privacy policy:* {PRIVACY_POLICY_URL}"
+            "📜 *What this service is*\n\n"
+            "*Robin des Airs* (" + RDA_DOMAIN.rstrip("/") + ") helps you **open and follow** a passenger "
+            "compensation file under **EU Regulation 261/2004** (and related rules where applicable). "
+            "This WhatsApp flow collects **information** only; the **contractual relationship and mandate** "
+            "are those on **our website / mandate document**.\n\n"
+            "We are **not a law firm** and this bot does **not** provide tailored legal advice. Amounts shown "
+            "(e.g. *600 € gross* tier) are **indicative**; any payment depends on **facts**, **distance** and the airline.\n\n"
+            "💶 *Fees:* you owe **nothing** unless compensation is **actually obtained**; if we succeed, "
+            "Robin des Airs’ fee is as set out in the **mandate** (e.g. **25%** commission on the amount recovered — "
+            "the net share shown in the flow is an **example**).\n\n"
+            "🔄 *Other options:* you may claim **directly** from the airline, use **public ADR / mediation** schemes "
+            "(varies by country), or a lawyer. Some routes are **free**; airline participation is not always mandatory.\n\n"
+            "🛡️ *Right of withdrawal (EU / UK-style consumers):* if you are a **consumer**, you generally have "
+            "**14 days** to cancel a distance contract — **unless** you expressly request **immediate performance** "
+            "before that period ends (*Consumer Code / similar*).\n\n"
+            "──────────────\n"
+            "🔒 *Personal data*\n\n"
+            "We are about to open your claim file. Your data are processed **for this claim**, stored securely "
+            "and in line with **GDPR**. They are **not sold** and are shared **only with the airline** as needed.\n\n"
+            "By continuing you accept this processing and confirm you have seen our **Terms** and **Privacy policy**:\n"
+            f"👉 *Terms:* {TERMS_URL}\n"
+            f"👉 *Privacy:* {PRIVACY_POLICY_URL}"
         )
     return (
         "──────────────\n"
-        "🔒 *Sécurité*\n\n"
-        "Nous allons maintenant constituer votre dossier. Robin des Airs accorde une *grande importance* "
-        "et une *vigilance particulière* à vos *données personnelles*.\n\n"
-        "Vos données sont *chiffrées* et stockées sur nos serveurs sécurisés, *conformes au RGPD* "
-        "(normes européennes). Elles ne seront *jamais vendues* et ne seront transmises *qu'à la compagnie aérienne* "
-        "dans le cadre de votre dossier.\n\n"
-        "En continuant, vous acceptez que Robin des Airs collecte vos données pour traiter votre réclamation.\n\n"
-        f"👉 *Politique de confidentialité :* {PRIVACY_POLICY_URL}"
+        "📜 *Nature du service (résumé)*\n\n"
+        "*Robin des Airs* (" + RDA_DOMAIN.rstrip("/") + ") vous assiste pour **constituer et suivre** un dossier "
+        "d’indemnisation passagers sur la base du **règlement (UE) n°261/2004** (et textes connexes le cas échéant). "
+        "Ce fil WhatsApp sert à la **collecte d’informations** ; la **relation contractuelle** et les **pouvoirs** "
+        "figurent sur **robindesairs.eu** et dans le **document de mandat**.\n\n"
+        "Robin des Airs **n’est pas un cabinet d’avocats** : pas de **conseil juridique personnalisé** via ce bot. "
+        "Les montants affichés (ex. *600 € bruts* / palier) sont **indicatifs** ; tout versement dépend des **faits**, "
+        "des **distances** et de la **compagnie**.\n\n"
+        "💶 *Rémunération* : vous ne devez **rien** tant qu’aucune indemnité n’est **effectivement obtenue** ; "
+        "en cas de succès, la rémunération est celle du **mandat** (p.ex. commission **25 %** sur l’indemnité — "
+        "le **net** affiché dans le tunnel est un **exemple**).\n\n"
+        "🔄 *Autres voies* : réclamation **directe** auprès de la compagnie, **médiation / conciliation** des transports "
+        "(selon pays), avocat. Souvent **gratuites** ; la participation des compagnies n’est pas toujours obligatoire.\n\n"
+        "🛡️ *Rétractation (consommateur)* : si vous êtes **consommateur**, vous disposez en principe de **14 jours** "
+        "pour revenir sur un contrat à distance — **sauf** si vous demandez l’**exécution immédiate** avant la fin de ce délai "
+        "(*art. L. 221-25 Code de la consommation*).\n\n"
+        "──────────────\n"
+        "🔒 *Données personnelles*\n\n"
+        "Nous allons constituer votre dossier. Vos données sont traitées **pour cette réclamation**, hébergées de façon "
+        "sécurisée et **conformes au RGPD**. Elles ne sont **pas vendues** et ne sont transmises **qu’à la compagnie aérienne** "
+        "dans le cadre utile au dossier.\n\n"
+        "En poursuivant, vous acceptez ce traitement et prenez connaissance des **CGU** et de la **politique de confidentialité** :\n"
+        f"👉 *Conditions générales* : {TERMS_URL}\n"
+        f"👉 *Confidentialité* : {PRIVACY_POLICY_URL}"
     )
 
 
@@ -1100,52 +1153,72 @@ def _privacy_short_notice(lang):
         return ""
     if lang == "en":
         return (
-            "\n\n📋 *Privacy:* we only use your data for this claim (secure hosting, GDPR). "
-            f"*Policy:* {PRIVACY_POLICY_URL}"
+            "\n\n📋 *Legal (short):* this channel helps open an EU261-related file on robindesairs.eu — "
+            "not legal advice; fees only if we obtain compensation. "
+            f"*Terms:* {TERMS_URL} · *Privacy:* {PRIVACY_POLICY_URL}"
         )
     return (
-        "\n\n📋 *Confidentialité :* vos données servent à traiter cette réclamation (hébergement sécurisé, RGPD). "
-        f"*Politique :* {PRIVACY_POLICY_URL}"
+        "\n\n📋 *Rappel légal (court) :* ce canal sert à ouvrir un dossier lié au règlement UE 261 sur robindesairs.eu — "
+        "pas de conseil juridique personnalisé ; rémunération uniquement en cas de succès. "
+        f"*CGU :* {TERMS_URL} · *Confidentialité :* {PRIVACY_POLICY_URL}"
     )
 
 
 def q_passengers(phone, lang):
-    """Étape 1 — Passagers + montant visible immédiatement"""
-    rows = []
-    for n in range(1, 6):
-        brut, net, _, per_pax = calc_amounts(n)
-        rows.append(
-            f"{n}️⃣  {n} passager{'s' if n>1 else ''} — 💶 *{per_pax}€ brut*/passager "
-            f"_(palier indicatif long-courrier), soit *{brut}€ brut* le groupe — net indicatif *{net}€*_"
-        )
-    rows.append(f"6️⃣  6 ou plus — 📱 Climbie vous appelle")
-    bloc = "\n".join(rows)
-    consent_fr = "\n\n_En répondant, vous confirmez avoir pris connaissance de la mention confidentialité ci-dessus._"
-    consent_en = "\n\n_By replying, you confirm you have read the privacy note above._"
+    """Étape 1 — Accueil + choix passagers (1–6 dossier auto, 7+ expertise Climbie)."""
+    consent_fr = (
+        "\n\n_En répondant, vous confirmez avoir pris connaissance des liens *CGU* et *confidentialité* ci-dessus "
+        "(résumé du service, honoraires « succès uniquement », rétractation L. 221-25 si consommateur)._"
+    )
+    consent_en = (
+        "\n\n_By replying, you confirm you have seen the *Terms* and *Privacy* links above "
+        "(service summary, success-only fees, 14-day withdrawal for consumers where applicable)._"
+    )
+
+    lines_fr = []
+    lines_en = []
+    for n in range(1, 7):
+        _, net, _, _ = calc_amounts(n)
+        ns = fmt_money_space(net)
+        lab_fr = f"{n} passager{'s' if n > 1 else ''}"
+        lab_en = f"{n} passenger{'s' if n > 1 else ''}"
+        if n == 4:
+            lab_fr = "Famille (4 passagers)"
+            lab_en = "Family (4 passengers)"
+        lines_fr.append(f"{n}️⃣ {lab_fr} ➔ Recevez *{ns} € net*")
+        lines_en.append(f"{n}️⃣ {lab_en} ➔ *{ns} € net*")
+    lines_fr.append(
+        "7️⃣ *7 passagers ou plus* ➔ *Expertise prioritaire* — *Climbie* vous rappelle"
+    )
+    lines_en.append(
+        "7️⃣ *7+ passengers* ➔ *Priority expert handling* — *Climbie* will call you back"
+    )
+    bloc_fr = "\n".join(lines_fr)
+    bloc_en = "\n".join(lines_en)
 
     if lang == "en":
         msg = (
-            "👋 Welcome to *Robin des Airs* ✈️\n\n"
-            "Flight delayed or cancelled? Under EU261 you may be owed *up to 600€ gross per passenger* "
-            "(tier depends on distance — we show the long-haul bracket here as an example).\n\n"
+            "👋 Welcome to *Robin des Airs* 🏹\n\n"
+            "Don't leave money on the table. A delayed/cancelled flight can be worth *up to €600 per person* "
+            "(long-haul tier shown as a guide).\n\n"
+            "⚖️ *Nothing to pay upfront.* We take *25%* commission *only if we win.*\n\n"
+            "*How many passengers are you claiming for?*\n\n"
+            + bloc_en
             + _privacy_short_notice("en")
-            + "\n\n👥 *How many passengers?*\n\n"
-            + bloc.replace("passager", "passenger").replace("ou plus", "or more")
-            .replace("le groupe", "for the group").replace("vous appelle", "will call you")
-            .replace("passagers", "passengers")
             + consent_en
-            + "\n\nReply *1–6*"
+            + "\n\n_Reply with a number from *1* to *7*._"
         )
     else:
         msg = (
-            "👋 Bienvenue chez *Robin des Airs* ✈️\n\n"
-            "Vol retardé ou annulé ? Sous EU261 vous pouvez avoir droit à *jusqu'à 600€ bruts par passager* "
-            "_(selon distance ; on affiche ici le palier long-courrier indicatif)_.\n\n"
+            "👋 Bienvenue chez *Robin des Airs* 🏹\n\n"
+            "Ne laissez pas votre argent à la compagnie. Votre vol retardé / annulé vaut *600 €* par personne "
+            "_(palier indicatif long-courrier EU261)_.\n\n"
+            "⚖️ *Zéro frais à avancer.* On prend *25 %* de commission *uniquement si on gagne.*\n\n"
+            "*Pour combien de passagers réclamez-vous ?*\n\n"
+            + bloc_fr
             + _privacy_short_notice("fr")
-            + "\n\n👥 *Combien de passagers ?*\n\n"
-            + bloc
             + consent_fr
-            + "\n\nRépondez *1 à 6*"
+            + "\n\n_Répondez par le chiffre *1* à *7*._"
         )
     send(phone, msg)
 
@@ -1169,6 +1242,20 @@ def user_wants_fresh_start(text):
     return any(n in low for n in needles)
 
 
+def user_wants_expertise_rappel(text):
+    """Demande explicite de rappel / expertise humaine (prioritaire 7+ passagers)."""
+    low = (text or "").lower().strip()
+    needles = (
+        "rappel expertise", "rappel d'expertise", "rappel expert",
+        "me rappeler", "rappel téléphonique", "rappel telephonique",
+        "appelez-moi", "appelez moi", "être rappelé", "etre rappele", "etre rappelé",
+        "rappel climbie", "parler à un expert", "parler a un expert",
+        "besoin d'un expert", "besoin dun expert", "conseiller humain",
+        "expertise prioritaire",
+    )
+    return any(n in low for n in needles)
+
+
 def amount_potential_box(pax):
     """Bloc montant indicatif (même rendu que l'étape incident)."""
     brut, net, _, _ = calc_amounts(pax)
@@ -1186,59 +1273,58 @@ def amount_potential_box(pax):
 
 
 def q_boarding_after_pax(phone, lang, pax):
-    """Montant + choix explicite : photo (simple) ou questions sans photo."""
-    brut, net, box = amount_potential_box(pax)
-    # Texte détaillé RGPD ici : la collecte « utile » (billet, vol, etc.) commence à cette étape.
+    """Preuves carte / billet (après choix de l'incident) — RGPD détaillé ici."""
     privacy_block = ""
     if os.environ.get("PRIVACY_HIDE_DETAILED_BANNER", "").strip().lower() not in ("1", "true", "yes", "on"):
         privacy_block = _privacy_consent_footer(lang) + "\n\n"
-    _, _, _, per_pax = calc_amounts(pax)
     if lang == "en":
         msg = (
             privacy_block
-            + f"✅ *{pax} passenger(s).*\n\n"
-            + f"Indicative **{per_pax} € gross / passenger** (long-haul tier shown), **{brut} € gross** for your group "
-            + f"— *net up to {net} €* for the group if we win (75% after our 25% fee — see box).\n\n"
-            + f"{box}\n\n"
-            + "📸 *The easy way:* one **clear photo** of your boarding pass or e-ticket — we auto-fill flight, date, airline, PNR, route.\n\n"
-            + "1️⃣  *I'll send the photo* — reply *1*, then send the image (or send the image right now)\n"
-            + "2️⃣  *I'd rather answer step by step* — reply *2* (no photo for now — next: what happened to your flight)"
+            + "📸 *Evidence — boarding pass*\n\n"
+            "We'll save you time.\n\n"
+            "Send a *photo* of your boarding pass or e-ticket now *(flat, no glare)*.\n\n"
+            "✨ *Why:* our system reads it and fills in your file — the fastest step.\n\n"
+            "⌨️ *No photo handy?* Reply *2* to enter the details *manually*."
         )
     else:
         msg = (
             privacy_block
-            + f"✅ *{pax} passager(s) noté(s).*\n\n"
-            + f"Palier indicatif **{per_pax} € bruts / passager**, **{brut} € bruts** pour votre groupe "
-            + f"— *net jusqu'à {net} €* pour le groupe si succès (après commission RDA 25 % — encadré ci-dessous).\n\n"
-            + f"{box}\n\n"
-            + "📸 *Le plus simple :* une **photo nette** de votre carte d'embarquement ou billet — on remplit vol, date, compagnie, PNR, trajet pour vous.\n\n"
-            + "1️⃣  *J'envoie la photo* — répondez *1* puis envoyez l'image *(ou envoyez la photo directement)*\n"
-            + "2️⃣  *Je préfère répondre aux questions* une par une — répondez *2* (sans photo pour l'instant — ensuite : retard / annulation / refus)"
+            + "📸 *PREUVES — Carte d'embarquement*\n\n"
+            "On va vous faire gagner du temps.\n\n"
+            "Envoyez maintenant une *photo* de votre carte d'embarquement ou de votre billet "
+            "*(bien à plat, sans reflets)*.\n\n"
+            "✨ *L'avantage :* notre système lit les informations et remplit le dossier pour vous — "
+            "c'est l'étape la plus rapide !\n\n"
+            "⌨️ *Pas de photo sous la main ?* Tapez *2* pour remplir les informations *manuellement*."
         )
     send(phone, msg)
 
 
 def q_incident(phone, lang, pax):
-    _, _, box = amount_potential_box(pax)
+    """Message 2 : passagers enregistrés + net groupe + type d'incident (avant la photo)."""
+    _, net, _, _ = calc_amounts(pax)
+    net_s = fmt_money_space(net)
     if lang == "en":
         msg = (
-            f"✅ *{pax} passenger(s) noted!*\n\n"
-            f"{box}\n\n"
-            "✈️ *What happened?*\n\n"
-            "1️⃣  Delay of 3+ hours ⏱️\n"
-            "2️⃣  Flight cancelled ❌\n"
-            "3️⃣  Denied boarding 🚫\n\n"
-            "Reply *1, 2 or 3*"
+            f"✅ *{pax} passenger(s) registered.*\n\n"
+            f"💰 *Estimated payout:*\n"
+            f"💶 *{net_s} € NET* _(for the group, after commission)._\n\n"
+            "⚖️ *What happened on this flight?*\n\n"
+            "1️⃣ Delay *(+3h at arrival)*\n"
+            "2️⃣ Flight cancelled\n"
+            "3️⃣ Denied boarding *(overbooking)*\n\n"
+            "_(Reply *1*, *2* or *3*.)_"
         )
     else:
         msg = (
-            f"✅ *{pax} passager(s) noté(s) !*\n\n"
-            f"{box}\n\n"
-            "✈️ *Que s'est-il passé ?*\n\n"
-            "1️⃣  Retard de +3 heures ⏱️\n"
-            "2️⃣  Vol annulé ❌\n"
-            "3️⃣  Refus d'embarquement 🚫\n\n"
-            "Répondez *1, 2 ou 3*"
+            f"✅ *{pax} passager{'s' if pax > 1 else ''} enregistré{'s' if pax > 1 else ''}.*\n\n"
+            f"💰 *Estimation de votre gain :*\n"
+            f"💶 *{net_s} € NET* _(pour le groupe, après commission)._\n\n"
+            "⚖️ *Que s'est-il passé sur ce vol ?*\n\n"
+            "1️⃣ Retard *(+3 h à l'arrivée)*\n"
+            "2️⃣ Vol annulé\n"
+            "3️⃣ Refus d'embarquement *(surréservation)*\n\n"
+            "_(Répondez *1*, *2* ou *3*.)_"
         )
     send(phone, msg)
 
@@ -1298,6 +1384,31 @@ def next_after_airline_pick(phone, lang, conv):
     else:
         conv["step"] = "pnr_input"
         q_pnr(phone, lang, air)
+
+
+def advance_after_incident(phone, lang, conv):
+    """
+    Après la preuve billet (ou saisie manuelle sans photo) : ne pas afficher le menu compagnie si déjà connu
+    (données fusionnées depuis la carte, ou n° de vol suffisant pour deviner l'IATA).
+    """
+    d = conv["data"]
+    if not (d.get("airline") or "").strip():
+        fn_raw = re.sub(r"[\s]+", "", (d.get("flight_number") or "").upper())
+        guess = airline_guess_from_flight_number(fn_raw) if fn_raw else None
+        if guess:
+            d["airline"] = guess
+    if (d.get("airline") or "").strip():
+        nm = (d.get("airline") or "").strip()
+        send(
+            phone,
+            f"✅ *{nm}* retenue pour la suite _(billet ou n° de vol)_ — pas besoin de la resaisir."
+            if lang == "fr"
+            else f"✅ Keeping *{nm}* _(from your pass or flight number)_ — no need to enter it again.",
+        )
+        next_after_airline_pick(phone, lang, conv)
+    else:
+        conv["step"] = "airline"
+        q_airline(phone, lang)
 
 
 def q_flight_number(phone, lang):
@@ -1559,7 +1670,8 @@ def show_summary(phone, conv):
             f"👥 Passengers ({pax}):\n{names_str}\n\n"
             f"{box}\n\n"
             f"👇 *Sign your mandate (2 min):*\n{mandat_link}\n\n"
-            f"_If signing fails, try a private/incognito window or contact us via {RDA_DOMAIN}._"
+            f"_If signing fails, try a private/incognito window or contact us via {RDA_DOMAIN}._\n\n"
+            f"📜 _Full terms:_ {TERMS_URL}"
         )
     else:
         msg = (
@@ -1571,7 +1683,8 @@ def show_summary(phone, conv):
             f"👥 Passagers ({pax}) :\n{names_str}\n\n"
             f"{box}\n\n"
             f"👇 *Signez votre mandat (2 min) :*\n{mandat_link}\n\n"
-            f"_Si la signature échoue : essayez une fenêtre de navigation privée ou contactez-nous via {RDA_DOMAIN}._"
+            f"_Si la signature échoue : essayez une fenêtre de navigation privée ou contactez-nous via {RDA_DOMAIN}._\n\n"
+            f"📜 _CGU complètes :_ {TERMS_URL}"
         )
     send(phone, msg)
     at_save(phone, conv)
@@ -2372,8 +2485,8 @@ def send_carte_confirm_panel(phone, conv, lang):
 def apply_boarding_pass_image(phone, conv, image_b64, lang, after_passengers=False):
     """
     Lit une carte / billet et enchaîne en sautant les étapes déjà remplies.
-    Si after_passengers=True (juste après le choix du nombre de passagers), on fusionne
-    puis on impose l'étape « incident » (obligatoire) avant la suite.
+    Si after_passengers=True : photo à l'étape « preuves » (l'incident a déjà été choisi) ; on fusionne
+    puis on enchaîne compagnie / vol / date sans redemander l'incident.
     Retourne True si au moins une info exploitable a été extraite.
     """
     step_before = conv.get("step")
@@ -2444,8 +2557,7 @@ def apply_boarding_pass_image(phone, conv, image_b64, lang, after_passengers=Fal
 
     if after_passengers:
         send(phone, f"{head}\n{body}" if body else head)
-        conv["step"] = "incident_type"
-        q_incident(phone, lang, d.get("passengers") or 1)
+        advance_after_incident(phone, conv, lang)
         at_save(phone, conv)
         return True
 
@@ -2582,6 +2694,41 @@ def handle_reply(phone, text, conv, image_b64=None):
         q_passengers(phone, lang)
         return True
 
+    if t and user_wants_expertise_rappel(t) and step and step != "completed":
+        if step == "passengers":
+            send(
+                phone,
+                (
+                    "📞 *Rappel expertise*\n\n"
+                    "Pour *7 passagers ou plus*, choisissez l'option *7* : *Climbie* vous rappelle en *expertise prioritaire*.\n\n"
+                    "Pour joindre l'équipe :\n"
+                    f"📱 {CLIMBIE_TEL}\n👉 {DEPOT_URL}"
+                )
+                if lang == "fr"
+                else (
+                    "📞 *Expert callback*\n\n"
+                    "For *7+ passengers*, reply *7*: *Climbie* will call you back with *priority handling*.\n\n"
+                    f"📱 {CLIMBIE_TEL}\n👉 {DEPOT_URL}"
+                ),
+            )
+        else:
+            send(
+                phone,
+                (
+                    "📞 *Rappel / expertise*\n\n"
+                    "Pour être rappelé ou échanger avec un conseiller :\n"
+                    f"📱 {CLIMBIE_TEL}\n👉 {DEPOT_URL}\n\n"
+                    "_Vous pouvez aussi poursuivre votre dossier ici en répondant à la dernière question._"
+                )
+                if lang == "fr"
+                else (
+                    "📞 *Callback / expert*\n\n"
+                    f"📱 {CLIMBIE_TEL}\n👉 {DEPOT_URL}\n\n"
+                    "_You can also continue your claim here by answering the last question._"
+                ),
+            )
+        return True
+
     # ── VÉRIFICATION LECTURE CARTE / BILLET (réduit la friction) ─────
     if step == "carte_confirm":
         if image_b64:
@@ -2652,20 +2799,44 @@ def handle_reply(phone, text, conv, image_b64=None):
 
     # ── ÉTAPE 1 : PASSAGERS ──────────────────────────────────────────
     if step == "passengers":
-        if choice in ["1","2","3","4","5"]:
+        if choice in ("1", "2", "3", "4", "5", "6"):
             pax = int(choice)
             conv["data"]["passengers"] = pax
             print(f"[consent] phone={phone} pax={pax} lang={lang} continued_after_privacy_notice")
-            conv["step"] = "boarding_after_pax"
-            q_boarding_after_pax(phone, lang, pax)
+            conv["step"] = "incident_type"
+            q_incident(phone, lang, pax)
             at_save(phone, conv)
             return True
-        if choice == "6":
-            send(phone, f"🙏 Pour 6+ passagers, *Climbie* vous contacte personnellement.\n\n📱 {CLIMBIE_TEL}\n\n👉 {DEPOT_URL}")
+        if choice == "7":
+            send(
+                phone,
+                (
+                    "🙏 *Expertise prioritaire — 7 passagers ou plus*\n\n"
+                    "*Climbie* vous rappelle personnellement pour constituer votre dossier.\n\n"
+                    f"📱 {CLIMBIE_TEL}\n👉 {DEPOT_URL}"
+                )
+                if lang == "fr"
+                else (
+                    "🙏 *Priority expert handling — 7+ passengers*\n\n"
+                    "*Climbie* will call you back to open your file.\n\n"
+                    f"📱 {CLIMBIE_TEL}\n👉 {DEPOT_URL}"
+                ),
+            )
             return True
         return False
 
-    # ── ÉTAPE 2 : CARTE D'EMBARQUEMENT (juste après le montant) ───────
+    # ── ÉTAPE 2 : INCIDENT (avant la photo) ─────────────────────────
+    if step == "incident_type":
+        mapping = {"1": "delay", "2": "cancel", "3": "denied"}
+        if choice in mapping:
+            conv["data"]["incident_type"] = mapping[choice]
+            conv["step"] = "boarding_after_pax"
+            q_boarding_after_pax(phone, lang, conv["data"]["passengers"] or 1)
+            at_save(phone, conv)
+            return True
+        return False
+
+    # ── ÉTAPE 3 : CARTE D'EMBARQUEMENT (preuves) ─────────────────────
     if step == "boarding_after_pax":
         if image_b64:
             if apply_boarding_pass_image(phone, conv, image_b64, lang, after_passengers=True):
@@ -2680,30 +2851,18 @@ def handle_reply(phone, text, conv, image_b64=None):
         if choice == "1":
             send(
                 phone,
-                "👍 Parfait. Envoyez maintenant la *photo* de votre carte d'embarquement ou billet (image nette).\n\n"
-                "_(Ou tapez *2* si vous préférez les questions sans photo.)_"
+                "👍 *Parfait.* Envoyez la *photo* maintenant : carte à plat, *sans reflets*.\n\n"
+                "_(Tapez *2* si vous préférez tout saisir à la main.)_"
                 if lang == "fr"
-                else "👍 Great — send your boarding pass or e-ticket *photo* now (clear image).\n\n"
-                "_(Or reply *2* to continue with questions only.)_",
+                else "👍 *Great.* Send the *photo* now: pass flat on the table, *no glare*.\n\n"
+                "_(Reply *2* to type everything manually.)_",
             )
             return True
         if choice == "2" or low in (
             "continuer", "continue", "skip", "passer", "plus tard", "sans photo",
             "no photo", "later", "pas de photo", "questions", "sans image",
         ):
-            conv["step"] = "incident_type"
-            q_incident(phone, lang, conv["data"]["passengers"] or 1)
-            at_save(phone, conv)
-            return True
-        return False
-
-    # ── ÉTAPE 3 : INCIDENT ───────────────────────────────────────────
-    if step == "incident_type":
-        mapping = {"1": "delay", "2": "cancel", "3": "denied"}
-        if choice in mapping:
-            conv["data"]["incident_type"] = mapping[choice]
-            conv["step"] = "airline"
-            q_airline(phone, lang)
+            advance_after_incident(phone, lang, conv)
             at_save(phone, conv)
             return True
         return False
@@ -3214,6 +3373,8 @@ def test():
         "openai":   "OK" if OPENAI_API_KEY else "MISSING",
         "wati":     "OK" if WATI_API_TOKEN else "MISSING",
         "convs":    len(conversations),
+        "terms_url": TERMS_URL,
+        "privacy_url": PRIVACY_POLICY_URL,
     }), 200
 
 @app.route("/reset/<phone>", methods=["GET"])
