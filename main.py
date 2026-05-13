@@ -633,6 +633,22 @@ def try_parse_flight_date_message(text, lang):
             y = _expand_two_digit_year(y)
         return _format_flight_date_ddmmyyyy(d, mo, y)
 
+    # « 15 mai » sans année (souvent en Afrique / WhatsApp) : années récentes plausibles
+    m = re.match(
+        r"^(\d{1,2})\s+([a-zA-ZéèêëàùâîôûçÉÈÊËÀÙÂÎÔÛÇ]+)\s*$",
+        s,
+        re.I,
+    )
+    if m:
+        d = int(m.group(1))
+        mo = month_number_from_word_token(m.group(2), lang)
+        if mo:
+            cy = datetime.now().year
+            for y in (cy, cy - 1, cy - 2, cy - 3):
+                fd = _format_flight_date_ddmmyyyy(d, mo, y)
+                if fd:
+                    return fd
+
     return None
 
 
@@ -687,6 +703,9 @@ conversations    = {}
 recent_event_ids = {}
 MEMORY_HOURS     = 24
 
+# PNR / record locator : certaines compagnies utilisent 4 caractères alphanumériques.
+MIN_PNR_LEN = 4
+
 def fresh_data(lang="fr"):
     return {
         "lang": lang,
@@ -712,6 +731,18 @@ def get_conv(phone):
     now = datetime.now()
     if phone in conversations:
         if (now - conversations[phone]["created"]) > timedelta(hours=MEMORY_HOURS):
+            try:
+                lang = conversations[phone].get("data", {}).get("lang", "fr")
+                st = conversations[phone].get("step")
+                if st and st != "completed":
+                    send(
+                        phone,
+                        "⏱️ *Votre session a expiré* (24 h sans activité). Le dossier en cours a été effacé — vous pouvez recommencer en envoyant *menu* ou le nombre de passagers."
+                        if lang == "fr"
+                        else "⏱️ *Your session expired* (24h idle). The in-progress claim was cleared — send *menu* or your passenger count to start again.",
+                    )
+            except Exception as e:
+                print(f"get_conv expiry notify: {e}")
             del conversations[phone]
     if phone not in conversations:
         conversations[phone] = {
@@ -808,6 +839,10 @@ def at_find(ref):
 def at_save(phone, conv):
     """Sauvegarde progressive — crée ou met à jour les records Airtable."""
     if not AIRTABLE_API_KEY:
+        print(
+            f"❌ CRITICAL at_save: AIRTABLE_API_KEY manquant — aucune persistance Airtable "
+            f"(tel={phone}, ref={conv.get('ref')}, step={conv.get('step')})"
+        )
         return
 
     try:
@@ -986,6 +1021,16 @@ def at_boarding_attach_to_indices(phone, conv, image_b64, indices_0based, lang):
     raw = _boarding_image_bytes(image_b64)
     if not raw:
         return 0
+    if len(raw) > 5 * 1024 * 1024:
+        send(
+            phone,
+            "⚠️ *Image trop lourde* (max 5 Mo pour l’enregistrement du billet sur notre dossier). "
+            "Réduisez la taille ou renvoyez une capture plus compressée."
+            if lang == "fr"
+            else "⚠️ *Image too large* (max 5 MB for boarding-pass storage). Please send a smaller or more compressed photo.",
+        )
+        print(f"at_boarding_attach_to_indices: image {len(raw)} bytes > 5 Mo (tel={phone})")
+        return 0
     d = conv["data"]
     ref = conv.get("ref") or make_ref(phone)
     conv["ref"] = ref
@@ -1068,28 +1113,38 @@ def q_passengers(phone, lang):
     """Étape 1 — Passagers + montant visible immédiatement"""
     rows = []
     for n in range(1, 6):
-        brut, net, _, _ = calc_amounts(n)
-        rows.append(f"{n}️⃣  {n} passager{'s' if n>1 else ''} — 💶 jusqu'à *{net}€* net")
+        brut, net, _, per_pax = calc_amounts(n)
+        rows.append(
+            f"{n}️⃣  {n} passager{'s' if n>1 else ''} — 💶 *{per_pax}€ brut*/passager "
+            f"_(palier indicatif long-courrier), soit *{brut}€ brut* le groupe — net indicatif *{net}€*_"
+        )
     rows.append(f"6️⃣  6 ou plus — 📱 Climbie vous appelle")
     bloc = "\n".join(rows)
+    consent_fr = "\n\n_En répondant, vous confirmez avoir pris connaissance de la mention confidentialité ci-dessus._"
+    consent_en = "\n\n_By replying, you confirm you have read the privacy note above._"
 
     if lang == "en":
         msg = (
             "👋 Welcome to *Robin des Airs* ✈️\n\n"
-            "Flight delayed or cancelled? You may be owed *up to 600€* per passenger.\n\n"
+            "Flight delayed or cancelled? Under EU261 you may be owed *up to 600€ gross per passenger* "
+            "(tier depends on distance — we show the long-haul bracket here as an example).\n\n"
             + _privacy_short_notice("en")
             + "\n\n👥 *How many passengers?*\n\n"
             + bloc.replace("passager", "passenger").replace("ou plus", "or more")
-            .replace("jusqu'à", "up to").replace("vous appelle", "will call you")
+            .replace("le groupe", "for the group").replace("vous appelle", "will call you")
+            .replace("passagers", "passengers")
+            + consent_en
             + "\n\nReply *1–6*"
         )
     else:
         msg = (
             "👋 Bienvenue chez *Robin des Airs* ✈️\n\n"
-            "Vol retardé ou annulé ? Vous avez peut-être droit à *600€ par passager*.\n\n"
+            "Vol retardé ou annulé ? Sous EU261 vous pouvez avoir droit à *jusqu'à 600€ bruts par passager* "
+            "_(selon distance ; on affiche ici le palier long-courrier indicatif)_.\n\n"
             + _privacy_short_notice("fr")
             + "\n\n👥 *Combien de passagers ?*\n\n"
             + bloc
+            + consent_fr
             + "\n\nRépondez *1 à 6*"
         )
     send(phone, msg)
@@ -1137,11 +1192,13 @@ def q_boarding_after_pax(phone, lang, pax):
     privacy_block = ""
     if os.environ.get("PRIVACY_HIDE_DETAILED_BANNER", "").strip().lower() not in ("1", "true", "yes", "on"):
         privacy_block = _privacy_consent_footer(lang) + "\n\n"
+    _, _, _, per_pax = calc_amounts(pax)
     if lang == "en":
         msg = (
             privacy_block
             + f"✅ *{pax} passenger(s).*\n\n"
-            + f"Indicative **net up to {net} €** for your group (75% after our 25% fee if we win — tier shown below).\n\n"
+            + f"Indicative **{per_pax} € gross / passenger** (long-haul tier shown), **{brut} € gross** for your group "
+            + f"— *net up to {net} €* for the group if we win (75% after our 25% fee — see box).\n\n"
             + f"{box}\n\n"
             + "📸 *The easy way:* one **clear photo** of your boarding pass or e-ticket — we auto-fill flight, date, airline, PNR, route.\n\n"
             + "1️⃣  *I'll send the photo* — reply *1*, then send the image (or send the image right now)\n"
@@ -1150,7 +1207,9 @@ def q_boarding_after_pax(phone, lang, pax):
     else:
         msg = (
             privacy_block
-            + f"✅ *{pax} passager(s) noté(s).* Voici l'estimation indicative (**net jusqu'à {net} €** pour le groupe si succès, après commission RDA 25 % — palier ci-dessous).\n\n"
+            + f"✅ *{pax} passager(s) noté(s).*\n\n"
+            + f"Palier indicatif **{per_pax} € bruts / passager**, **{brut} € bruts** pour votre groupe "
+            + f"— *net jusqu'à {net} €* pour le groupe si succès (après commission RDA 25 % — encadré ci-dessous).\n\n"
             + f"{box}\n\n"
             + "📸 *Le plus simple :* une **photo nette** de votre carte d'embarquement ou billet — on remplit vol, date, compagnie, PNR, trajet pour vous.\n\n"
             + "1️⃣  *J'envoie la photo* — répondez *1* puis envoyez l'image *(ou envoyez la photo directement)*\n"
@@ -1204,28 +1263,36 @@ def q_pnr(phone, lang, airline):
         msg = (
             f"✅ *{airline}* noted!\n\n"
             "📋 *PNR / Booking reference*\n"
-            "(6-character code on your confirmation email)\n\n"
-            "Example: *ABC123*\n\n"
+            "(often 5–6 characters on your confirmation email; sometimes 4)\n\n"
+            "Example: *ABC12* or *ABC123*\n\n"
             "_(Don't have it? Reply *SKIP* — photo also works.)_"
         )
     else:
         msg = (
             f"✅ *{airline}* noté !\n\n"
             "📋 *PNR / Code de réservation*\n"
-            "(6 caractères sur votre email de confirmation)\n\n"
-            "Exemple : *ABC123*\n\n"
+            "(souvent 5–6 caractères sur l'email de confirmation ; parfois 4)\n\n"
+            "Exemple : *ABC12* ou *ABC123*\n\n"
             "_(Pas le code ? Répondez *SKIP* — une photo de billet suffit aussi.)_"
         )
     send(phone, msg)
 
 
 def next_after_airline_pick(phone, lang, conv):
-    """Après choix de la compagnie : ne redemande pas le PNR s'il est déjà sur le billet (fusion)."""
+    """Après choix de la compagnie : ne redemande pas PNR / n° de vol / date déjà fusionnés depuis la carte."""
     d = conv["data"]
     air = d.get("airline") or ""
     pnr_clean = re.sub(r"[^A-Za-z0-9]", "", (d.get("pnr") or "").upper())
-    if len(pnr_clean) >= 5:
+    if len(pnr_clean) >= MIN_PNR_LEN:
         d["pnr"] = pnr_clean[:8]
+    if d.get("flight_number") and d.get("flight_date"):
+        advance_after_flight_date_complete(phone, conv, lang)
+        return
+    if d.get("flight_number"):
+        conv["step"] = "flight_date"
+        q_flight_date(phone, lang, conv)
+        return
+    if len(pnr_clean) >= MIN_PNR_LEN:
         conv["step"] = "flight_number"
         q_flight_number(phone, lang)
     else:
@@ -1379,7 +1446,8 @@ def q_passenger_names_confirm(phone, lang, conv):
                 f"👥 *All {pax} passenger(s) — confirm*\n\n"
                 f"{lines}\n\n"
                 "1️⃣  *All correct* — continue\n"
-                "2️⃣  *Fix last name* — re-enter the last passenger"
+                "2️⃣  *Fix last name* — re-enter the last passenger\n\n"
+                "_Next: minors vs adults for these names._"
             )
     else:
         if partial:
@@ -1394,7 +1462,8 @@ def q_passenger_names_confirm(phone, lang, conv):
                 f"👥 *Les {pax} passagers — confirmez*\n\n"
                 f"{lines}\n\n"
                 "1️⃣  *Tout est correct* — on continue\n"
-                "2️⃣  *Corriger le dernier nom* — resaisir le dernier passager"
+                "2️⃣  *Corriger le dernier nom* — resaisir le dernier passager\n\n"
+                "_Ensuite : mineurs / majeurs pour ces noms._"
             )
     send(phone, msg)
 
@@ -1404,16 +1473,25 @@ def goto_passenger_names_confirm(phone, conv, lang):
     q_passenger_names_confirm(phone, lang, conv)
 
 
-def q_minors(phone, lang, pax):
+def q_minors(phone, lang, conv):
+    d = conv["data"]
+    pax = d.get("passengers") or 1
+    names = d.get("passenger_names") or []
+    names_txt = "\n".join(f"  • *{n}*" for n in names) if names else ""
+    block = f"\n{names_txt}\n" if names_txt else "\n"
     if lang == "en":
         msg = (
-            "👶 *Any minors (under 18) among the passengers?*\n\n"
+            "👶 *Any minors (under 18) among these passengers?*"
+            + block
+            + "\nPlease answer *for the people listed above* (declaration on your honour).\n\n"
             "1️⃣  No — all adults\n"
             "2️⃣  Yes — at least one minor"
         )
     else:
         msg = (
-            "👶 *Y a-t-il des mineurs (moins de 18 ans) parmi les passagers ?*\n\n"
+            "👶 *Parmi ces passagers, y a-t-il des mineurs (moins de 18 ans) ?*"
+            + block
+            + "\nMerci de répondre *pour les personnes listées ci-dessus* (déclaration sur l’honneur).\n\n"
             "1️⃣  Non — tous majeurs\n"
             "2️⃣  Oui — au moins un mineur"
         )
@@ -1480,7 +1558,8 @@ def show_summary(phone, conv):
             f"⚠️ Incident: *{incident}*\n"
             f"👥 Passengers ({pax}):\n{names_str}\n\n"
             f"{box}\n\n"
-            f"👇 *Sign your mandate (2 min):*\n{mandat_link}"
+            f"👇 *Sign your mandate (2 min):*\n{mandat_link}\n\n"
+            f"_If signing fails, try a private/incognito window or contact us via {RDA_DOMAIN}._"
         )
     else:
         msg = (
@@ -1491,7 +1570,8 @@ def show_summary(phone, conv):
             f"⚠️ Incident : *{incident}*\n"
             f"👥 Passagers ({pax}) :\n{names_str}\n\n"
             f"{box}\n\n"
-            f"👇 *Signez votre mandat (2 min) :*\n{mandat_link}"
+            f"👇 *Signez votre mandat (2 min) :*\n{mandat_link}\n\n"
+            f"_Si la signature échoue : essayez une fenêtre de navigation privée ou contactez-nous via {RDA_DOMAIN}._"
         )
     send(phone, msg)
     at_save(phone, conv)
@@ -1774,7 +1854,7 @@ def boarding_pass_info_usable(info):
     if 2 <= len((info.get("airline") or "").strip()) <= 3 and len(air_short) <= 3 and airline_from_iata(air_short):
         return True
     pnr = _pnr_from_vision_info(info)
-    return len(pnr) >= 5
+    return len(pnr) >= MIN_PNR_LEN
 
 
 def _format_passenger_name_token(s):
@@ -1980,7 +2060,7 @@ def merge_boarding_pass_info(conv, info):
     elif kind == "partial":
         d["pending_ticket_dm"] = dval
     pnr = _pnr_from_vision_info(info)
-    if len(pnr) >= 5:
+    if len(pnr) >= MIN_PNR_LEN:
         d["pnr"] = pnr[:8]
     dep = (info.get("departure") or "").strip()
     arr = (info.get("arrival") or "").strip()
@@ -2064,7 +2144,7 @@ def _carte_recap_lines(d, lang, extra_lines=None):
 def _carte_confirm_yes_no_suffix(lang):
     if lang == "en":
         return (
-            "\n\n*Tout is correct?*\n"
+            "\n\n*Everything correct?*\n"
             "✅ *1* — Yes, continue.\n"
             "✏️ *2* — I need to fix something."
         )
@@ -2072,6 +2152,19 @@ def _carte_confirm_yes_no_suffix(lang):
         "\n\n*Tout est correct ?*\n"
         "✅ *1* — Oui, c'est bon, on continue.\n"
         "✏️ *2* — Non, je dois corriger une information."
+    )
+
+
+def _carte_modify_later_hint(lang):
+    """Rappel : correction possible sans bloquer le tunnel."""
+    if lang == "en":
+        return (
+            "\n\nℹ️ _If something is wrong, reply *2* now — or continue and fix any field later "
+            "from this same summary screen._"
+        )
+    return (
+        "\n\nℹ️ _Si une information est incorrecte : répondez *2* maintenant — ou continuez : "
+        "vous pourrez corriger chaque champ plus tard depuis cet écran récapitulatif._"
     )
 
 
@@ -2163,9 +2256,19 @@ def q_carte_edit_prompt(phone, lang, key):
     elif key == "flight_number":
         send(phone, "✍️ Indiquez le *numéro de vol* (ex. *AF703* ou *SN3638*)." if lang == "fr" else "✍️ Type the *flight number* (e.g. *AF703*).")
     elif key == "flight_date":
-        send(phone, "✍️ Indiquez la *date du vol* au format *JJ/MM/AAAA* (ex. *12/05/2024*)." if lang == "fr" else "✍️ Enter the *flight date* as *DD/MM/YYYY* (e.g. *12/05/2024*).")
+        send(
+            phone,
+            "✍️ Indiquez la *date du vol* (*JJ/MM/AAAA*, ou ex. *12 mai 2024*, *15 mai*)."
+            if lang == "fr"
+            else "✍️ Enter the *flight date* (*DD/MM/YYYY*, or e.g. *12 May 2024*).",
+        )
     elif key == "pnr":
-        send(phone, "✍️ Indiquez le *PNR* / code réservation (au moins 5 caractères)." if lang == "fr" else "✍️ Type the *PNR* / booking code (at least 5 characters).")
+        send(
+            phone,
+            f"✍️ Indiquez le *PNR* / code réservation (au moins *{MIN_PNR_LEN}* caractères alphanumériques)."
+            if lang == "fr"
+            else f"✍️ Type the *PNR* / booking code (at least *{MIN_PNR_LEN}* alphanumeric characters).",
+        )
     elif key == "itinerary":
         send(phone, "✍️ Indiquez le *trajet* (ex. *Paris CDG → Abidjan* ou *CDG → ABJ*)." if lang == "fr" else "✍️ Type the *route* (e.g. *Paris CDG → Abidjan*).")
     elif key == "passenger_names":
@@ -2201,15 +2304,26 @@ def _apply_carte_field_edit(d, key, text, lang):
         return True, None
     if key == "flight_date":
         s = raw.strip()
-        if not re.match(r"^\d{2}/\d{2}/\d{4}$", s):
-            return False, ("Format attendu : *JJ/MM/AAAA* (ex. 12/05/2024)." if lang == "fr" else "Expected format: *DD/MM/YYYY* (e.g. 12/05/2024).")
-        d["flight_date"] = s
+        parsed = try_parse_flight_date_message(s, lang)
+        if not parsed and re.match(r"^\d{2}/\d{2}/\d{4}$", s):
+            parsed = s
+        if not parsed:
+            return False, (
+                "Date non reconnue. Ex. *12/05/2024*, *2024-05-12* ou *15 mai*."
+                if lang == "fr"
+                else "Date not recognized. E.g. *12/05/2024*, *2024-05-12*, or *15 May*."
+            )
+        d["flight_date"] = parsed
         d.pop("pending_ticket_dm", None)
         return True, None
     if key == "pnr":
         p = re.sub(r"[^A-Za-z0-9]", "", raw.upper())
-        if len(p) < 5:
-            return False, ("Le PNR doit contenir au moins 5 caractères." if lang == "fr" else "PNR must be at least 5 characters.")
+        if len(p) < MIN_PNR_LEN:
+            return False, (
+                f"Le PNR doit contenir au moins {MIN_PNR_LEN} caractères."
+                if lang == "fr"
+                else f"PNR must be at least {MIN_PNR_LEN} characters."
+            )
         d["pnr"] = p[:8]
         return True, None
     if key == "itinerary":
@@ -2252,7 +2366,7 @@ def send_carte_confirm_panel(phone, conv, lang):
     bits = _carte_recap_lines(d, lang)
     head = "📋 *Voici ce qu'on retient :*" if lang == "fr" else "📋 *Here's what we have:*"
     body = "\n".join(bits) if bits else ("_(rien de détecté pour l'instant — vous pouvez corriger ou renvoyer une photo)_" if lang == "fr" else "_(nothing detected yet — fix a field or send another photo)_")
-    send(phone, f"{head}\n{body}{_carte_confirm_yes_no_suffix(lang)}")
+    send(phone, f"{head}\n{body}{_carte_modify_later_hint(lang)}{_carte_confirm_yes_no_suffix(lang)}")
 
 
 def apply_boarding_pass_image(phone, conv, image_b64, lang, after_passengers=False):
@@ -2265,7 +2379,24 @@ def apply_boarding_pass_image(phone, conv, image_b64, lang, after_passengers=Fal
     step_before = conv.get("step")
     idx_for_attach = max(0, (conv["data"].get("pax_collect_idx") or 1) - 1)
     info = read_boarding_pass_merged(image_b64)
+    raw_probe = _boarding_image_bytes(image_b64)
     if not boarding_pass_info_usable(info):
+        if raw_probe and len(raw_probe) > 5 * 1024 * 1024:
+            send(
+                phone,
+                "⚠️ *Image trop lourde* (max 5 Mo pour l’archivage du billet). Réduisez la taille ou renvoyez une capture plus légère."
+                if lang == "fr"
+                else "⚠️ *Image too large* (max 5 MB for boarding-pass storage). Please send a smaller file.",
+            )
+        elif image_b64 and not (OPENAI_API_KEY or "").strip():
+            send(
+                phone,
+                "📸 *Lecture automatique limitée* : le service « vision » n’est pas configuré sur ce serveur. "
+                "Répondez *2* pour saisir le vol à la main, ou renvoyez une photo *très nette* avec le *QR code* du billet si présent."
+                if lang == "fr"
+                else "📸 *Auto-read is limited*: the vision API is not configured on this server. "
+                "Reply *2* to enter details manually, or resend a very sharp photo including the ticket *QR code* if visible.",
+            )
         return False
     merge_boarding_pass_info(conv, info)
     d = conv["data"]
@@ -2288,7 +2419,19 @@ def apply_boarding_pass_image(phone, conv, image_b64, lang, after_passengers=Fal
             idx_plan = list(range(min(len(vis_list), pax)))
         else:
             idx_plan = [0]
-        n_att = at_boarding_attach_to_indices(phone, conv, image_b64, idx_plan, lang)
+        raw_att = _boarding_image_bytes(image_b64)
+        h_att = hashlib.sha256(raw_att).hexdigest() if raw_att else ""
+        if h_att and d.get("_last_boarding_attach_hash") == h_att:
+            n_att = 0
+            extras.append(
+                "📎 _Même fichier qu’à l’envoi précédent — pas de nouvel enregistrement Airtable._"
+                if lang == "fr"
+                else "📎 _Same file as before — no duplicate Airtable upload._"
+            )
+        else:
+            if h_att:
+                d["_last_boarding_attach_hash"] = h_att
+            n_att = at_boarding_attach_to_indices(phone, conv, image_b64, idx_plan, lang)
     if n_att:
         extras.append(
             f"📎 Carte enregistrée dans Airtable ({n_att} ligne{'s' if n_att > 1 else ''})."
@@ -2313,7 +2456,8 @@ def apply_boarding_pass_image(phone, conv, image_b64, lang, after_passengers=Fal
             else "\n\nHere's what we detected — *please check before continuing*:"
         )
         sfx = _carte_confirm_yes_no_suffix(lang)
-        send(phone, f"{head}{intro}\n\n{body}{sfx}" if body else f"{head}{intro}{sfx}")
+        hint = _carte_modify_later_hint(lang)
+        send(phone, f"{head}{intro}\n\n{body}{hint}{sfx}" if body else f"{head}{intro}{hint}{sfx}")
         conv["step"] = "carte_confirm"
         at_save(phone, conv)
         return True
@@ -2511,6 +2655,7 @@ def handle_reply(phone, text, conv, image_b64=None):
         if choice in ["1","2","3","4","5"]:
             pax = int(choice)
             conv["data"]["passengers"] = pax
+            print(f"[consent] phone={phone} pax={pax} lang={lang} continued_after_privacy_notice")
             conv["step"] = "boarding_after_pax"
             q_boarding_after_pax(phone, lang, pax)
             at_save(phone, conv)
@@ -2640,8 +2785,12 @@ def handle_reply(phone, text, conv, image_b64=None):
             conv["data"]["pnr"] = None
         else:
             conv["data"]["pnr"] = pnr_clean[:8]
-        conv["step"] = "flight_number"
-        q_flight_number(phone, lang)
+        if conv["data"].get("flight_number"):
+            conv["step"] = "flight_date"
+            q_flight_date(phone, lang, conv)
+        else:
+            conv["step"] = "flight_number"
+            q_flight_number(phone, lang)
         at_save(phone, conv)
         return True
 
@@ -2885,7 +3034,7 @@ def handle_reply(phone, text, conv, image_b64=None):
                 q_passenger_name(phone, lang, nxt, pax, names)
             else:
                 conv["step"] = "minor_check"
-                q_minors(phone, lang, pax)
+                q_minors(phone, lang, conv)
             at_save(phone, conv)
             return True
         if choice == "2":
