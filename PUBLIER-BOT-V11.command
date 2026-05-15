@@ -3,31 +3,38 @@ cd "$(dirname "$0")"
 echo "════════════════════════════════════════"
 echo "  Publication bot v11 sur GitHub"
 echo "════════════════════════════════════════"
-if [ ! -d .git ] || ! git rev-parse --git-dir >/dev/null 2>&1; then
-  echo "Initialisation du dépôt git..."
-  rm -rf .git 2>/dev/null
+URL="https://github.com/expert-ctrl/robin-des-airs-bot.git"
+if [ ! -d .git ]; then
   git init
-  git remote add origin https://github.com/expert-ctrl/robin-des-airs-bot.git 2>/dev/null \
-    || git remote set-url origin https://github.com/expert-ctrl/robin-des-airs-bot.git
 fi
-git add app.py requirements.txt .gitignore
-git status -sb
-if git diff --cached --quiet; then
-  echo "Rien de nouveau à committer (déjà à jour ?)."
+if git remote get-url origin >/dev/null 2>&1; then
+  git remote set-url origin "$URL"
 else
-  git commit -m "Deploy bot v11: mandat.html, tunnel Wati, webhook /mandat_signed."
+  git remote add origin "$URL"
 fi
-echo ""
-echo "Envoi vers expert-ctrl/robin-des-airs-bot (main)..."
+echo "Remote origin : $(git remote get-url origin)"
+git add app.py main.py requirements.txt .gitignore
+git status -sb
+if ! git diff --cached --quiet 2>/dev/null; then
+  git commit -m "Deploy bot v11: main.py -> app.py, mandat.html, webhook /mandat_signed."
+elif [ -z "$(git log -1 --oneline 2>/dev/null)" ]; then
+  git commit -m "Deploy bot v11: main.py -> app.py, mandat.html, webhook /mandat_signed."
+else
+  echo "Commit local OK (rien de nouveau à ajouter)."
+fi
 git branch -M main 2>/dev/null
+echo ""
+echo "Envoi vers GitHub..."
 git push -u origin main
 CODE=$?
 echo ""
 if [ $CODE -eq 0 ]; then
-  echo "✅ Bot v11 poussé. Redéployez sur Render (Manual Deploy)."
-  echo "   Variables Render : MANDAT_URL=https://robindesairs.eu/mandat.html"
-  echo "   MANDAT_SIGNED_WEBHOOK_SECRET (identique à Netlify)"
+  echo "✅ Bot v11 en ligne sur GitHub."
+  echo "   Render → Manual Deploy"
+  echo "   MANDAT_URL=https://robindesairs.eu/mandat.html"
 else
-  echo "❌ Échec push ($CODE). Utilisez GitHub Desktop sur ce dossier."
+  echo "❌ Push échoué ($CODE)."
+  echo "   Essayez : git pull origin main --allow-unrelated-histories"
+  echo "   puis relancez ce script."
 fi
 read -p "Entrée pour fermer..."
