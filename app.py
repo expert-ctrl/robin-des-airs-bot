@@ -845,7 +845,13 @@ def _iter_wati_interactive_reply_objects(data):
         if not isinstance(node, dict) or id(node) in seen:
             return
         seen.add(id(node))
-        for field in ("interactiveButtonReply", "listReply", "buttonReply"):
+        for field in (
+            "interactiveButtonReply",
+            "listReply",
+            "buttonReply",
+            "interactiveListReply",
+            "list_reply",
+        ):
             obj = node.get(field)
             if isinstance(obj, dict):
                 yield obj
@@ -857,12 +863,42 @@ def _iter_wati_interactive_reply_objects(data):
                 inner = None
         if isinstance(inner, dict):
             walk(inner)
-        for key in ("reply", "context", "message", "interactive"):
+        for key in ("reply", "context", "message", "interactive", "messageData"):
             sub = node.get(key)
             if isinstance(sub, dict):
                 walk(sub)
 
     walk(data)
+
+
+def _has_wati_interactive(data):
+    if not isinstance(data, dict):
+        return False
+    if data.get("type") in ("button", "interactive", "list", "listReply"):
+        return True
+    if any(isinstance(data.get(f), dict) for f in ("interactiveButtonReply", "listReply", "buttonReply")):
+        return True
+    for _ in _iter_wati_interactive_reply_objects(data):
+        return True
+    return False
+
+
+def enrich_message_from_wati_interactive(data, message_text):
+    """Récupère le libellé du clic liste/bouton quand le champ text est vide."""
+    mt = (message_text or "").strip()
+    if mt:
+        return mt
+    if not isinstance(data, dict):
+        return mt
+    for obj in _iter_wati_interactive_reply_objects(data):
+        for key in ("id", "title", "text", "description", "rowId", "selectedRowId", "message"):
+            val = obj.get(key)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+    top = (data.get("text") or "").strip()
+    if top and data.get("type") in ("interactive", "button", "list", "listReply"):
+        return top
+    return mt
 
 def _map_raw_to_choice_id(raw, cmap):
     if not raw:
@@ -892,16 +928,22 @@ def extract_poll_choice(conv, data, message_text):
         candidates.append(str(message_text).strip())
     if isinstance(data, dict):
         for obj in _iter_wati_interactive_reply_objects(data):
-            for key in ("id", "title", "text", "description"):
+            for key in ("id", "title", "text", "description", "rowId", "selectedRowId", "message"):
                 val = obj.get(key)
                 if val is not None and str(val).strip():
                     candidates.append(str(val).strip())
-        if data.get("type") in ("button", "interactive") and message_text:
-            candidates.append(str(message_text).strip())
+        top = (data.get("text") or "").strip()
+        if top:
+            candidates.append(top)
     for raw in candidates:
         mapped = _map_raw_to_choice_id(raw, cmap)
         if mapped:
             return mapped
+    # Repli sans carte (redémarrage Railway) : chiffre 1–6 dans le libellé
+    for raw in candidates:
+        m = re.search(r"\b([1-6])\b", raw)
+        if m:
+            return m.group(1)
     return None
 
 def resolve_tunnel_choice(conv, data, message_text):
@@ -1976,6 +2018,12 @@ def q_passengers(phone, lang, conv=None):
         )
         lbtn = "Choisir"
     send_tunnel_poll(phone, conv, body, options, list_button_text=lbtn)
+    hint = (
+        "\n\n👆 Ouvrez *Choisir* puis touchez une ligne — ou tapez un chiffre *1* à *6*."
+        if lang == "fr"
+        else "\n\n👆 Open *Choose* and tap a row — or type *1* to *6*."
+    )
+    send(phone, hint)
 
 def user_wants_fresh_start(text):
     """Recommencer le dossier depuis le début (hors étape terminée)."""
@@ -3929,9 +3977,13 @@ def handle_reply(phone, text, conv, image_b64=None):
     t    = text.strip()
     low  = t.lower()
 
-    # Choix : déjà normalisé par le webhook (clic sondage) ou chiffre en tête
+    # Choix : clic sondage, chiffre en tête, ou chiffre 1–6 dans le texte
     m      = re.search(r"^(\d+)", t)
     choice = m.group(1) if m else None
+    if not choice and step == "passengers" and t:
+        m2 = re.search(r"\b([1-6])\b", t)
+        if m2:
+            choice = m2.group(1)
 
     print(f"[STEP={step}] text='{t[:30]}' choice={choice}")
 
@@ -4744,14 +4796,12 @@ def webhook():
         conv = get_conv(phone)
 
         message_text, image_b64 = parse_wati_inbound_message(data)
+        message_text = enrich_message_from_wati_interactive(data, message_text)
         poll_choice = resolve_tunnel_choice(conv, data, message_text)
         if poll_choice:
             message_text = poll_choice
 
-        has_interactive = any(
-            isinstance(data.get(f), dict)
-            for f in ("interactiveButtonReply", "listReply", "buttonReply")
-        ) or data.get("type") in ("button", "interactive")
+        has_interactive = _has_wati_interactive(data)
 
         if not message_text and not image_b64 and not has_interactive:
             print(f"[webhook] ignored empty keys={list(data.keys())[:12]}")
