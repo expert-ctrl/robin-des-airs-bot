@@ -866,9 +866,9 @@ def _iter_wati_interactive_reply_objects(data):
         for key in ("reply", "context", "message", "interactive", "messageData"):
             sub = node.get(key)
             if isinstance(sub, dict):
-                walk(sub)
+                yield from walk(sub)
 
-    walk(data)
+    yield from walk(data)
 
 
 def _has_wati_interactive(data):
@@ -922,7 +922,11 @@ def _map_raw_to_choice_id(raw, cmap):
 
 def extract_poll_choice(conv, data, message_text):
     """Réponse clic sondage WATI → id « 1 », « 2 », … (ou None)."""
+    if not isinstance(conv, dict):
+        return None
     cmap = (conv.get("data") or {}).get("_choice_map") or {}
+    if not isinstance(cmap, dict):
+        cmap = {}
     candidates = []
     if message_text and str(message_text).strip():
         candidates.append(str(message_text).strip())
@@ -948,6 +952,7 @@ def extract_poll_choice(conv, data, message_text):
 
 def resolve_tunnel_choice(conv, data, message_text):
     """Choix tunnel : clic WATI puis repli chiffre en tête de texte."""
+    message_text = message_text or ""
     c = extract_poll_choice(conv, data, message_text)
     if c:
         return c
@@ -4778,12 +4783,31 @@ def mandat_signed_webhook():
             ps["active"] = False
     return jsonify({"ok": True, "updated": updated}), 200
 
-@app.route("/webhook", methods=["POST"])
+@app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     try:
-        data = request.json
+        if request.method == "GET":
+            return jsonify({"ok": True, "service": "robin-des-airs-bot", "webhook": "ready"}), 200
+
+        raw_preview = (request.get_data(as_text=True) or "")[:800]
+        print(f"[webhook] IN POST preview={raw_preview!r}", flush=True)
+
+        data = request.get_json(silent=True) or {}
+        if not data and raw_preview.strip().startswith("{"):
+            try:
+                data = json.loads(raw_preview)
+            except (json.JSONDecodeError, TypeError):
+                data = {}
         if not data:
+            print("[webhook] no JSON body", flush=True)
             return jsonify({"status": "no data"}), 200
+
+        print(
+            f"[webhook] type={data.get('type')!r} event={data.get('eventType')!r} "
+            f"waId={data.get('waId')!r} text={(data.get('text') or '')[:80]!r} "
+            f"listReply={bool(data.get('listReply'))}",
+            flush=True,
+        )
 
         phone = normalize_phone_key(
             data.get("waId") or data.get("from") or data.get("phone")
@@ -4800,6 +4824,7 @@ def webhook():
         poll_choice = resolve_tunnel_choice(conv, data, message_text)
         if poll_choice:
             message_text = poll_choice
+        message_text = (message_text or "").strip()
 
         has_interactive = _has_wati_interactive(data)
 
@@ -4810,10 +4835,19 @@ def webhook():
         if not message_text and has_interactive and not poll_choice:
             print(
                 f"[webhook] interactive sans choix résolu type={data.get('type')} "
-                f"listReply={data.get('listReply')} btn={data.get('interactiveButtonReply')}"
+                f"listReply={data.get('listReply')} btn={data.get('interactiveButtonReply')}",
+                flush=True,
             )
+            lang = (conv.get("data") or {}).get("lang", "fr")
+            hint = (
+                "👆 Choix non reçu. Ouvrez *Choisir* à nouveau ou tapez *1*, *2*, *3*… *6*."
+                if lang == "fr"
+                else "👆 Choice not received. Open *Choose* again or type *1*…*6*."
+            )
+            send(phone, hint)
+            return jsonify({"status": "ok", "note": "interactive_unparsed"}), 200
 
-        sig  = f"{message_text.strip().lower()}|img:{bool(image_b64)}|poll:{poll_choice or ''}"
+        sig  = f"{message_text.lower()}|img:{bool(image_b64)}|poll:{poll_choice or ''}"
         step = conv.get("step")
         if is_dup(phone, data, sig, step):
             return jsonify({"status": "duplicate"}), 200
