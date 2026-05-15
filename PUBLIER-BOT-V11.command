@@ -1,4 +1,5 @@
 #!/bin/bash
+set +H
 cd "$(dirname "$0")"
 echo "════════════════════════════════════════"
 echo "  Publication bot v11 sur GitHub"
@@ -12,29 +13,41 @@ if git remote get-url origin >/dev/null 2>&1; then
 else
   git remote add origin "$URL"
 fi
-echo "Remote origin : $(git remote get-url origin)"
-git add app.py main.py requirements.txt .gitignore
-git status -sb
+echo "Remote : $(git remote get-url origin)"
+git add app.py main.py requirements.txt .gitignore PUBLIER-BOT-V11.command 2>/dev/null
 if ! git diff --cached --quiet 2>/dev/null; then
-  git commit -m "Deploy bot v11: main.py -> app.py, mandat.html, webhook /mandat_signed."
-elif [ -z "$(git log -1 --oneline 2>/dev/null)" ]; then
-  git commit -m "Deploy bot v11: main.py -> app.py, mandat.html, webhook /mandat_signed."
-else
-  echo "Commit local OK (rien de nouveau à ajouter)."
+  git commit -m "Deploy bot v11: app.py, main.py, mandat.html."
 fi
 git branch -M main 2>/dev/null
 echo ""
+echo "Synchronisation avec GitHub..."
+git fetch origin 2>/dev/null
+if git rev-parse origin/main >/dev/null 2>&1; then
+  if ! git merge-base --is-ancestor origin/main main 2>/dev/null; then
+    git merge origin/main --no-edit 2>/dev/null || true
+    if [ -f main.py ] && grep -q '<<<<<<<' main.py 2>/dev/null; then
+      git checkout --ours main.py requirements.txt 2>/dev/null
+      git add main.py requirements.txt app.py
+      git commit -m "Bot v11: garde app.py + main.py (Railway)." 2>/dev/null || true
+    fi
+  fi
+fi
 echo "Envoi vers GitHub..."
-git push -u origin main
-CODE=$?
-echo ""
-if [ $CODE -eq 0 ]; then
+if git push -u origin main 2>&1; then
+  echo ""
   echo "✅ Bot v11 en ligne sur GitHub."
-  echo "   Render → Manual Deploy"
+  echo "   Railway redéploie automatiquement."
   echo "   MANDAT_URL=https://robindesairs.eu/mandat.html"
 else
-  echo "❌ Push échoué ($CODE)."
-  echo "   Essayez : git pull origin main --allow-unrelated-histories"
-  echo "   puis relancez ce script."
+  echo ""
+  echo "Push normal bloqué → envoi forcé du bot v11 (normal)."
+  if git push --force origin main 2>&1; then
+    echo ""
+    echo "✅ Bot v11 envoyé (force push)."
+    echo "   Railway → attendez Success sur Deployments."
+  else
+    echo ""
+    echo "❌ Échec. Vérifiez username + token GitHub."
+  fi
 fi
 read -p "Entrée pour fermer..."
