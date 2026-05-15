@@ -26,6 +26,10 @@ WATI_POST_SUBMIT_TEMPLATE_BROADCAST = os.environ.get(
     "WATI_POST_SUBMIT_TEMPLATE_BROADCAST", "rda_post_submit_reminder"
 ).strip()
 WATI_TEMPLATE_CHANNEL_NUMBER = os.environ.get("WATI_TEMPLATE_CHANNEL_NUMBER", "").strip()
+# Sondage WATI : boutons (≤3) ou liste (≤10) — clic au lieu de taper 1/2/3.
+WATI_USE_INTERACTIVE = os.environ.get("WATI_USE_INTERACTIVE", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 POST_SUBMIT_TEMPLATE_REPEAT_H = int(os.environ.get("POST_SUBMIT_TEMPLATE_REPEAT_HOURS", "48") or "48")
 META_SESSION_HOURS = int(os.environ.get("META_CUSTOMER_CARE_WINDOW_HOURS", "24") or "24")
 AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY", "")
@@ -284,7 +288,6 @@ def _decode_mandat_html():
 
 _MANDAT_HTML_BODY = _decode_mandat_html()
 MANDAT_URL = os.environ.get("MANDAT_URL", f"{RDA_DOMAIN.rstrip('/')}/mandat.html")
-DEPOT_URL   = f"{RDA_DOMAIN.rstrip('/')}/depot-express"
 
 
 def _mandat_public_origin():
@@ -751,7 +754,10 @@ STEPS = [
     "summary", "completed",
 ]
 
-# Progression affichée en tête des messages WhatsApp : [k/N] (hors completed / paused).
+# Progression en tête des messages WhatsApp : 🟢 / ⚪ (7 segments max, hors completed / paused).
+TUNNEL_PROGRESS_FILLED = "🟢"
+TUNNEL_PROGRESS_EMPTY = "⚪"
+TUNNEL_PROGRESS_VISUAL_SEGMENTS = 7
 TUNNEL_PROGRESS_BUCKETS = (
     ("passengers",),
     ("pax_ack_route",),
@@ -791,7 +797,19 @@ def tunnel_progress_prefix(conv):
     if not info:
         return ""
     cur, total = info
-    return f"[{cur}/{total}] "
+    n = TUNNEL_PROGRESS_VISUAL_SEGMENTS
+    vis = max(1, min(n, round(cur * n / total)))
+    bar = TUNNEL_PROGRESS_FILLED * vis + TUNNEL_PROGRESS_EMPTY * (n - vis)
+    return f"{bar}\n"
+
+
+def _first_line_looks_like_tunnel_progress_bar(line):
+    """Évite de préfixer deux fois si le message commence déjà par la barre."""
+    s = (line or "").strip()
+    if len(s) != TUNNEL_PROGRESS_VISUAL_SEGMENTS:
+        return False
+    ok = frozenset((TUNNEL_PROGRESS_FILLED, TUNNEL_PROGRESS_EMPTY))
+    return all(c in ok for c in s)
 
 
 # Étapes où une photo de billet remplit la suite : on demande confirmation avant d'enchaîner
@@ -1043,8 +1061,10 @@ def send(phone, msg):
         return False
     conv = conversations.get(phone)
     pre = tunnel_progress_prefix(conv) if conv else ""
-    if pre and not msg.startswith("["):
-        msg = pre + msg
+    if pre:
+        first_line = msg.split("\n", 1)[0]
+        if not _first_line_looks_like_tunnel_progress_bar(first_line):
+            msg = pre + msg
     if not WATI_API_TOKEN or not WATI_BASE_URL:
         print("send: WATI_API_TOKEN ou WATI_BASE_URL manquant")
         return False
@@ -1059,12 +1079,190 @@ def send(phone, msg):
         return False
 
 
+def _norm_wa_number(phone):
+    return re.sub(r"\D", "", str(phone or ""))
+
+
+def _norm_choice_key(s):
+    s = (s or "").strip().lower()
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    s = re.sub(r"[^\w\s]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def register_choice_map(conv, options):
+    """Associe libellés de boutons/liste WATI → id logique (« 1 », « 2 », …)."""
+    cmap = {}
+    for opt in options:
+        oid = str(opt["id"])
+        cmap[oid] = oid
+        for key in (opt.get("id"), opt.get("label"), opt.get("button"), opt.get("list_title")):
+            if not key:
+                continue
+            nk = _norm_choice_key(str(key))
+            if nk:
+                cmap[nk] = oid
+            short = str(key).strip()[:24]
+            if short:
+                cmap[_norm_choice_key(short)] = oid
+    conv.setdefault("data", {})["_choice_map"] = cmap
+
+
+def extract_poll_choice(conv, data, message_text):
+    """Réponse clic sondage WATI → id « 1 », « 2 », … (ou None)."""
+    raw = None
+    if isinstance(data, dict):
+        for field in ("interactiveButtonReply", "listReply", "buttonReply"):
+            obj = data.get(field)
+            if isinstance(obj, dict):
+                raw = str(obj.get("id") or obj.get("title") or obj.get("text") or "").strip()
+                if raw:
+                    break
+        if not raw and data.get("type") in ("button", "interactive"):
+            raw = (message_text or "").strip()
+    if not raw:
+        return None
+    cmap = (conv.get("data") or {}).get("_choice_map") or {}
+    if raw in cmap:
+        return cmap[raw]
+    nk = _norm_choice_key(raw)
+    if nk in cmap:
+        return cmap[nk]
+    for k, v in cmap.items():
+        if len(k) >= 3 and (nk == k or nk.startswith(k) or k.startswith(nk)):
+            return v
+    m = re.match(r"^(\d+)", raw)
+    if m and m.group(1) in cmap:
+        return cmap[m.group(1)]
+    return None
+
+
+def _poll_body_with_progress(conv, body):
+    body = (body or "").strip()
+    pre = tunnel_progress_prefix(conv) if conv else ""
+    if pre:
+        fl = body.split("\n", 1)[0]
+        if not _first_line_looks_like_tunnel_progress_bar(fl):
+            body = pre + body
+    return body
+
+
+def send_wati_buttons(phone, body, button_texts, footer=None):
+    if not WATI_API_TOKEN or not WATI_BASE_URL:
+        return False
+    wa = _norm_wa_number(phone)
+    if not wa:
+        return False
+    payload = {
+        "body": (body or "")[:1024],
+        "buttons": [{"text": (t or "")[:20]} for t in button_texts[:3] if (t or "").strip()],
+    }
+    if footer:
+        payload["footer"] = footer[:60]
+    if not payload["buttons"]:
+        return False
+    url = f"{WATI_BASE_URL}/api/v1/sendInteractiveButtonsMessage"
+    headers = {"Authorization": f"Bearer {WATI_API_TOKEN}", "accept": "application/json"}
+    try:
+        r = requests.post(
+            url, headers=headers, params={"whatsappNumber": wa}, json=payload, timeout=30
+        )
+        print(f"Wati buttons {r.status_code}")
+        return 200 <= r.status_code < 300
+    except Exception as e:
+        print(f"Wati buttons error: {e}")
+        return False
+
+
+def send_wati_list(phone, body, button_text, rows, footer=None, header=None, section_title=None):
+    if not WATI_API_TOKEN or not WATI_BASE_URL:
+        return False
+    wa = _norm_wa_number(phone)
+    if not wa:
+        return False
+    section_rows = []
+    for row in rows[:10]:
+        title = (row.get("title") or "")[:24]
+        if not title:
+            continue
+        ent = {"title": title}
+        desc = (row.get("description") or "").strip()
+        if desc:
+            ent["description"] = desc[:72]
+        section_rows.append(ent)
+    if not section_rows:
+        return False
+    payload = {
+        "body": (body or "")[:1024],
+        "buttonText": (button_text or "Choisir")[:20],
+        "sections": [
+            {
+                "title": ((section_title or "Options")[:24]),
+                "rows": section_rows,
+            }
+        ],
+    }
+    if header:
+        payload["header"] = header[:60]
+    if footer:
+        payload["footer"] = footer[:60]
+    url = f"{WATI_BASE_URL}/api/v1/sendInteractiveListMessage"
+    headers = {"Authorization": f"Bearer {WATI_API_TOKEN}", "accept": "application/json"}
+    try:
+        r = requests.post(
+            url, headers=headers, params={"whatsappNumber": wa}, json=payload, timeout=30
+        )
+        print(f"Wati list {r.status_code}")
+        return 200 <= r.status_code < 300
+    except Exception as e:
+        print(f"Wati list error: {e}")
+        return False
+
+
+def send_tunnel_poll(phone, conv, body, options, footer=None, list_button_text=None, header=None):
+    """
+    Mode sondage : boutons (1–3 choix) ou liste WATI (4–10).
+    options: [{"id":"1", "label":"…", "button":"…", "list_title":"…", "desc":"…"}]
+    """
+    conv = conv or conversations.get(phone) or {"data": {}}
+    lang = (conv.get("data") or {}).get("lang", "fr")
+    body = _poll_body_with_progress(conv, body)
+    register_choice_map(conv, options)
+    if WATI_USE_INTERACTIVE and WATI_API_TOKEN and WATI_BASE_URL:
+        if 1 <= len(options) <= 3:
+            btns = [(o.get("button") or o.get("label") or str(o["id"]))[:20] for o in options]
+            if send_wati_buttons(phone, body, btns, footer=footer):
+                return True
+        if 4 <= len(options) <= 10:
+            rows = [
+                {
+                    "title": (o.get("list_title") or o.get("label") or str(o["id"]))[:24],
+                    "description": (o.get("desc") or "")[:72],
+                }
+                for o in options
+            ]
+            lbtn = (list_button_text or ("Choisir" if lang == "fr" else "Choose"))[:20]
+            if send_wati_list(phone, body, lbtn, rows, footer=footer, header=header):
+                return True
+    lines = "\n".join(f"{o['id']}️⃣  {o['label']}" for o in options)
+    hint = (
+        "\n\n👆 *Appuyez sur un bouton ou ouvrez la liste.*"
+        if lang == "fr"
+        else "\n\n👆 *Tap a button or open the list below.*"
+    )
+    send(phone, f"{body}\n\n{lines}{hint}")
+    return True
+
+
 def site_mandat_links_footer(lang="fr"):
-    """Liens courts hors tunnel — pas de long paragraphe ; les URL parlent d’elles-mêmes."""
+    """Liens courts hors tunnel — site et suivi (sans mandat / dépôt express en liste)."""
     site = RDA_DOMAIN.rstrip("/")
     if lang == "en":
-        return f"\n\n👉 *Our website:* {site}\n*Mandate:* {MANDAT_URL}\n*Express claim:* {DEPOT_URL}\n*Track:* {SUIVI_URL}"
-    return f"\n\n👉 *Notre site Internet :* {site}\n*Mandat :* {MANDAT_URL}\n*Dépôt express :* {DEPOT_URL}\n*Suivi dossier :* {SUIVI_URL}"
+        return f"\n\n👉 *Our website:* {site}\n*Track:* {SUIVI_URL}"
+    return f"\n\n👉 *Notre site Internet :* {site}\n*Suivi dossier :* {SUIVI_URL}"
 
 
 # ===== RELANCES POST-DÉPÔT (mandat + pièces) =====
@@ -1943,38 +2141,47 @@ def _privacy_short_notice(lang):
     )
 
 
-def q_passengers(phone, lang):
+def q_passengers(phone, lang, conv=None):
     """Étape 1 — Accueil + choix passagers (1–5 dossier auto, 6 = rappel expert 6+)."""
-    lines_fr = []
-    lines_en = []
+    conv = conv or conversations.get(phone) or {"data": {"lang": lang}}
+    options = []
     for n in range(1, 6):
         _, net, _, _ = calc_amounts(n)
         ns = fmt_money_space(net)
-        if n == 1:
-            lines_fr.append(f"1️⃣  1 personne  → *{ns} € net*")
-            lines_en.append(f"1️⃣  1 person  → *{ns} € net*")
+        if lang == "en":
+            lab = f"{n} person{'s' if n > 1 else ''} · {ns} € net"
         else:
-            lines_fr.append(f"{n}️⃣  {n} personnes → *{ns} € net*")
-            lines_en.append(f"{n}️⃣  {n} people → *{ns} € net*")
-    lines_fr.append("6️⃣  6 ou plus   →  un expert vous rappelle 📞")
-    lines_en.append("6️⃣  6 or more   →  an expert will call you 📞")
-    bloc_fr = "\n".join(lines_fr)
-    bloc_en = "\n".join(lines_en)
-
+            lab = f"{n} pers. · {ns} € net" if n > 1 else f"1 pers. · {ns} € net"
+        options.append(
+            {
+                "id": str(n),
+                "label": lab,
+                "list_title": f"{n} · {ns}€",
+                "desc": f"{n} passager{'s' if n > 1 else ''}" if lang == "fr" else f"{n} passenger{'s' if n > 1 else ''}",
+            }
+        )
+    options.append(
+        {
+            "id": "6",
+            "label": "6+ · expert vous rappelle" if lang == "fr" else "6+ · expert calls you",
+            "list_title": "6+ · expert 📞",
+            "desc": "Climbie" if lang == "fr" else "Expert callback",
+        }
+    )
     if lang == "en":
-        msg = (
+        body = (
             "👋 Welcome to *Robin des Airs* 🏹\n\n"
             "Don't leave money with the airline.\n\n"
             "A delayed or cancelled flight may entitle you to\n"
             "*up to €600 legal compensation per person.*\n\n"
             "⚖️ *Zero upfront fees.* We take *25%*\n"
             "only when you receive your money.\n\n"
-            "👥 *How many people are you claiming for?*\n\n"
-            + bloc_en
-            + "\n\nReply *1* to *6* 👇"
+            "⏱️ *Open your claim file in about 5 minutes* — a few short questions here.\n\n"
+            "👥 *How many people are you claiming for?*"
         )
+        lbtn = "Choose"
     else:
-        msg = (
+        body = (
             "👋 Bienvenue chez *Robin des Airs* 🏹\n\n"
             "Ne laissez pas votre argent\n"
             "à la compagnie aérienne.\n\n"
@@ -1982,11 +2189,11 @@ def q_passengers(phone, lang):
             "droit à *600 € d'indemnité légale.*\n\n"
             "⚖️ *Zéro frais.* On prend 25%\n"
             "uniquement si vous recevez votre argent.\n\n"
-            "👥 *Pour combien réclamez-vous ?*\n\n"
-            + bloc_fr
-            + "\n\nRépondez *1 à 6* 👇"
+            "⏱️ *Votre dossier s’ouvre en environ 5 minutes* — quelques questions courtes ici.\n\n"
+            "👥 *Pour combien réclamez-vous ?*"
         )
-    send(phone, msg)
+        lbtn = "Choisir"
+    send_tunnel_poll(phone, conv, body, options, list_button_text=lbtn)
 
 def user_wants_fresh_start(text):
     """Recommencer le dossier depuis le début (hors étape terminée)."""
@@ -2038,27 +2245,31 @@ def amount_potential_box(pax):
     return brut, net, box
 
 
-def q_boarding_after_pax(phone, lang, pax):
-    """Message 3 : preuves carte / billet (texte court uniquement). pax conservé pour compatibilité d'appel."""
+def q_boarding_after_pax(phone, lang, conv, pax=None):
+    """Message 3 : preuves carte / billet — sondage photo / saisie manuelle."""
     if lang == "en":
-        msg = (
+        body = (
             "*📸 PROOF — Boarding pass / booking confirmation*\n\n"
             "👍 We'll save you time.\n\n"
-            "Send a *photo* of your boarding pass or e-ticket now *(flat, no glare)*.\n\n"
-            "*The upside:* our system reads the details and fills in your file for you — it's the fastest step!\n\n"
-            "⌨️ *No photo handy?* Type *2* or *B* to enter the details *manually*."
+            "*The upside:* our system reads a sharp photo and fills in your file — it's the fastest step!\n\n"
+            "*How would you like to continue?*"
         )
+        options = [
+            {"id": "1", "label": "Send a boarding pass photo", "button": "📸 Photo"},
+            {"id": "2", "label": "Enter details manually", "button": "⌨️ Manual"},
+        ]
     else:
-        msg = (
-            "*📸 PREUVES — Carte d'embarquement / confirmation de réservation*\n\n"
+        body = (
+            "*📸 PREUVES — Carte d'embarquement / confirmation*\n\n"
             "👍 On va vous faire gagner du temps.\n\n"
-            "Envoyez maintenant une *photo* de votre carte d'embarquement ou de votre billet "
-            "*(bien à plat, sans reflets)*.\n\n"
-            "*L'avantage* : notre système lit les informations et remplit le dossier pour vous — "
-            "c'est l'étape la plus rapide !\n\n"
-            "⌨️ *Pas de photo sous la main ?* Tapez *2* ou *B* pour remplir les informations *manuellement*."
+            "*L'avantage* : une photo nette permet de remplir le dossier automatiquement — c'est le plus rapide !\n\n"
+            "*Comment souhaitez-vous continuer ?*"
         )
-    send(phone, msg)
+        options = [
+            {"id": "1", "label": "Envoyer une photo de carte", "button": "📸 Photo"},
+            {"id": "2", "label": "Saisir les infos à la main", "button": "⌨️ Manuel"},
+        ]
+    send_tunnel_poll(phone, conv, body, options)
 
 
 def q_boarding_next_passenger(phone, lang, pax_index, total_pax):
@@ -2086,43 +2297,45 @@ def q_boarding_next_passenger(phone, lang, pax_index, total_pax):
     send(phone, msg)
 
 
-def q_passenger_name_post_add_confirm(phone, lang, recorded_name):
+def q_passenger_name_post_add_confirm(phone, lang, conv, recorded_name):
     """Après chaque nom saisi : confirmer ou corriger avant le passager suivant."""
     if lang == "en":
-        msg = (
-            f"✅ *{recorded_name}* saved.\n\n"
-            "1️⃣ *Correct* — continue\n"
-            "2️⃣ *Fix* — re-enter this name"
-        )
+        body = f"✅ *{recorded_name}* saved."
+        options = [
+            {"id": "1", "label": "Correct — continue", "button": "✅ Correct"},
+            {"id": "2", "label": "Fix this name", "button": "✏️ Fix"},
+        ]
     else:
-        msg = (
-            f"✅ *{recorded_name}* enregistré.\n\n"
-            "1️⃣ *C'est correct* — continuer\n"
-            "2️⃣ *Corriger* — resaisir ce nom"
-        )
-    send(phone, msg)
+        body = f"✅ *{recorded_name}* enregistré."
+        options = [
+            {"id": "1", "label": "C'est correct", "button": "✅ Correct"},
+            {"id": "2", "label": "Corriger ce nom", "button": "✏️ Corriger"},
+        ]
+    send_tunnel_poll(phone, conv, body, options)
 
 
 def q_pax_ack_route(phone, lang, conv):
     """Juste après le nombre de passagers : direct vs correspondance."""
     pax = (conv.get("data") or {}).get("passengers") or 1
     if lang == "en":
-        msg = (
+        body = (
             f"✅ *{pax} passenger{'s' if pax > 1 else ''} registered.*\n\n"
-            "✈️ For this trip: was it a *direct flight*, or did it include a *connection / stopover*?\n\n"
-            "1️⃣ *Direct* *(no connection)*\n"
-            "2️⃣ *With connection* / stopover\n\n"
-            "_(Reply *1* or *2*.)_"
+            "✈️ For this trip: *direct flight* or *with a connection*?"
         )
+        options = [
+            {"id": "1", "label": "Direct flight", "button": "✈️ Direct"},
+            {"id": "2", "label": "With connection", "button": "🔄 Connection"},
+        ]
     else:
-        msg = (
+        body = (
             f"✅ *{pax} passager{'s' if pax > 1 else ''} enregistré{'s' if pax > 1 else ''}.*\n\n"
-            "✈️ Sur ce trajet : vol *direct*, ou *avec correspondance / escale* ?\n\n"
-            "1️⃣ Vol *direct* *(sans correspondance)*\n"
-            "2️⃣ *Avec correspondance* / escale\n\n"
-            "_(Répondez *1* ou *2*.)_"
+            "✈️ Sur ce trajet : vol *direct* ou *avec correspondance* ?"
         )
-    send(phone, msg)
+        options = [
+            {"id": "1", "label": "Vol direct", "button": "✈️ Direct"},
+            {"id": "2", "label": "Avec correspondance", "button": "🔄 Escale"},
+        ]
+    send_tunnel_poll(phone, conv, body, options)
 
 
 def q_pax_contact_lang(phone, lang, conv):
@@ -2131,28 +2344,29 @@ def q_pax_contact_lang(phone, lang, conv):
     pax = d.get("passengers") or 1
     _, net, _, _ = calc_amounts(pax)
     net_s = fmt_money_space(net)
-    rows = []
+    options = []
     for i, (_c, fl, lab_fr, lab_en) in enumerate(EXPERT_LANG_OPTIONS, start=1):
         lab = lab_fr if lang == "fr" else lab_en
-        rows.append(f"{i}️⃣  {fl} {lab}")
-    blo = "\n".join(rows)
+        options.append(
+            {
+                "id": str(i),
+                "label": f"{fl} {lab}",
+                "list_title": f"{fl} {lab}"[:24],
+            }
+        )
     if lang == "en":
-        msg = (
-            f"✅ *Got it* — we’ll push for *up to {net_s} € net* for your group (legal EU261 caps depend on distance & case). 🚀\n\n"
-            "At Robin des Airs we speak your language. For voice notes and follow-up, which language should our experts use when they contact you?\n\n"
-            f"{blo}\n\n"
-            "_(Reply *1* to *7*.)_"
+        body = (
+            f"✅ *Got it* — we'll push for *up to {net_s} € net* for your group. 🚀\n\n"
+            "Which language should our experts use for voice notes and follow-up?"
         )
+        lbtn = "Language"
     else:
-        msg = (
-            f"✅ *C'est noté* — nous vous aidons à *viser jusqu'à {net_s} € net* pour votre groupe "
-            f"(plafonds légaux UE 261 selon distance & situation). 🚀\n\n"
-            "Chez *Robin des Airs*, nous parlons votre langue. Pour faciliter nos échanges *(vocal, suivi du dossier)*, "
-            "dans quelle langue préférez-vous que nos experts vous contactent ?\n\n"
-            f"{blo}\n\n"
-            "_(Répondez *1* à *7*.)_"
+        body = (
+            f"✅ *C'est noté* — nous visons jusqu'à *{net_s} € net* pour votre groupe. 🚀\n\n"
+            "Dans quelle langue nos experts doivent-ils vous contacter *(vocal, suivi)* ?"
         )
-    send(phone, msg)
+        lbtn = "Langue"
+    send_tunnel_poll(phone, conv, body, options, list_button_text=lbtn)
 
 
 def q_pax_voice_confirm(phone, lang, conv):
@@ -2161,54 +2375,65 @@ def q_pax_voice_confirm(phone, lang, conv):
     code = d.get("expert_phone_lang") or "fr"
     label = _expert_lang_display(code, lang)
     if lang == "en":
-        msg = (
-            f"Perfect! ✅ If we need a short *voice note* to move your file forward, we’ll do it in *{label}*.\n\n"
-            "👉 Reply *OK* or *1* to continue."
+        body = (
+            f"Perfect! ✅ Voice notes, if needed, will be in *{label}*.\n\n"
+            "Ready to continue?"
         )
+        options = [{"id": "1", "label": "Continue", "button": "✅ Continue"}]
     else:
-        msg = (
-            f"Parfait ! ✅ Si nous devons vous laisser un *message vocal* pour faire avancer le dossier, "
-            f"nous le ferons en *{label}*.\n\n"
-            "👉 Tapez *OK* ou *1* pour continuer."
+        body = (
+            f"Parfait ! ✅ Les vocaux, si besoin, seront en *{label}*.\n\n"
+            "On continue ?"
         )
-    send(phone, msg)
+        options = [{"id": "1", "label": "Continuer", "button": "✅ Continuer"}]
+    send_tunnel_poll(phone, conv, body, options)
 
 
-def q_incident(phone, lang, pax):
-    """Choix du type d’incident (après langue / confirmation vocale). pax conservé pour compatibilité d’appel."""
+def q_incident(phone, lang, conv, pax=None):
+    """Choix du type d’incident (après langue / confirmation vocale)."""
     if lang == "en":
-        msg = (
-            "⚖️ *What happened on this flight?*\n\n"
-            "1️⃣ Delay *(+3 h at arrival)*\n"
-            "2️⃣ Flight cancelled\n"
-            "3️⃣ Denied boarding *(overbooking)*\n\n"
-            "_(Reply *1*, *2* or *3*.)_"
-        )
+        body = "⚖️ *What happened on this flight?*"
+        options = [
+            {"id": "1", "label": "Delay (+3 h at arrival)", "button": "⏱ Delay"},
+            {"id": "2", "label": "Flight cancelled", "button": "❌ Cancelled"},
+            {"id": "3", "label": "Denied boarding", "button": "🚫 Denied"},
+        ]
     else:
-        msg = (
-            "⚖️ *Que s'est-il passé sur ce vol ?*\n\n"
-            "1️⃣ Retard *(+3 h à l'arrivée)*\n"
-            "2️⃣ Vol annulé\n"
-            "3️⃣ Refus d'embarquement *(surréservation)*\n\n"
-            "_(Répondez *1*, *2* ou *3*.)_"
-        )
-    send(phone, msg)
+        body = "⚖️ *Que s'est-il passé sur ce vol ?*"
+        options = [
+            {"id": "1", "label": "Retard (+3 h à l'arrivée)", "button": "⏱ Retard"},
+            {"id": "2", "label": "Vol annulé", "button": "❌ Annulé"},
+            {"id": "3", "label": "Refus d'embarquement", "button": "🚫 Refus"},
+        ]
+    send_tunnel_poll(phone, conv, body, options)
 
-def q_airline(phone, lang):
-    lines = [f"{k}️⃣  {v}" for k, v in AIRLINES_MAP.items()]
-    lines.append("9️⃣  Autre — tapez le nom")
-    bloc = "\n".join(lines)
+def q_airline(phone, lang, conv=None):
+    conv = conv or conversations.get(phone) or {"data": {"lang": lang}}
+    options = []
+    for k, v in AIRLINES_MAP.items():
+        short = v[:22] if len(v) > 22 else v
+        options.append(
+            {
+                "id": k,
+                "label": v,
+                "list_title": short,
+            }
+        )
+    options.append(
+        {
+            "id": "9",
+            "label": "Autre compagnie" if lang == "fr" else "Other airline",
+            "list_title": "Autre ✏️" if lang == "fr" else "Other ✏️",
+            "desc": "Tapez le nom" if lang == "fr" else "Type the name",
+        }
+    )
     if lang == "en":
-        msg = (
-            "🛫 *Which airline?*\n\n"
-            f"{bloc}\n\nReply *1–9*, type the name, or send a boarding-pass photo if you still need to."
-        )
+        body = "🛫 *Which airline?*\n\n_Open the list — or type the name / send a boarding pass photo._"
+        lbtn = "Airlines"
     else:
-        msg = (
-            "🛫 *Quelle compagnie aérienne ?*\n\n"
-            f"{bloc}\n\nRépondez *1 à 9*, tapez le nom, ou envoyez une photo de carte si besoin."
-        )
-    send(phone, msg)
+        body = "🛫 *Quelle compagnie aérienne ?*\n\n_Ouvrez la liste — ou tapez le nom / envoyez une photo de carte._"
+        lbtn = "Compagnies"
+    send_tunnel_poll(phone, conv, body, options, list_button_text=lbtn)
 
 def q_pnr(phone, lang, airline):
     if lang == "en":
@@ -2274,7 +2499,7 @@ def advance_after_incident(phone, lang, conv):
         next_after_airline_pick(phone, lang, conv)
     else:
         conv["step"] = "airline"
-        q_airline(phone, lang)
+        q_airline(phone, lang, conv)
 
 
 def q_flight_number(phone, lang):
@@ -2480,52 +2705,44 @@ def q_itinerary_route_kind(phone, lang, conv):
     """Avant départ/arrivée manuels : type de parcours (direct / escale / aller-retour sur même doc)."""
     fn, fd = _flight_brief_for_prompt(conv)
     if lang == "en":
-        msg = (
-            "🛤️ *What kind of trip is this for the claim?*\n\n"
-            "We already have from your ticket: "
-            f"✈️ *{fn}* · *{fd}* — that’s the **flight line**.\n"
-            "We still need the **full route** (airports) for the leg affected by delay / cancellation / denied boarding.\n\n"
-            "1️⃣ *Direct flight* — one segment (I’ll ask departure then arrival).\n"
-            "2️⃣ *Connecting flight* — send the **boarding pass of the affected segment**, "
-            "or type the full route (e.g. *BRU → CDG → ABJ*).\n"
-            "3️⃣ *Round trip on one booking* — outbound + return on the same document — "
-            "I’ll ask which leg was disrupted, then the route or boarding pass **for that leg only**.\n\n"
-            "_Reply *1*, *2* or *3*._"
+        body = (
+            "🛤️ *How was your trip routed?*\n\n"
+            f"We have *{fn}* · *{fd}* (flight + date). We still need the *airports* for the segment you claim."
         )
+        options = [
+            {"id": "1", "label": "Non-stop", "button": "✈️ Direct"},
+            {"id": "2", "label": "With connection", "button": "🔄 Connection"},
+            {"id": "3", "label": "Round trip", "button": "🔁 Round trip"},
+        ]
     else:
-        msg = (
-            "🛤️ *Quel type de parcours pour ce dossier ?*\n\n"
-            "D’après votre billet nous avons déjà : "
-            f"✈️ *{fn}* · *{fd}* — c’est la **ligne du vol** (numéro + date).\n"
-            "Il nous manque encore le **trajet complet** (aéroports) du **vol concerné** par le retard, l’annulation ou le refus d’embarquement.\n\n"
-            "1️⃣ *Vol direct* — un seul segment (je demande départ puis arrivée).\n"
-            "2️⃣ *Vol avec escale / correspondance* — envoyez la **carte d’embarquement du tronçon touché**, "
-            "ou tapez le trajet complet (ex. *BRU → CDG → ABJ*).\n"
-            "3️⃣ *Aller-retour sur la même réservation* — plusieurs vols sur le même document — "
-            "je vous demande **quel sens** a été impacté, puis la route ou la **carte uniquement pour ce vol-là**.\n\n"
-            "_Répondez *1*, *2* ou *3*._"
+        body = (
+            "🛤️ *Comment était le trajet ?*\n\n"
+            f"Nous avons *{fn}* · *{fd}* (vol + date). Il nous manque les *aéroports* du segment à indemniser."
         )
-    send(phone, msg)
+        options = [
+            {"id": "1", "label": "Vol direct", "button": "✈️ Direct"},
+            {"id": "2", "label": "Avec escale", "button": "🔄 Escale"},
+            {"id": "3", "label": "Aller-retour", "button": "🔁 A/R"},
+        ]
+    send_tunnel_poll(phone, conv, body, options)
 
 
 def q_itinerary_rt_pick(phone, lang, conv):
     if lang == "en":
-        msg = (
-            "🔁 *Which leg was affected?*\n\n"
-            "1️⃣ *Outbound* (first direction)\n"
-            "2️⃣ *Return* (second direction)\n"
-            "3️⃣ *Both directions* (same incident on both)\n\n"
-            "_Reply *1*, *2* or *3*._"
-        )
+        body = "🔁 *Which leg was affected?*"
+        options = [
+            {"id": "1", "label": "Outbound", "button": "→ Outbound"},
+            {"id": "2", "label": "Return", "button": "← Return"},
+            {"id": "3", "label": "Both directions", "button": "↔ Both"},
+        ]
     else:
-        msg = (
-            "🔁 *Quel sens du voyage est concerné par l’incident ?*\n\n"
-            "1️⃣ *Vol aller* (premier sens)\n"
-            "2️⃣ *Vol retour* (deuxième sens)\n"
-            "3️⃣ *Les deux sens* (même incident sur l’aller et le retour — cas rare)\n\n"
-            "_Répondez *1*, *2* ou *3*._"
-        )
-    send(phone, msg)
+        body = "🔁 *Quel sens du voyage est concerné ?*"
+        options = [
+            {"id": "1", "label": "Vol aller", "button": "→ Aller"},
+            {"id": "2", "label": "Vol retour", "button": "← Retour"},
+            {"id": "3", "label": "Les deux sens", "button": "↔ Les deux"},
+        ]
+    send_tunnel_poll(phone, conv, body, options)
 
 
 def q_itinerary_freeline(phone, lang, conv):
@@ -2681,37 +2898,31 @@ def q_passenger_names_confirm(phone, lang, conv):
     partial = n_done < pax
     if lang == "en":
         if partial:
-            msg = (
-                f"👥 *Check passengers 1–{n_done}* (of {pax})\n\n"
-                f"{lines}\n\n"
-                f"1️⃣  *OK* — enter passenger *{n_done + 1}*\n"
-                f"2️⃣  *Fix* — re-enter passenger *{n_done}*"
-            )
+            body = f"👥 *Check passengers 1–{n_done}* (of {pax})\n\n{lines}"
+            options = [
+                {"id": "1", "label": f"OK — passenger {n_done + 1}", "button": "✅ Continue"},
+                {"id": "2", "label": f"Fix passenger {n_done}", "button": "✏️ Fix"},
+            ]
         else:
-            msg = (
-                f"👥 *All {pax} passenger(s) — confirm*\n\n"
-                f"{lines}\n\n"
-                "1️⃣  *All correct* — continue\n"
-                "2️⃣  *Fix last name* — re-enter the last passenger\n\n"
-                "_Next: minors vs adults for these names._"
-            )
+            body = f"👥 *All {pax} passenger(s) — confirm*\n\n{lines}"
+            options = [
+                {"id": "1", "label": "All correct", "button": "✅ Continue"},
+                {"id": "2", "label": "Fix last name", "button": "✏️ Fix"},
+            ]
     else:
         if partial:
-            msg = (
-                f"👥 *Vérifiez les passagers 1 à {n_done}* (sur {pax})\n\n"
-                f"{lines}\n\n"
-                f"1️⃣  *C'est bon* — saisie du passager *{n_done + 1}*\n"
-                f"2️⃣  *Corriger* — resaisir le passager *{n_done}*"
-            )
+            body = f"👥 *Vérifiez les passagers 1 à {n_done}* (sur {pax})\n\n{lines}"
+            options = [
+                {"id": "1", "label": f"OK — passager {n_done + 1}", "button": "✅ Continuer"},
+                {"id": "2", "label": f"Corriger passager {n_done}", "button": "✏️ Corriger"},
+            ]
         else:
-            msg = (
-                f"👥 *Les {pax} passagers — confirmez*\n\n"
-                f"{lines}\n\n"
-                "1️⃣  *Tout est correct* — on continue\n"
-                "2️⃣  *Corriger le dernier nom* — resaisir le dernier passager\n\n"
-                "_Ensuite : mineurs / majeurs pour ces noms._"
-            )
-    send(phone, msg)
+            body = f"👥 *Les {pax} passagers — confirmez*\n\n{lines}"
+            options = [
+                {"id": "1", "label": "Tout est correct", "button": "✅ Continuer"},
+                {"id": "2", "label": "Corriger le dernier", "button": "✏️ Corriger"},
+            ]
+    send_tunnel_poll(phone, conv, body, options)
 
 
 def goto_passenger_names_confirm(phone, conv, lang):
@@ -2725,26 +2936,28 @@ def q_minors(phone, lang, conv):
     names = d.get("passenger_names") or []
     names_lines = "\n".join(f"• *{n}*" for n in names) if names else "• …"
     if lang == "en":
-        msg = (
+        body = (
             "👶 *Important legal question*\n\n"
             "Among the passengers listed below, are any minors (under 18)?\n\n"
             f"{names_lines}\n\n"
-            "⚖️ This is a legal requirement so we can prepare the correct signing mandate "
-            "(a parent will sign for the child).\n\n"
-            "1️⃣ No — they are all adults.\n"
-            "2️⃣ Yes — at least one minor."
+            "⚖️ Required to prepare the correct signing mandate."
         )
+        options = [
+            {"id": "1", "label": "No — all adults", "button": "✅ All adults"},
+            {"id": "2", "label": "Yes — at least one minor", "button": "👶 Minor(s)"},
+        ]
     else:
-        msg = (
+        body = (
             "👶 *Question juridique importante*\n\n"
             "Parmi les passagers suivants, y a-t-il des mineurs (moins de 18 ans) ?\n\n"
             f"{names_lines}\n\n"
-            "⚖️ C'est une obligation légale pour que nous puissions préparer le bon mandat de signature "
-            "(un parent signera pour l'enfant).\n\n"
-            "1️⃣ Non — ils sont tous majeurs.\n"
-            "2️⃣ Oui — au moins un mineur."
+            "⚖️ Obligation légale pour préparer le bon mandat de signature."
         )
-    send(phone, msg)
+        options = [
+            {"id": "1", "label": "Non — tous majeurs", "button": "✅ Tous majeurs"},
+            {"id": "2", "label": "Oui — au moins un mineur", "button": "👶 Mineur(s)"},
+        ]
+    send_tunnel_poll(phone, conv, body, options)
 
 def show_summary(phone, conv):
     """
@@ -3514,33 +3727,36 @@ def _carte_recap_lines(d, lang, extra_lines=None):
     return bits
 
 
-def _carte_confirm_yes_no_suffix(lang):
+def _carte_confirm_poll_options(lang):
     if lang == "en":
-        return (
-            "\n\n*Everything correct?*\n"
-            "✅ *1* — Yes, continue.\n"
-            "✏️ *2* — I need to fix something."
-        )
-    return (
-        "\n\n*Tout est correct ?*\n"
-        "✅ *1* — Oui, c'est bon, on continue.\n"
-        "✏️ *2* — Non, je dois corriger une information."
-    )
+        return [
+            {"id": "1", "label": "Yes, continue", "button": "✅ Continue"},
+            {"id": "2", "label": "Fix something", "button": "✏️ Fix"},
+        ]
+    return [
+        {"id": "1", "label": "Oui, continuer", "button": "✅ Continuer"},
+        {"id": "2", "label": "Corriger", "button": "✏️ Corriger"},
+    ]
 
 
 def _carte_modify_later_hint(lang):
     """Rappel court sous le récap carte (correction immédiate)."""
     if lang == "en":
-        return "\n\nℹ️ _If something is wrong, reply *2*._"
-    return "\n\nℹ️ _Si une information est incorrecte : répondez *2*._"
+        return "\n\nℹ️ _If something is wrong, tap *Fix* below._"
+    return "\n\nℹ️ _Si une information est incorrecte : touchez *Corriger* ci-dessous._"
 
 
 def _carte_confirm_yes(text, choice, lang):
     u = (text or "").strip()
     low = u.lower()
+    if choice == "1":
+        return True
     if re.match(r"^\s*1(?:\uFE0F\u20E3)?\s*$", u):
         return True
     if re.match(r"^\s*1[\.\)\:]", u):
+        return True
+    nk = _norm_choice_key(u)
+    if nk in ("continuer", "continue", "oui", "yes", "ok", "correct"):
         return True
     if lang == "fr":
         return bool(re.match(r"^(oui|ok|exact|correct|dac|d'accord)\b", low))
@@ -3550,9 +3766,14 @@ def _carte_confirm_yes(text, choice, lang):
 def _carte_confirm_no(text, choice, lang):
     u = (text or "").strip()
     low = u.lower()
+    if choice == "2":
+        return True
     if re.match(r"^\s*2(?:\uFE0F\u20E3)?\s*$", u):
         return True
     if re.match(r"^\s*2[\.\)\:]", u):
+        return True
+    nk = _norm_choice_key(u)
+    if nk in ("corriger", "fix", "modifier", "edit"):
         return True
     if lang == "fr":
         return bool(re.match(r"^(non|nn|nope|erreur|faux|corriger)\b", low))
@@ -3576,7 +3797,7 @@ def finalize_boarding_pass_navigation(phone, conv, lang):
             q_pnr(phone, lang, d["airline"])
     else:
         conv["step"] = "airline"
-        q_airline(phone, lang)
+        q_airline(phone, lang, conv)
 
 
 def q_carte_pick_field(phone, conv, lang):
@@ -3728,12 +3949,17 @@ def _apply_carte_field_edit(d, key, text, lang):
 
 
 def send_carte_confirm_panel(phone, conv, lang):
-    """Rappel des infos + question 1/2 (après correction ou relance)."""
+    """Rappel des infos + sondage Oui / Corriger."""
     d = conv["data"]
     bits = _carte_recap_lines(d, lang)
     head = "📋 *Voici ce qu'on retient :*" if lang == "fr" else "📋 *Here's what we have:*"
-    body = "\n".join(bits) if bits else ("_(rien de détecté pour l'instant — vous pouvez corriger ou renvoyer une photo)_" if lang == "fr" else "_(nothing detected yet — fix a field or send another photo)_")
-    send(phone, f"{head}\n{body}{_carte_modify_later_hint(lang)}{_carte_confirm_yes_no_suffix(lang)}")
+    recap = "\n".join(bits) if bits else (
+        "_(rien de détecté — corrigez ou renvoyez une photo)_"
+        if lang == "fr"
+        else "_(nothing detected — fix a field or send another photo)_"
+    )
+    body = f"{head}\n{recap}{_carte_modify_later_hint(lang)}\n\n*{'Tout est correct ?' if lang == 'fr' else 'Everything correct?'}*"
+    send_tunnel_poll(phone, conv, body, _carte_confirm_poll_options(lang))
 
 
 def send_boarding_read_failed_escapes(phone, lang, recap_followup=False, variant="blur"):
@@ -3871,9 +4097,11 @@ def apply_boarding_pass_image(phone, conv, image_b64, lang, after_passengers=Fal
             if lang == "fr"
             else "\n\nHere's what we detected — *please check before continuing*:"
         )
-        sfx = _carte_confirm_yes_no_suffix(lang)
         hint = _carte_modify_later_hint(lang)
-        send(phone, f"{head}{intro}\n\n{body}{hint}{sfx}" if body else f"{head}{intro}{hint}{sfx}")
+        poll_body = f"{head}{intro}\n\n{body}{hint}\n\n*{'Tout est correct ?' if lang == 'fr' else 'Everything correct?'}*"
+        if not body:
+            poll_body = f"{head}{intro}{hint}\n\n*{'Tout est correct ?' if lang == 'fr' else 'Everything correct?'}*"
+        send_tunnel_poll(phone, conv, poll_body, _carte_confirm_poll_options(lang))
         conv["step"] = "carte_confirm"
         at_save(phone, conv)
         return True
@@ -3995,7 +4223,7 @@ def handle_reply(phone, text, conv, image_b64=None):
             if lang == "fr"
             else "🔄 *OK — starting fresh.* Pick the number of passengers again.",
         )
-        q_passengers(phone, lang)
+        q_passengers(phone, lang, conv)
         return True
 
     if t and user_wants_expertise_rappel(t) and step and step != "completed":
@@ -4005,13 +4233,13 @@ def handle_reply(phone, text, conv, image_b64=None):
                 (
                     "📞 *Rappel expertise*\n\n"
                     "Pour *6 personnes ou plus*, répondez *6* : *un expert vous rappelle* (*Climbie*).\n\n"
-                    f"📱 {CLIMBIE_TEL}\n👉 {DEPOT_URL}"
+                    f"📱 {CLIMBIE_TEL}"
                 )
                 if lang == "fr"
                 else (
                     "📞 *Expert callback*\n\n"
                     "For *6+ people*, reply *6* — *an expert will call you* (*Climbie*).\n\n"
-                    f"📱 {CLIMBIE_TEL}\n👉 {DEPOT_URL}"
+                    f"📱 {CLIMBIE_TEL}"
                 ),
             )
         else:
@@ -4020,13 +4248,13 @@ def handle_reply(phone, text, conv, image_b64=None):
                 (
                     "📞 *Rappel / expertise*\n\n"
                     "Pour être rappelé ou échanger avec un conseiller :\n"
-                    f"📱 {CLIMBIE_TEL}\n👉 {DEPOT_URL}\n\n"
+                    f"📱 {CLIMBIE_TEL}\n\n"
                     "_Vous pouvez aussi poursuivre votre dossier ici en répondant à la dernière question._"
                 )
                 if lang == "fr"
                 else (
                     "📞 *Callback / expert*\n\n"
-                    f"📱 {CLIMBIE_TEL}\n👉 {DEPOT_URL}\n\n"
+                    f"📱 {CLIMBIE_TEL}\n\n"
                     "_You can also continue your claim here by answering the last question._"
                 ),
             )
@@ -4111,13 +4339,13 @@ def handle_reply(phone, text, conv, image_b64=None):
                 (
                     "🙏 *6 personnes ou plus*\n\n"
                     "*Un expert* vous rappelle pour étudier votre dossier.\n\n"
-                    f"📱 {CLIMBIE_TEL}\n👉 {DEPOT_URL}"
+                    f"📱 {CLIMBIE_TEL}"
                 )
                 if lang == "fr"
                 else (
                     "🙏 *6+ people*\n\n"
                     "*An expert* will call you back to review your case.\n\n"
-                    f"📱 {CLIMBIE_TEL}\n👉 {DEPOT_URL}"
+                    f"📱 {CLIMBIE_TEL}"
                 ),
             )
             return True
@@ -4156,7 +4384,7 @@ def handle_reply(phone, text, conv, image_b64=None):
         ) or choice == "1"
         if ok_voice:
             conv["step"] = "incident_type"
-            q_incident(phone, lang, conv["data"].get("passengers") or 1)
+            q_incident(phone, lang, conv)
             at_save(phone, conv)
             return True
         return False
@@ -4167,7 +4395,7 @@ def handle_reply(phone, text, conv, image_b64=None):
         if choice in mapping:
             conv["data"]["incident_type"] = mapping[choice]
             conv["step"] = "boarding_after_pax"
-            q_boarding_after_pax(phone, lang, conv["data"]["passengers"] or 1)
+            q_boarding_after_pax(phone, lang, conv)
             at_save(phone, conv)
             return True
         return False
@@ -4185,11 +4413,9 @@ def handle_reply(phone, text, conv, image_b64=None):
         if choice == "1":
             send(
                 phone,
-                "👍 *Parfait.* Envoyez la *photo* maintenant : carte à plat, *sans reflets*.\n\n"
-                "_(Tapez *2* ou *B* si vous préférez tout saisir à la main.)_"
+                "👍 *Parfait.* Envoyez la *photo* maintenant : carte à plat, *sans reflets*."
                 if lang == "fr"
-                else "👍 *Great.* Send the *photo* now: pass flat on the table, *no glare*.\n\n"
-                "_(Reply *2* or *B* to type everything manually.)_",
+                else "👍 *Great.* Send the *photo* now: pass flat on the table, *no glare*.",
             )
             return True
         if choice == "2" or re.match(r"^\s*b\s*$", low) or re.match(r"^\s*option\s*b\s*$", low) or low in (
@@ -4231,9 +4457,9 @@ def handle_reply(phone, text, conv, image_b64=None):
         if u.isdigit() and len(u) > 1:
             send(
                 phone,
-                "⚠️ Répondez *1 à 8* pour la liste, *9* pour « autre », ou *tapez le nom* de la compagnie (ex. *EasyJet*)."
+                "⚠️ *Ouvrez la liste* du message précédent, choisissez *Autre*, ou *tapez le nom* de la compagnie (ex. *EasyJet*)."
                 if lang == "fr"
-                else "⚠️ Reply *1–8* from the list, *9* for *other*, or *type the airline name* (e.g. *EasyJet*).",
+                else "⚠️ *Open the list* on the previous message, pick *Other*, or *type the airline name* (e.g. *EasyJet*).",
             )
             return True
         # Nom tapé (lettres : évite interpréter "12" comme compagnie)
@@ -4658,7 +4884,7 @@ def handle_reply(phone, text, conv, image_b64=None):
             goto_passenger_names_confirm(phone, conv, lang)
         else:
             conv["step"] = "passenger_name_post_add"
-            q_passenger_name_post_add_confirm(phone, lang, formatted)
+            q_passenger_name_post_add_confirm(phone, lang, conv, formatted)
         at_save(phone, conv)
         return True
 
@@ -4826,7 +5052,11 @@ def webhook():
 
         touch_last_user_inbound(conv)
 
-        print(f"[MSG] from={phone} step={step} text='{message_text[:50]}'")
+        poll_choice = extract_poll_choice(conv, data, message_text)
+        if poll_choice:
+            message_text = poll_choice
+
+        print(f"[MSG] from={phone} step={step} text='{message_text[:50]}' poll={poll_choice!r}")
 
         # Détection langue
         if message_text:
@@ -4838,10 +5068,10 @@ def webhook():
             handled = handle_reply(phone, message_text, conv, image_b64)
             if not handled:
                 fallback = (
-                    "👆 Répondez avec le numéro proposé (ex : *1*, *2*, *3*…)\n\n"
+                    "👆 *Appuyez sur un bouton* ou *ouvrez la liste* du dernier message.\n\n"
                     "💡 *menu* ou *recommencer* = tout relancer depuis le début."
                     if lang == "fr"
-                    else "👆 Reply with the number shown (e.g. *1*, *2*, *3*…)\n\n"
+                    else "👆 *Tap a button* or *open the list* on the last message.\n\n"
                     "💡 *menu* or *restart* = start over from the beginning."
                 )
                 rep_ai = None
@@ -4859,7 +5089,7 @@ def webhook():
                 conv["data"] = fresh_data(lang)
                 conv["step"] = "passengers"
                 conv["ref"] = make_ref(phone)
-                q_passengers(phone, lang)
+                q_passengers(phone, lang, conv)
                 return jsonify({"status": "flow started"}), 200
             rep = gpt_free_reply(phone, message_text, conv, dossier_done=True)
             fallback_done = (
@@ -4878,18 +5108,18 @@ def webhook():
                 conv["data"] = fresh_data(lang)
                 conv["step"] = "passengers"
                 conv["ref"] = make_ref(phone)
-                q_passengers(phone, lang)
+                q_passengers(phone, lang, conv)
                 return jsonify({"status": "flow started"}), 200
             rep = gpt_free_reply(phone, message_text, conv, dossier_done=False)
             nudge = (
-                "\n\n_💡 *menu* ou chiffre *1–6* = formulaire._"
+                "\n\n_💡 *menu* = ouvrir le formulaire (liste de choix)._"
                 if lang == "fr"
-                else "\n\n_💡 *menu* or number *1–6* = form._"
+                else "\n\n_💡 *menu* = open the form (pick from the list)._"
             )
             fallback_new = (
-                "Bonjour ✈️ Réponse courte ci-dessous ; pour le formulaire WhatsApp : *menu* ou *1* à *6* (passagers)."
+                "Bonjour ✈️ Réponse courte ci-dessous ; pour le formulaire : *menu* puis choisissez dans la liste."
                 if lang == "fr"
-                else "Hi ✈️ Short answer below; for the WhatsApp form: *menu* or *1*–*6* (passengers)."
+                else "Hi ✈️ Short answer below; for the form: *menu* then pick from the list."
             )
             body = ((rep or "").strip() + nudge) if rep else (fallback_new + nudge)
             send(phone, body + site_mandat_links_footer(lang))
@@ -4899,7 +5129,7 @@ def webhook():
         conv["data"] = fresh_data(lang)
         conv["step"] = "passengers"
         conv["ref"] = make_ref(phone)
-        q_passengers(phone, lang)
+        q_passengers(phone, lang, conv)
         return jsonify({"status": "flow started"}), 200
 
     except Exception as e:
