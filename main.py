@@ -751,6 +751,49 @@ STEPS = [
     "summary", "completed",
 ]
 
+# Progression affichée en tête des messages WhatsApp : [k/N] (hors completed / paused).
+TUNNEL_PROGRESS_BUCKETS = (
+    ("passengers",),
+    ("pax_ack_route",),
+    ("pax_contact_lang",),
+    ("pax_voice_confirm",),
+    ("incident_type",),
+    ("boarding_after_pax",),
+    ("airline", "airline_other"),
+    ("pnr_input",),
+    ("flight_number",),
+    ("flight_date", "flight_month", "flight_day"),
+    (
+        "itinerary_kind",
+        "itinerary_rt_pick",
+        "itinerary_freeline",
+        "itinerary_dep",
+        "itinerary_arr",
+    ),
+    ("carte_confirm", "carte_pick_field", "carte_edit_value"),
+    ("passenger_names", "passenger_name_post_add"),
+    ("passenger_names_confirm", "minor_check", "summary"),
+)
+TUNNEL_PROGRESS_TOTAL = len(TUNNEL_PROGRESS_BUCKETS)
+_STEP_TO_TUNNEL_PROGRESS = {}
+for _i, _bucket in enumerate(TUNNEL_PROGRESS_BUCKETS, start=1):
+    for _st in _bucket:
+        _STEP_TO_TUNNEL_PROGRESS[_st] = (_i, TUNNEL_PROGRESS_TOTAL)
+
+
+def tunnel_progress_prefix(conv):
+    if not conv or not isinstance(conv, dict):
+        return ""
+    step = conv.get("step")
+    if not step or step in ("completed", "paused"):
+        return ""
+    info = _STEP_TO_TUNNEL_PROGRESS.get(step)
+    if not info:
+        return ""
+    cur, total = info
+    return f"[{cur}/{total}] "
+
+
 # Étapes où une photo de billet remplit la suite : on demande confirmation avant d'enchaîner
 # (évite de redemander compagnie / n° de vol déjà lus sur la carte).
 CARTE_CONFIRM_ELIGIBLE_STEPS = frozenset({
@@ -998,6 +1041,10 @@ def send(phone, msg):
     msg = msg.strip()
     if not msg:
         return False
+    conv = conversations.get(phone)
+    pre = tunnel_progress_prefix(conv) if conv else ""
+    if pre and not msg.startswith("["):
+        msg = pre + msg
     if not WATI_API_TOKEN or not WATI_BASE_URL:
         print("send: WATI_API_TOKEN ou WATI_BASE_URL manquant")
         return False
@@ -2305,7 +2352,30 @@ def q_flight_date(phone, lang, conv):
     cy = datetime.now().year
     today = date.today()
     dm = conv["data"].get("pending_ticket_dm")
-    partial_years = _years_for_partial_ticket_dm(dm, today) if dm and isinstance(dm, (list, tuple)) and len(dm) == 2 else None
+    ticket_dm = bool(dm and isinstance(dm, (list, tuple)) and len(dm) == 2)
+
+    # Sans indice jour/mois billet : privilégier la date complète en un message (exemples sur une ligne).
+    if not ticket_dm:
+        conv["data"]["temp_years"] = [cy, cy - 1, cy - 2, cy - 3, cy - 4]
+        lines = "\n".join(f"{i + 1}️⃣  {conv['data']['temp_years'][i]}" for i in range(5))
+        tail_fr = f"\n\n6️⃣  Avant {cy - 4} _(hors rétroactivité 5 ans)_"
+        tail_en = f"\n\n6️⃣  Before {cy - 4} _(outside 5-year limit)_"
+        if lang == "en":
+            msg = (
+                "📅 *Flight date*\n\n"
+                "In *one message*, e.g. `12/05/2024`, `2024-05-12` or `12 May 2024`.\n\n"
+                "_Or_ pick the *year* first with the buttons below.\n\n"
+            ) + lines + tail_en
+        else:
+            msg = (
+                "📅 *Date du vol*\n\n"
+                "En *un message* : `12/05/2024`, `2024-05-12` ou `12 mai 2024`.\n\n"
+                "_Sinon_, choisissez d’abord l’*année* avec les touches ci-dessous.\n\n"
+            ) + lines + tail_fr
+        send(phone, msg)
+        return
+
+    partial_years = _years_for_partial_ticket_dm(dm, today)
     if partial_years is not None:
         yrs = partial_years if partial_years else [cy - 1, cy - 2, cy - 3]
         conv["data"]["temp_years"] = yrs
@@ -2315,7 +2385,7 @@ def q_flight_date(phone, lang, conv):
         lines = "\n".join(f"{i + 1}️⃣  {conv['data']['temp_years'][i]}" for i in range(5))
 
     intro_en = intro_fr = ""
-    if dm and isinstance(dm, (list, tuple)) and len(dm) == 2:
+    if ticket_dm:
         day_s, mon_s = dm[0], dm[1]
         try:
             mw = month_word(mon_s, lang)
@@ -2350,16 +2420,10 @@ def q_flight_date(phone, lang, conv):
 
     if lang == "en":
         msg = (intro_en or "📅 *Which year* did you take this flight?\n\n") + lines + tail_en
-        if not dm:
-            msg += shortcut_en
-        elif partial_years is not None:
-            msg += shortcut_en
+        msg += shortcut_en
     else:
         msg = (intro_fr or "📅 *Quelle année* avez-vous pris ce vol ?\n\n") + lines + tail_fr
-        if not dm:
-            msg += shortcut_fr
-        elif partial_years is not None:
-            msg += shortcut_fr
+        msg += shortcut_fr
     send(phone, msg)
 
 def q_flight_month(phone, lang, year):
@@ -4299,6 +4363,26 @@ def handle_reply(phone, text, conv, image_b64=None):
 
     # ── ÉTAPE 7b : MOIS ──────────────────────────────────────────────
     if step == "flight_month":
+        parsed = try_parse_flight_date_message(t, lang)
+        if parsed:
+            if not _is_valid_claim_flight_date_str(parsed):
+                send(
+                    phone,
+                    "⚠️ Cette date est *dans le futur* ou *trop ancienne* pour la fenêtre habituelle (environ 5 ans). "
+                    "Vérifiez jour, mois et année — ou choisissez le mois dans la liste."
+                    if lang == "fr"
+                    else "⚠️ That date is *in the future* or *too far back* for the usual window (~5 years). "
+                    "Check day, month and year — or pick the month from the list.",
+                )
+                return True
+            conv["data"]["flight_date"] = parsed
+            conv["data"].pop("pending_ticket_dm", None)
+            conv["data"].pop("temp_year", None)
+            conv["data"].pop("temp_years", None)
+            conv["data"].pop("temp_month", None)
+            advance_after_flight_date_complete(phone, conv, lang)
+            at_save(phone, conv)
+            return True
         if choice and choice.isdigit() and 1 <= int(choice) <= 12:
             conv["data"]["temp_month"] = f"{int(choice):02d}"
             conv["step"] = "flight_day"
@@ -4314,6 +4398,26 @@ def handle_reply(phone, text, conv, image_b64=None):
 
     # ── ÉTAPE 7c : JOUR ──────────────────────────────────────────────
     if step == "flight_day":
+        parsed = try_parse_flight_date_message(t, lang)
+        if parsed:
+            if not _is_valid_claim_flight_date_str(parsed):
+                send(
+                    phone,
+                    "⚠️ Cette date est *dans le futur* ou *trop ancienne* pour la fenêtre habituelle (environ 5 ans). "
+                    "Vérifiez jour, mois et année — ou répondez par un *jour* entre 1 et 31."
+                    if lang == "fr"
+                    else "⚠️ That date is *in the future* or *too far back* for the usual window (~5 years). "
+                    "Check day, month and year — or reply with a *day* from 1 to 31.",
+                )
+                return True
+            conv["data"]["flight_date"] = parsed
+            conv["data"].pop("pending_ticket_dm", None)
+            conv["data"].pop("temp_year", None)
+            conv["data"].pop("temp_years", None)
+            conv["data"].pop("temp_month", None)
+            advance_after_flight_date_complete(phone, conv, lang)
+            at_save(phone, conv)
+            return True
         if choice and choice.isdigit() and 1 <= int(choice) <= 31:
             day   = f"{int(choice):02d}"
             year  = conv["data"].get("temp_year", "")
