@@ -1,85 +1,33 @@
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify
 import requests
 import os
 import json
 import base64
-import zlib
 import re
 import hashlib
-import unicodedata
 import time
+import random
 import threading
 import secrets
-from html import escape
-from datetime import datetime, timedelta, date
-from urllib.parse import urlencode, urlparse
+from datetime import datetime, timedelta
+from urllib.parse import urlencode
 
 app = Flask(__name__)
 
-# ===== CONFIG =====
-OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "")
-WATI_API_TOKEN   = os.environ.get("WATI_API_TOKEN", "")
-WATI_BASE_URL    = os.environ.get("WATI_BASE_URL", "").rstrip("/")
-# Relances hors fenêtre 24 h (Meta) : template WhatsApp approuvé — Wati v2.
-WATI_POST_SUBMIT_TEMPLATE_NAME = os.environ.get("WATI_POST_SUBMIT_TEMPLATE_NAME", "").strip()
-WATI_POST_SUBMIT_TEMPLATE_BROADCAST = os.environ.get(
-    "WATI_POST_SUBMIT_TEMPLATE_BROADCAST", "rda_post_submit_reminder"
-).strip()
-WATI_TEMPLATE_CHANNEL_NUMBER = os.environ.get("WATI_TEMPLATE_CHANNEL_NUMBER", "").strip()
-# Sondage WATI : boutons (≤3) ou liste (≤10) — clic au lieu de taper 1/2/3.
-WATI_USE_INTERACTIVE = os.environ.get("WATI_USE_INTERACTIVE", "1").strip().lower() in (
-    "1", "true", "yes", "on",
-)
-POST_SUBMIT_TEMPLATE_REPEAT_H = int(os.environ.get("POST_SUBMIT_TEMPLATE_REPEAT_HOURS", "48") or "48")
-META_SESSION_HOURS = int(os.environ.get("META_CUSTOMER_CARE_WINDOW_HOURS", "24") or "24")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+WATI_API_TOKEN = os.environ.get("WATI_API_TOKEN", "")
+WATI_BASE_URL  = os.environ.get("WATI_BASE_URL", "")
+RDA_SITE       = os.environ.get("RDA_SITE", "https://robindesairs.eu")
+MANDAT_BASE_URL = os.environ.get("MANDAT_BASE_URL", f"{RDA_SITE}/mandat.html")
+
+# ============================================
+# AIRTABLE — CONFIG (repris du v11)
+# ============================================
 AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY", "")
 AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID", "appv72lKbQtjt7EIP")
+AT_TABLE_ID      = os.environ.get("AIRTABLE_TABLE_ID", "tblfg688AGxaywi7O")
 
-RDA_DOMAIN = os.environ.get("RDA_SITE", os.environ.get("RDA_DOMAIN", "https://robindesairs.eu"))
-# Mandat en ligne sur le site (Netlify) — MANDAT_URL par defaut mandat.html
-MANDAT_URL = os.environ.get("MANDAT_URL", f"{RDA_DOMAIN.rstrip('/')}/mandat.html")
-
-def _mandat_public_origin():
-    """Origine (schéma + hôte) pour le lien court /m — alignée sur MANDAT_URL."""
-    pu = urlparse(MANDAT_URL)
-    if pu.scheme and pu.netloc:
-        return f"{pu.scheme}://{pu.netloc}".rstrip("/")
-    return RDA_DOMAIN.rstrip("/")
-
-def mandat_link_compressed(params):
-    """
-    Lien /m?c=… (JSON + zlib + base64url) → redirection 302 vers mandat.html?…
-    """
-    filtered = {k: v for k, v in params.items() if v}
-    raw = json.dumps(filtered, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    blob = zlib.compress(raw, level=9)
-    c = base64.urlsafe_b64encode(blob).decode("ascii").rstrip("=")
-    return f"{_mandat_public_origin()}/m?c={c}", filtered
-
-def mandat_signing_link(params):
-    """
-    Lien de signature : par défaut toujours la forme compressée /m?c=… (lisible sur WhatsApp).
-    Désactiver : MANDAT_PREFER_SHORT_LINK=0 → choix automatique long/court selon la longueur.
-    """
-    short_url, filtered = mandat_link_compressed(params)
-    prefer = os.environ.get("MANDAT_PREFER_SHORT_LINK", "1").strip().lower()
-    if prefer not in ("0", "false", "no", "off"):
-        return short_url
-    long_q = urlencode({k: str(v) for k, v in filtered.items()})
-    long_url = f"{MANDAT_URL}?{long_q}" if long_q else MANDAT_URL
-    return short_url if len(short_url) <= len(long_url) else long_url
-SUIVI_URL   = f"{RDA_DOMAIN.rstrip('/')}/suivi-dossier"
-# Politique de confidentialité (URL complète possible via env).
-# Optionnel : PRIVACY_HIDE_SHORT_NOTICE=1 (rien sur le 1er écran),
-#             PRIVACY_HIDE_DETAILED_BANNER=1 (pas le bloc long avant photo / questions).
-#             RDA_TERMS_URL=https://... (sinon URL dérivée de RDA_DOMAIN + /conditions-generales)
-PRIVACY_POLICY_URL = os.environ.get("PRIVACY_POLICY_URL", "").strip() or f"{RDA_DOMAIN.rstrip('/')}/politique-confidentialite"
-# Conditions générales (CGU) — même logique qu’AirHelp : lien vers le site officiel.
-TERMS_URL = os.environ.get("RDA_TERMS_URL", "").strip() or f"{RDA_DOMAIN.rstrip('/')}/conditions-generales"
-CLIMBIE_TEL = "+33756863630"
-
-# ===== IDs CHAMPS AIRTABLE (récupérés directement depuis l'API) =====
-AT_TABLE_ID         = "tblfg688AGxaywi7O"
+# IDs des champs Airtable
 F_NOM_PASSAGER      = "fldCtJysGhTYF2LNf"  # Nom Passager (primary)
 F_REF_DOSSIER       = "flduSWqrqxeNoQkKW"  # Référence Dossier
 F_DATE_DOSSIER      = "fldU8r9ME43CeOZ1T"  # Date Dossier
@@ -95,20 +43,24 @@ F_PNR               = "fld7scWE20q3DRPUa"  # PNR
 F_TYPE_INCIDENT     = "fldci5VnHb0HpOoKL"  # Type d'incident (singleSelect)
 F_MONTANT_INDEMNITE = "fldlzkJOqqC8AYbIM"  # Montant de l'indemnité
 F_STATUT_SUIVI      = "fldUnBUQFKeoKf8LL"  # Statut du Dossier Suivi
-# Carte d'embarquement (champ Attachment Airtable) — renseigner l'ID fld… dans AIRTABLE_F_CARTE_EMB
+F_ITINERAIRE        = os.environ.get("AIRTABLE_F_ITINERAIRE", "fldtCISegQZ58Yvrl").strip()
+
+# Champs attachments (optionnels — ID fld… via env)
 F_CARTE_EMBARQUEMENT = os.environ.get("AIRTABLE_F_CARTE_EMB", "").strip()
-# Pièces optionnelles pour arrêter les relances quand tout est reçu (Airtable)
-F_PIECE_IDENTITE = os.environ.get("AIRTABLE_F_IDENTITE", "").strip()
-F_MANDAT_SIGNE = os.environ.get("AIRTABLE_F_MANDAT_SIGNE", "").strip()
-# POST JSON {"ref":"RDA-…","secret":"…"} — même secret que côté mandat.html / Make
-MANDAT_SIGNED_WEBHOOK_SECRET = os.environ.get("MANDAT_SIGNED_WEBHOOK_SECRET", "").strip()
-# Case à cocher Airtable (tblfg688AGxaywi7O) — **une seule** des deux : ID du champ copié depuis Airtable.
-# Stop_Relance : coché = arrêter les relances WhatsApp / templates pour ce dossier.
-# Sequence_Active : coché = relances autorisées ; **décoché** = arrêt (lire sur la 1ʳᵉ ligne du dossier).
-F_STOP_RELANCE = os.environ.get("AIRTABLE_F_STOP_RELANCE", "").strip()
+F_PIECE_IDENTITE     = os.environ.get("AIRTABLE_F_IDENTITE", "").strip()
+F_MANDAT_SIGNE       = os.environ.get("AIRTABLE_F_MANDAT_SIGNE", "").strip()
+
+# Cases relances Airtable
+F_STOP_RELANCE    = os.environ.get("AIRTABLE_F_STOP_RELANCE", "").strip()
 F_SEQUENCE_ACTIVE = os.environ.get("AIRTABLE_F_SEQUENCE_ACTIVE", "").strip()
-# Même fld que l’ancien main.py ; surcharge : AIRTABLE_F_ITINERAIRE=fld… ou désactivation : AIRTABLE_F_ITINERAIRE=
-F_ITINERAIRE = os.environ.get("AIRTABLE_F_ITINERAIRE", "fldtCISegQZ58Yvrl").strip()
+
+# Webhook mandat signé
+MANDAT_SIGNED_WEBHOOK_SECRET = os.environ.get("MANDAT_SIGNED_WEBHOOK_SECRET", "").strip()
+
+# Template Wati post-soumission (hors fenêtre 24 h)
+WATI_POST_SUBMIT_TEMPLATE_NAME      = os.environ.get("WATI_POST_SUBMIT_TEMPLATE_NAME", "").strip()
+WATI_POST_SUBMIT_TEMPLATE_BROADCAST = os.environ.get("WATI_POST_SUBMIT_TEMPLATE_BROADCAST", "rda_post_submit_reminder").strip()
+WATI_TEMPLATE_CHANNEL_NUMBER        = os.environ.get("WATI_TEMPLATE_CHANNEL_NUMBER", "").strip()
 
 # Options singleSelect EXACTES dans Airtable
 INCIDENT_AT = {
@@ -119,121 +71,155 @@ INCIDENT_AT = {
 STATUT_DOSSIER_DEFAUT = "Ouvert"
 STATUT_SUIVI_DEFAUT   = "Nouveau"
 
-# ===== EU261 =====
-EU261_BANDS = {
-    "band_250": {"amount_eur": 250, "label": "≤ 1500 km"},
-    "band_400": {"amount_eur": 400, "label": "1500–3500 km"},
-    "band_600": {"amount_eur": 600, "label": "> 3500 km (Europe-Afrique)"},
-}
-AMOUNT_DEFAULT     = 600   # long-courrier par défaut
-COMMISSION_PCT     = 0.25  # 25% Robin des Airs
-NET_PCT            = 0.75  # 75% client
+COMMISSION_PCT = 0.25
+NET_PCT        = 0.75
 
-INCIDENT_LABELS = {
-    "delay":  "Retard +3h",
-    "cancel": "Annulation",
-    "denied": "Surbooking",
-}
-INCIDENT_LABELS_EN = {
-    "delay":  "Delay (3h+)",
-    "cancel":  "Cancellation",
-    "denied":  "Overbooking",
+# ===== MEMOIRE =====
+conversations         = {}
+recent_event_ids      = {}
+recent_payload_keys   = {}
+recent_outbound_sends = {}
+MEMORY_HOURS              = 24
+DEDUP_WINDOW_SECONDS      = 25
+EVENT_ID_TTL_SECONDS      = 900
+OUTBOUND_DEDUP_SECONDS    = int(os.environ.get("OUTBOUND_DEDUP_SECONDS", "45"))
+OUTBOUND_CACHE_TTL_SECONDS = int(os.environ.get("OUTBOUND_CACHE_TTL_SECONDS", "900"))
+
+# Relances — timing fenêtre 24h WhatsApp
+RELANCE_THRESHOLDS_HOURS = [2, 8, 22]
+
+# ============================================
+# NOUVEAU FLUX v8 — ORDRE OPTIMISÉ
+# ============================================
+# MSG 1  — Accroche commerciale + stat choc + bouton "Vérifier mon indemnité"
+# MSG 2  — Langue (9 options avec drapeaux)
+# MSG 3  — Route (4 boutons reformulés)
+# MSG 4  — Incident + durée retard
+# MSG 5  — Nb passagers
+# MSG 6  — Type de vol (direct/escale) — AVANT le scan
+# MSG 7  — Motivation (montant calculé avec nb pax connu)
+# MSG 8  — Scan document(s) — on sait combien scanner
+# MSG 9  — Noms passagers (si pas lus par scan)
+# MSG 10 — Vol & Date (si pas lus par scan)
+# MSG 11 — Mineurs
+# MSG 12 — Récap modifiable
+# MSG 13 — Documents justificatifs (passeport, carte, e-billet, certificat)
+# MSG 14 — RGPD + Mandat + Annonce expert humain
+
+STEP_PROGRESS = {
+    None:                    0,
+    "welcome":               0,
+    "language":              0,
+    "route_qualify":         1,
+    "incident_type":         2,
+    "delay_duration":        2,
+    "passengers":            3,
+    "flight_type":           4,
+    "document":              5,
+    "doc_confirm":           5,
+    "doc_correction":        5,
+    "trip_select":           5,
+    "passenger_collect":     5,
+    "passenger_confirm":     5,
+    "flight_number":         6,
+    "flight_number_confirm": 6,
+    "flight_date":           6,
+    "flight_date_confirm":   6,
+    "minor_check":           6,
+    "minor_select":          6,
+    "recap":                 7,
+    "recap_modify":          7,
+    "route_input":           7,
+    "passport_collect":      7,
+    "boarding_collect":      7,
+    "ebillet_collect":       7,
+    "certificat_collect":    7,
+    "rgpd":                  7,
+    "summary":               7,
+    "completed":             8,
 }
 
-AIRLINES_MAP = {
-    "1": "Air France",
-    "2": "KLM",
-    "3": "Brussels Airlines",
-    "4": "Lufthansa",
-    "5": "TAP Portugal",
-    "6": "Corsair",
-    "7": "Air Senegal",
-    "8": "Royal Air Maroc",
+
+def progress_bar(step_done):
+    """step_done = nombre d'étapes validées (0 à 8) → barre 8 pastilles."""
+    step_done = max(0, min(8, int(step_done)))
+    return "🟢" * step_done + "⚪" * (8 - step_done)
+
+
+def bar_for_step(step):
+    """Barre de progression pour une étape (clé current_step)."""
+    return progress_bar(STEP_PROGRESS.get(step, 0))
+
+
+def with_bar(step, message):
+    """Préfixe un message avec la barre de progression de l'étape."""
+    return f"{bar_for_step(step)}\n\n{message}"
+
+
+# ===== STAT CHOC — ROTATION A/B =====
+STAT_VARIANTS = [
+    "Seulement 5% des passagers réclament leur indemnité — soyez dans les 5%.",
+    "Les compagnies gardent 95% des indemnités dues... faute de réclamation.",
+    "Un vol sur 4 au départ d'Afrique arrive en retard en Europe.",
+    "Des centaines de dossiers gagnés. Des familles indemnisées. Votre dossier est le suivant.",
+    "600€ par passager. C'est la loi. La compagnie le sait. Vous aussi maintenant.",
+    "Chaque année, des millions d'euros d'indemnités ne sont jamais réclamés faute de démarche.",
+]
+
+STAT_VARIANTS_EN = [
+    "Only 5% of passengers claim their compensation — be in the 5%.",
+    "Airlines keep 95% of the compensation owed... because nobody claims it.",
+    "One in four flights leaving Africa arrives late in Europe.",
+    "Hundreds of cases won. Families compensated. Your file is next.",
+    "€600 per passenger. It's the law. The airline knows it. Now you do too.",
+    "Every year, millions of euros in compensation go unclaimed for lack of action.",
+]
+
+
+# ===== COMPAGNIES PAR PRÉFIXE IATA =====
+AIRLINE_PREFIXES = {
+    "AF": "Air France", "KL": "KLM", "SN": "Brussels Airlines",
+    "LH": "Lufthansa", "TP": "TAP Portugal", "IB": "Iberia",
+    "BA": "British Airways", "AZ": "ITA Airways", "FR": "Ryanair",
+    "U2": "EasyJet", "VY": "Vueling", "W6": "Wizz Air",
+    "TO": "Transavia", "BJ": "Corsair", "SS": "Corsair",
+    "HC": "Air Sénégal", "SC": "Air Sénégal",
+    "AT": "Royal Air Maroc", "TU": "Tunisair",
+    "ET": "Ethiopian Airlines", "KQ": "Kenya Airways",
+    "WB": "RwandAir", "QR": "Qatar Airways",
+    "EK": "Emirates", "MS": "EgyptAir",
+    "CM": "COPA Airlines", "DL": "Delta", "AA": "American Airlines",
 }
 
-# Codes IATA (2–3 lettres) : Europe↔Afrique, hub Proche-Orient, Amériques + code-share fréquents
+# Table IATA enrichie (repris du v11) pour résolution codeshare
 FLIGHT_PREFIX_TO_AIRLINE = {
-    "EJU": "easyJet",
-    "BZZ": "Buzz",
-    "TUI": "TUI fly",
-    "AF": "Air France",
-    "KL": "KLM",
-    "SN": "Brussels Airlines",
-    "LH": "Lufthansa",
-    "TP": "TAP Portugal",
-    "SS": "Corsair",
-    "HC": "Air Senegal",
-    "HF": "Air Côte d'Ivoire",
-    "AT": "Royal Air Maroc",
-    "UX": "Air Europa",
-    "IB": "Iberia",
-    "BA": "British Airways",
-    "U2": "easyJet",
-    "FR": "Ryanair",
-    "W6": "Wizz Air",
-    "VY": "Vueling",
-    "EI": "Aer Lingus",
-    "LX": "Swiss",
-    "OS": "Austrian",
-    "EW": "Eurowings",
-    "DE": "Condor",
-    "TO": "Transavia France",
-    "HV": "Transavia",
-    "PC": "Pegasus Airlines",
-    "TK": "Turkish Airlines",
-    "MS": "EgyptAir",
-    "ET": "Ethiopian Airlines",
-    "SK": "SAS",
-    "DY": "Norwegian",
-    "XQ": "SunExpress",
-    "XQG": "SunExpress",
-    "TS": "Air Transat",
-    "UA": "United Airlines",
-    "DL": "Delta Air Lines",
-    "AA": "American Airlines",
-    "AC": "Air Canada",
-    "QR": "Qatar Airways",
-    "EK": "Emirates",
-    "GF": "Gulf Air",
-    "WY": "Oman Air",
-    "SV": "Saudia",
-    "RJ": "Royal Jordanian",
-    "TU": "Tunisair",
-    "AH": "Air Algérie",
-    "MD": "Air Madagascar",
-    "KP": "ASKY",
-    "WB": "RwandAir",
-    "KQ": "Kenya Airways",
-    "SA": "South African Airways",
-    "BT": "airBaltic",
-    "LO": "LOT Polish Airlines",
-    "OK": "Czech Airlines",
-    "RO": "TAROM",
-    "FB": "Bulgaria Air",
-    "A3": "Aegean Airlines",
-    "CY": "Cyprus Airways",
-    "KM": "Air Malta",
-    "LG": "Luxair",
-    # Afrique & vols transcontinentaux vers l’Afrique
-    "DT": "TAAG Angola Airlines",
-    "W3": "Arik Air",
-    "P4": "Air Peace",
-    "TM": "LAM Mozambique",
-    "UR": "Uganda Airlines",
-    "4Y": "Eurowings Discover",
-    "BF": "French Bee",
-    "J9": "Jazeera Airways",
-    "SM": "Air Cairo",
-    "NP": "Nile Air",
-    "NE": "Nesma Airlines",
-    "ZN": "Zambia Airways",
-    "G9": "Air Arabia",
-    "3O": "Air Arabia Maroc",
-    "TX": "Air Caraïbes",
+    "EJU": "easyJet", "BZZ": "Buzz", "TUI": "TUI fly",
+    "AF": "Air France", "KL": "KLM", "SN": "Brussels Airlines",
+    "LH": "Lufthansa", "TP": "TAP Portugal", "SS": "Corsair",
+    "HC": "Air Senegal", "HF": "Air Côte d'Ivoire", "AT": "Royal Air Maroc",
+    "UX": "Air Europa", "IB": "Iberia", "BA": "British Airways",
+    "U2": "easyJet", "FR": "Ryanair", "W6": "Wizz Air", "VY": "Vueling",
+    "EI": "Aer Lingus", "LX": "Swiss", "OS": "Austrian", "EW": "Eurowings",
+    "DE": "Condor", "TO": "Transavia France", "HV": "Transavia",
+    "PC": "Pegasus Airlines", "TK": "Turkish Airlines", "MS": "EgyptAir",
+    "ET": "Ethiopian Airlines", "SK": "SAS", "DY": "Norwegian",
+    "XQ": "SunExpress", "TS": "Air Transat", "UA": "United Airlines",
+    "DL": "Delta Air Lines", "AA": "American Airlines", "AC": "Air Canada",
+    "QR": "Qatar Airways", "EK": "Emirates", "GF": "Gulf Air", "WY": "Oman Air",
+    "SV": "Saudia", "RJ": "Royal Jordanian", "TU": "Tunisair", "AH": "Air Algérie",
+    "MD": "Air Madagascar", "KP": "ASKY", "WB": "RwandAir", "KQ": "Kenya Airways",
+    "SA": "South African Airways", "BT": "airBaltic", "LO": "LOT Polish Airlines",
+    "OK": "Czech Airlines", "RO": "TAROM", "FB": "Bulgaria Air", "A3": "Aegean Airlines",
+    "CY": "Cyprus Airways", "KM": "Air Malta", "LG": "Luxair", "DT": "TAAG Angola Airlines",
+    "W3": "Arik Air", "P4": "Air Peace", "TM": "LAM Mozambique", "UR": "Uganda Airlines",
+    "4Y": "Eurowings Discover", "BF": "French Bee", "J9": "Jazeera Airways",
+    "SM": "Air Cairo", "NP": "Nile Air", "NE": "Nesma Airlines", "ZN": "Zambia Airways",
+    "G9": "Air Arabia", "3O": "Air Arabia Maroc", "TX": "Air Caraïbes",
+    "CM": "COPA Airlines", "AZ": "ITA Airways", "BJ": "Corsair",
 }
 
 def airline_from_iata(code):
-    """Code compagnie seul (AF, KL, SS, EJU…) → nom. Base locale uniquement."""
+    """Code compagnie seul (AF, KL, EJU…) → nom. Base locale uniquement."""
     c = re.sub(r"[^A-Z]", "", (code or "").upper())
     if not c:
         return None
@@ -244,1404 +230,1547 @@ def airline_from_iata(code):
                 return FLIGHT_PREFIX_TO_AIRLINE[pref]
     return None
 
-def airline_guess_from_flight_number(fn):
-    """Devine la compagnie à partir du préfixe IATA du n° de vol (ex. SN271 → Brussels Airlines)."""
-    fn = (fn or "").strip().upper()
+def guess_airline(flight_number):
+    """Devine la compagnie à partir du préfixe IATA du numéro de vol."""
+    fn = (flight_number or "").strip().upper()
     m = re.match(r"^([A-Z]{2,3})\d", fn)
-    if not m:
-        return None
-    return airline_from_iata(m.group(1))
-
-MONTH_NAMES_FR = (
-    "", "janvier", "février", "mars", "avril", "mai", "juin",
-    "juillet", "août", "septembre", "octobre", "novembre", "décembre",
-)
-MONTH_NAMES_EN = (
-    "", "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
-)
-
-def month_word(month_mm, lang):
-    """temp_month '01'..'12' → libellé pour rappels utilisateur."""
-    try:
-        i = int((month_mm or "0").lstrip("0") or "0")
-    except ValueError:
-        return month_mm or "?"
-    names = MONTH_NAMES_EN if lang == "en" else MONTH_NAMES_FR
-    if 1 <= i <= 12:
-        return names[i]
-    return month_mm or "?"
-
-def _ascii_fold(s):
-    """Normalise pour comparer janvier / janv. / accents."""
-    if not s:
-        return ""
-    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode().lower()
-
-_MONTH_ALIASES_FR = {
-    "janvier": 1, "janv": 1, "jan": 1,
-    "fevrier": 2, "fev": 2, "fevr": 2,
-    "mars": 3, "mar": 3, "avril": 4, "avr": 4, "mai": 5,
-    "juin": 6, "juillet": 7, "juil": 7,
-    "aout": 8, "septembre": 9, "sep": 9, "sept": 9,
-    "octobre": 10, "oct": 10, "novembre": 11, "nov": 11,
-    "decembre": 12, "dec": 12,
-}
-_MONTH_ALIASES_EN = {
-    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3, "april": 4, "apr": 4,
-    "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7, "august": 8, "aug": 8,
-    "september": 9, "sep": 9, "sept": 9, "october": 10, "oct": 10, "november": 11, "nov": 11,
-    "december": 12, "dec": 12,
-}
-
-def month_number_from_word_token(token, lang):
-    """1–12 depuis un mot (ex. mai, oct) ou None."""
-    t = _ascii_fold((token or "").strip().rstrip("."))
-    if not t:
-        return None
-    aliases = _MONTH_ALIASES_EN if lang == "en" else _MONTH_ALIASES_FR
-    if t in aliases:
-        return aliases[t]
-    for k, v in aliases.items():
-        if t.startswith(k) or k.startswith(t):
-            return v
+    if m:
+        name = airline_from_iata(m.group(1))
+        if name:
+            return name
+    for prefix, name in AIRLINE_PREFIXES.items():
+        if fn.startswith(prefix):
+            return name
     return None
 
-def _expand_two_digit_year(yy):
-    """Année sur 2 chiffres → 19xx / 20xx (vols récents privilégiés)."""
-    yy = int(yy)
-    if yy <= 50:
-        return 2000 + yy
-    return 1900 + yy
 
-def _disambiguate_slash_parts(d1, d2, lang):
-    """d1/d2 sans année : ordre jour/mois vs mois/jour selon plausibilité et langue."""
-    if d1 > 12:
-        return d1, d2  # jour, mois
-    if d2 > 12:
-        return d2, d1  # jour, mois (d1 = mois)
-    if lang == "en":
-        return d2, d1  # MDY → jour=d2, mois=d1
-    return d1, d2  # DMY
+# ============================================
+# HELPERS CONVERSATION
+# ============================================
 
-def _format_flight_date_ddmmyyyy(day, month, year):
-    try:
-        datetime(year, month, day)
-    except ValueError:
-        return None
-    return f"{day:02d}/{month:02d}/{year}"
-
-def looks_like_full_date_input(text):
-    """JJ/MM/AAAA (etc.) : ne pas confondre avec un simple choix « 11 »."""
-    s = (text or "").strip()
-    if len(s) < 6:
-        return False
-    if re.match(r"^\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}\s*$", s):
-        return True
-    if re.match(r"^\d{4}-\d{1,2}-\d{1,2}\s*$", s):
-        return True
-    if re.match(
-        r"^\d{1,2}\s+[a-zA-ZéèêëàùâîôûçÉÈÊËÀÙÂÎÔÛÇ]+(?:\s+\d{2,4})?\s*$",
-        s,
-        re.I,
-    ):
-        return True
-    if re.match(r"^[a-zA-Z]+\s+\d{1,2},?\s+\d{2,4}\s*$", s, re.I):
-        return True
-    return False
-
-def try_parse_flight_date_message(text, lang):
-    """
-    Date complète en un message (sans carte) : JJ/MM/AAAA, AAAA-MM-JJ, 12 mai 2024, etc.
-    Retourne JJ/MM/AAAA ou None.
-    """
-    s = (text or "").strip()
-    if len(s) < 6:
-        return None
-
-    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})\s*$", s)
-    if m:
-        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        return _format_flight_date_ddmmyyyy(d, mo, y)
-
-    m = re.match(r"^(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4})\s*$", s)
-    if m:
-        d1, d2 = int(m.group(1)), int(m.group(2))
-        y_raw = m.group(3)
-        y = int(y_raw)
-        if len(y_raw) == 2:
-            y = _expand_two_digit_year(y)
-        day, month = _disambiguate_slash_parts(d1, d2, lang)
-        return _format_flight_date_ddmmyyyy(day, month, y)
-
-    # "12 janvier 2024" / "12 janv 24"
-    m = re.match(
-        r"^(\d{1,2})\s+([a-zA-ZéèêëàùâîôûçÉÈÊËÀÙÂÎÔÛÇ]+)\s+(\d{2,4})\s*$",
-        s,
-        re.I,
-    )
-    if m:
-        d = int(m.group(1))
-        mo = month_number_from_word_token(m.group(2), lang)
-        if not mo:
-            return None
-        y_raw = m.group(3)
-        y = int(y_raw)
-        if len(y_raw) == 2:
-            y = _expand_two_digit_year(y)
-        return _format_flight_date_ddmmyyyy(d, mo, y)
-
-    # "january 5, 2024" / "january 5 2024"
-    m = re.match(
-        r"^([a-zA-Z]+)\s+(\d{1,2}),?\s+(\d{2,4})\s*$",
-        s,
-        re.I,
-    )
-    if m and lang == "en":
-        mo = month_number_from_word_token(m.group(1), lang)
-        if not mo:
-            return None
-        d = int(m.group(2))
-        y_raw = m.group(3)
-        y = int(y_raw)
-        if len(y_raw) == 2:
-            y = _expand_two_digit_year(y)
-        return _format_flight_date_ddmmyyyy(d, mo, y)
-
-    # "5 january 2024" (EN)
-    m = re.match(
-        r"^(\d{1,2})\s+([a-zA-Z]+)\s+(\d{2,4})\s*$",
-        s,
-        re.I,
-    )
-    if m and lang == "en":
-        d = int(m.group(1))
-        mo = month_number_from_word_token(m.group(2), lang)
-        if not mo:
-            return None
-        y_raw = m.group(3)
-        y = int(y_raw)
-        if len(y_raw) == 2:
-            y = _expand_two_digit_year(y)
-        return _format_flight_date_ddmmyyyy(d, mo, y)
-
-    # « 15 mai » sans année (souvent en Afrique / WhatsApp) : années récentes plausibles
-    m = re.match(
-        r"^(\d{1,2})\s+([a-zA-ZéèêëàùâîôûçÉÈÊËÀÙÂÎÔÛÇ]+)\s*$",
-        s,
-        re.I,
-    )
-    if m:
-        d = int(m.group(1))
-        mo = month_number_from_word_token(m.group(2), lang)
-        if mo:
-            cy = datetime.now().year
-            for y in (cy, cy - 1, cy - 2, cy - 3):
-                fd = _format_flight_date_ddmmyyyy(d, mo, y)
-                if fd:
-                    return fd
-
-    return None
-
-def split_itinerary_for_mandat(itin):
-    """Découpe une ligne d'itinéraire pour préremplir départ / arrivée / escale(s)."""
-    itin = (itin or "").strip()
-    if not itin:
-        return "", "", ""
-    compact = re.sub(r"\s+", "", itin)
-    m = re.match(r"^([A-Za-z]{3})[-–—>]([A-Za-z]{3})$", compact)
-    if m:
-        return m.group(1).upper(), m.group(2).upper(), ""
-    if re.match(r"^[A-Za-z]{6}$", compact):
-        return compact[:3].upper(), compact[3:].upper(), ""
-    parts = re.split(r"\s*(?:→|->|—|–|\s-\s| vers | to )\s*", itin, flags=re.I)
-    parts = [p.strip() for p in parts if p.strip()]
-    if not parts:
-        return "", "", ""
-    if len(parts) == 1:
-        return parts[0], "", ""
-    if len(parts) == 2:
-        return parts[0], parts[1], ""
-    dep, arr = parts[0], parts[-1]
-    via = " ; ".join(parts[1:-1])
-    return dep, arr, via
-
-def try_set_itinerary_from_freeform(conv, text):
-    """Interprète une saisie libre (ex. BRU → CDG → ABJ ou BRU CDG ABJ) et remplit data.itinerary."""
-    raw = (text or "").strip()
-    if len(raw) < 2:
-        return False
-    d = conv["data"]
-    if "|" in text:
-        a, b = text.split("|", 1)
-        raw = a.strip()
-        if b.strip():
-            d["itinerary_compl_note"] = b.strip()[:220]
-    it0 = _unify_route_display(raw)
-    parts = re.split(r"\s*(?:→|->|—|–|\s-\s| vers | to )\s*", it0, flags=re.I)
-    parts = [p.strip() for p in parts if p.strip()]
-    if len(parts) < 2:
-        tokens = re.findall(r"\b[A-Za-z]{3}\b", raw.upper())
-        if len(tokens) >= 2:
-            parts = list(tokens)
-        else:
-            return False
-    if len(parts) < 2:
-        return False
-    d["itinerary"] = " → ".join(parts)
-    dep, arr, _ = split_itinerary_for_mandat(d["itinerary"])
-    return bool(dep and arr)
-
-# ===== FLUX (étapes) =====
-# 1. passengers → pax_ack_route (direct / escale) → langue contact expert → confirmation vocale
-# 2. incident_type …
-
-STEPS = [
-    "passengers", "pax_ack_route", "pax_contact_lang", "pax_voice_confirm",
-    "incident_type", "boarding_after_pax", "airline", "airline_other",
-    "pnr_input", "flight_number",
-    "flight_date", "flight_month", "flight_day",
-    "itinerary_kind", "itinerary_rt_pick", "itinerary_freeline",
-    "itinerary_dep", "itinerary_arr",
-    "carte_confirm", "carte_pick_field", "carte_edit_value",
-    "passenger_names", "passenger_name_post_add", "passenger_names_confirm", "minor_check",
-    "summary", "completed",
-]
-
-# Progression en tête des messages WhatsApp : 🟢 / ⚪ (7 segments max, hors completed / paused).
-TUNNEL_PROGRESS_FILLED = "🟢"
-TUNNEL_PROGRESS_EMPTY = "⚪"
-TUNNEL_PROGRESS_VISUAL_SEGMENTS = 7
-TUNNEL_PROGRESS_BUCKETS = (
-    ("passengers",),
-    ("pax_ack_route",),
-    ("pax_contact_lang",),
-    ("pax_voice_confirm",),
-    ("incident_type",),
-    ("boarding_after_pax",),
-    ("airline", "airline_other"),
-    ("pnr_input",),
-    ("flight_number",),
-    ("flight_date", "flight_month", "flight_day"),
-    (
-        "itinerary_kind",
-        "itinerary_rt_pick",
-        "itinerary_freeline",
-        "itinerary_dep",
-        "itinerary_arr",
-    ),
-    ("carte_confirm", "carte_pick_field", "carte_edit_value"),
-    ("passenger_names", "passenger_name_post_add"),
-    ("passenger_names_confirm", "minor_check", "summary"),
-)
-TUNNEL_PROGRESS_TOTAL = len(TUNNEL_PROGRESS_BUCKETS)
-_STEP_TO_TUNNEL_PROGRESS = {}
-for _i, _bucket in enumerate(TUNNEL_PROGRESS_BUCKETS, start=1):
-    for _st in _bucket:
-        _STEP_TO_TUNNEL_PROGRESS[_st] = (_i, TUNNEL_PROGRESS_TOTAL)
-
-def tunnel_progress_prefix(conv):
-    if not conv or not isinstance(conv, dict):
-        return ""
-    step = conv.get("step")
-    if not step or step in ("completed", "paused"):
-        return ""
-    info = _STEP_TO_TUNNEL_PROGRESS.get(step)
-    if not info:
-        return ""
-    cur, total = info
-    n = TUNNEL_PROGRESS_VISUAL_SEGMENTS
-    vis = max(1, min(n, round(cur * n / total)))
-    bar = TUNNEL_PROGRESS_FILLED * vis + TUNNEL_PROGRESS_EMPTY * (n - vis)
-    return f"{bar}\n"
-
-def _first_line_looks_like_tunnel_progress_bar(line):
-    """Évite de préfixer deux fois si le message commence déjà par la barre."""
-    s = (line or "").strip()
-    if len(s) != TUNNEL_PROGRESS_VISUAL_SEGMENTS:
-        return False
-    ok = frozenset((TUNNEL_PROGRESS_FILLED, TUNNEL_PROGRESS_EMPTY))
-    return all(c in ok for c in s)
-
-# Étapes où une photo de billet remplit la suite : on demande confirmation avant d'enchaîner
-# (évite de redemander compagnie / n° de vol déjà lus sur la carte).
-CARTE_CONFIRM_ELIGIBLE_STEPS = frozenset({
-    "boarding_after_pax",  # preuves : toujours valider la lecture avant d’enchaîner
-    "airline", "airline_other", "pnr_input", "flight_number",
-    "flight_date", "flight_month", "flight_day",
-    "itinerary_kind", "itinerary_rt_pick", "itinerary_freeline",
-    "itinerary_dep", "itinerary_arr",
-})
-# Même pause après « corriger » ou nouvelle photo pendant la vérification.
-CARTE_CONFIRM_PAUSE_STEPS = CARTE_CONFIRM_ELIGIBLE_STEPS | frozenset({"carte_confirm", "carte_pick_field", "carte_edit_value"})
-CARTE_FIELD_KEYS = ("airline", "flight_number", "flight_date", "pnr", "itinerary", "passenger_names", "operating_airline")
-
-# ===== MEMOIRE =====
-conversations    = {}
-recent_event_ids = {}
-MEMORY_HOURS     = 24
-# Liens courts /sign/<token> → URL mandat (évite URL compressée longue dans WhatsApp)
-SIGN_REDIRECTS   = {}
-SIGN_REDIRECT_TTL_S = 86400
-SIGN_REDIRECT_MAX  = 5000
-
-def _sign_redirect_cleanup():
-    now = time.time()
-    for k, ent in list(SIGN_REDIRECTS.items()):
-        if float(ent.get("exp") or 0) < now:
-            SIGN_REDIRECTS.pop(k, None)
-    while len(SIGN_REDIRECTS) > SIGN_REDIRECT_MAX:
-        k = next(iter(SIGN_REDIRECTS))
-        SIGN_REDIRECTS.pop(k, None)
-
-def register_mandate_short_link(target_url: str) -> str:
-    """Enregistre une redirection courte /sign/<token> → URL mandat réelle (WhatsApp)."""
-    u = (target_url or "").strip()
-    if not u:
-        return ""
-    _sign_redirect_cleanup()
-    tok = secrets.token_urlsafe(10)
-    SIGN_REDIRECTS[tok] = {"url": u, "exp": time.time() + SIGN_REDIRECT_TTL_S}
-    return f"{_mandat_public_origin()}/sign/{tok}"
-
-# Langues pour vocaux / suivi (ordre = chiffres 1–N au tunnel ; max 10 lignes liste WATI)
-EXPERT_LANG_OPTIONS = [
-    ("fr", "🇫🇷", "Français", "French"),
-    ("en", "🇬🇧", "Anglais", "English"),
-    ("wo", "🇸🇳", "Wolof", "Wolof"),
-    ("tw", "🇬🇭", "Twi", "Twi"),
-    ("yo", "🇳🇬", "Yoruba", "Yoruba"),
-    ("sw", "🇹🇿", "Kiswahili", "Kiswahili"),
-    ("pt", "🇵🇹", "Portugais", "Portuguese"),
-    ("ar", "🇲🇦", "Arabe", "Arabic"),
-    ("ha", "🇳🇬", "Haoussa", "Hausa"),
-    ("ma", "🇬🇲", "Mandinka", "Mandinka"),
-]
-
-def _expert_lang_display(code: str, lang_ui: str) -> str:
-    for c, fl, fr, en in EXPERT_LANG_OPTIONS:
-        if c == code:
-            lab = fr if lang_ui == "fr" else en
-            return f"{fl} {lab}"
-    return code or "—"
-
-def _early_route_caption(shape: str, lang_ui: str) -> str:
-    if not shape:
-        return ""
-    if lang_ui == "en":
-        return (
-            "✈️ *Route type:* direct (no connection)"
-            if shape == "direct"
-            else "✈️ *Route type:* with connection / stopover"
-        )
-    return (
-        "✈️ *Parcours :* vol *direct* (sans correspondance)"
-        if shape == "direct"
-        else "✈️ *Parcours :* *avec correspondance / escale*"
-    )
-
-def _summary_recap_lines(d: dict, lang_ui: str) -> list:
-    """Lignes récap pour le message « dossier prêt » (lisible sur WhatsApp)."""
-    lines = []
-    L = lambda fr, en: fr if lang_ui == "fr" else en
-    pax = d.get("passengers") or 1
-    lines.append(pax_recap_line(pax, lang_ui))
-    names = d.get("passenger_names") or []
-    if names:
-        joined = ", ".join(n.strip() for n in names[:8] if (n or "").strip())
-        if len(names) > 8:
-            joined += "…"
-        if joined:
-            lines.append(f"🪪 *{L('Noms sur le dossier', 'Names on file')} :* {joined}")
-    sh = d.get("early_route_shape")
-    if sh:
-        lines.append(_early_route_caption(sh, lang_ui))
-    code = d.get("expert_phone_lang")
-    if code:
-        lines.append(f"📞 *{L('Langue des experts (vocal)', 'Expert contact language')} :* {_expert_lang_display(code, lang_ui)}")
-    inc = d.get("incident_type")
-    if inc:
-        lab = INCIDENT_LABELS.get(inc) if lang_ui == "fr" else INCIDENT_LABELS_EN.get(inc)
-        if lab:
-            lines.append(f"⚖️ *{L('Incident déclaré', 'Reported disruption')} :* {lab}")
-    if d.get("airline"):
-        lines.append(f"🛫 *{L('Compagnie', 'Airline')} :* {d['airline']}")
-    if d.get("operating_airline"):
-        lines.append(f"🔧 *{L('Exploitant (si différent)', 'Operating carrier (if different)')} :* {d['operating_airline']}")
-    if d.get("flight_number"):
-        lines.append(f"🔢 *{L('N° de vol', 'Flight no.')} :* {d['flight_number']}")
-    if d.get("flight_date"):
-        lines.append(f"📅 *{L('Date du vol', 'Flight date')} :* {d['flight_date']}")
-    if d.get("pnr"):
-        lines.append(f"🎫 *PNR :* {str(d['pnr']).strip().upper()}")
-    it = (d.get("itinerary") or "").strip()
-    if it:
-        lines.append(f"🌍 *{L('Itinéraire', 'Itinerary')} :* {it}")
-    return lines
-
-# PNR / record locator : certaines compagnies utilisent 4 caractères alphanumériques.
-MIN_PNR_LEN = 4
-
-def fresh_data(lang="fr"):
-    return {
-        "lang": lang,
-        "passengers": None,
-        "incident_type": None,
-        "airline": None,
-        "pnr": None,
-        "flight_number": None,
-        "flight_date": None,
-        "temp_year": None,
-        "temp_month": None,
-        "temp_years": [],
-        "passenger_names": [],
-        "pax_collect_idx": 1,
-        "has_minors": None,
-        "itinerary": None,
-        "itin_collect_mode": None,  # "connection" | "rt_out" | "rt_in" | "rt_both"
-        "claim_rt_leg": None,  # "outbound" | "return" | "both" (choix utilisateur)
-        "vision_leg_hint": None,  # indice lecture billet (outbound|return|unknown)
-        "itinerary_compl_note": None,  # 2e segment saisi après « | »
-        "temp_itin_dep": None,
-        "pending_ticket_dm": None,  # ("DD","MM") si jour/mois lus sur billet sans année
-        "operating_airline": None,  # compagnie qui exploite le vol si ≠ commercial (code-share)
-        "boarding_evidence_in_flow": False,  # carte / billet reçu pendant le tunnel (relances post-dépôt)
-        "early_route_shape": None,  # "direct" | "connection" (dès le choix du nombre de passagers)
-        "expert_phone_lang": None,  # code langue vocaux / suivi (fr,en,wo,tw,yo,sw,pt,ar,ha,ma)
-    }
-
-def normalize_phone_key(phone):
-    """Clé stable pour conversations (évite 336… vs +336…)."""
-    return re.sub(r"\D", "", str(phone or ""))
-
-def get_conv(phone):
-    phone = normalize_phone_key(phone)
-    now = datetime.now()
-    if phone in conversations:
-        if (now - conversations[phone]["created"]) > timedelta(hours=MEMORY_HOURS):
-            try:
-                lang = conversations[phone].get("data", {}).get("lang", "fr")
-                st = conversations[phone].get("step")
-                if st and st != "completed":
-                    send(
-                        phone,
-                        (
-                            "⏱️ *Votre session a expiré* (24 h sans activité). Le dossier en cours a été effacé — vous pouvez recommencer en envoyant *menu* ou le nombre de passagers."
-                            if lang == "fr"
-                            else "⏱️ *Your session expired* (24h idle). The in-progress claim was cleared — send *menu* or your passenger count to start again."
-                        )
-                        + site_mandat_links_footer(lang),
-                    )
-            except Exception as e:
-                print(f"get_conv expiry notify: {e}")
-            del conversations[phone]
+def get_or_create_conversation(phone):
     if phone not in conversations:
         conversations[phone] = {
-            "step": None,
-            "ref":  None,
-            "data": fresh_data(),
-            "created": now,
+            "messages":     [],
+            "current_step": None,
+            "data": {
+                "route_zone":        None,  # "africa_europe" / "europe" / "depart_europe" / "other"
+                "incident_type":     None,  # "delay" / "cancel" / "denied"
+                "delay_ok":          None,  # True / False
+                "passengers":        None,
+                "passenger_names":   [],
+                "current_pax_index": 0,
+                "flight_number":     None,
+                "airline":           None,
+                "operating_airline": None,  # exploitant réel si ≠ marketing (codeshare)
+                "codeshare_note":    None,
+                "marketing_carrier_iata": None,
+                "operating_carrier_iata": None,
+                "pnr":               None,
+                "flight_date":       None,
+                "flight_type":       None,  # "direct" / "connection"
+                "route":             None,
+                "has_minors":        None,
+                "minors_count":      0,
+                "minor_names":       [],
+                "passports_collected":  [],
+                "boarding_collected":   False,
+                "ebillet_collected":    False,
+                "certificat_collected": False,
+                "docs_intro_sent":      False,
+                "relance_count":     0,
+                "boarding_pass_confirmed": False,
+                "scanned_docs":      [],
+                "scan_pax_index":    0,
+                "language":          "fr",
+                "preferred_language": None,
+                "stat_variant":      None,
+                "temp_year":         None,
+                "temp_month":        None,
+                "dossier_status":    "en_cours",
+                # en_cours / non_eligible / escalade_expert / docs_en_attente / mandat_envoye / complet
+                "non_eligibility_reason": None,
+                "escalade_reason":   None,
+            },
+            "created": datetime.now(),
+            "last_activity": datetime.now(),
         }
+    if (datetime.now() - conversations[phone]["created"]) > timedelta(hours=MEMORY_HOURS):
+        del conversations[phone]
+        return get_or_create_conversation(phone)
     return conversations[phone]
 
-# ===== HELPERS =====
 
-def make_ref(phone):
+def touch_activity(conv):
+    """Met à jour le timestamp d'activité (pour relance d'abandon)."""
+    conv["last_activity"] = datetime.now()
+
+
+def generate_ref_dossier(phone):
     today  = datetime.now().strftime("%Y%m%d")
     suffix = hashlib.md5(f"{phone}{today}".encode()).hexdigest()[:4].upper()
     return f"RDA-{today}-{suffix}"
 
-def calc_amounts(pax, band="band_600"):
-    per_pax = EU261_BANDS.get(band, EU261_BANDS["band_600"])["amount_eur"]
-    brut    = per_pax * pax
-    net     = round(brut * NET_PCT)
-    com     = round(brut * COMMISSION_PCT)
-    return brut, net, com, per_pax
 
-def fmt_money_space(n):
-    """Montants entiers avec espaces milliers (ex. 1 350)."""
-    n = int(round(n))
-    neg = n < 0
-    s = str(abs(n))
-    parts = []
-    while len(s) > 3:
-        parts.insert(0, s[-3:])
-        s = s[:-3]
-    if s:
-        parts.insert(0, s)
-    r = " ".join(parts)
-    return ("-" if neg else "") + r
+def _mandat_wa_display(phone):
+    p = str(phone or "").strip().replace(" ", "")
+    if not p: return ""
+    if p.startswith("+"): return p
+    if p.startswith("00"): return "+" + p[2:]
+    if p.isdigit(): return "+" + p
+    return p
 
-def _pax_int(pax):
-    try:
-        n = int(pax or 1)
-    except (TypeError, ValueError):
-        n = 1
-    return max(1, n)
 
-def pax_count_phrase(pax, lang):
-    """« 1 passager » / « 3 passagers » (FR ou EN)."""
-    n = _pax_int(pax)
-    if lang == "en":
-        return f"{n} passenger" if n == 1 else f"{n} passengers"
-    return f"{n} passager" if n == 1 else f"{n} passagers"
+def _mandat_fn_ln_from_names(names):
+    if not names: return "", ""
+    first = (names[0] or "").strip()
+    parts = first.split()
+    if len(parts) >= 2:
+        return parts[0], " ".join(parts[1:]).upper()
+    return "", ""
 
-def pax_registered_ack(pax, lang):
-    """Message court après choix du nombre (accord singulier/pluriel)."""
-    n = _pax_int(pax)
-    if lang == "en":
-        return f"✅ *{pax_count_phrase(n, 'en').capitalize()} registered.*"
-    if n == 1:
-        return "✅ *1 passager enregistré.*"
-    return f"✅ *{n} passagers enregistrés.*"
 
-def pax_names_confirm_heading(pax, lang, partial=False, n_done=0):
-    """Titre de l’étape confirmation des noms."""
-    n = _pax_int(pax)
-    nd = int(n_done or 0)
-    if partial:
-        if lang == "en":
-            if n == 1:
-                return "👥 *Check the passenger*"
-            return f"👥 *Check passengers 1–{nd}* (of {n})"
-        if n == 1:
-            return "👥 *Vérifiez le passager*"
-        return f"👥 *Vérifiez les passagers 1 à {nd}* (sur {n})"
-    if lang == "en":
-        if n == 1:
-            return "👥 *1 passenger — confirm*"
-        return f"👥 *All {n} passengers — confirm*"
-    if n == 1:
-        return "👥 *1 passager — confirmez*"
-    return f"👥 *Les {n} passagers — confirmez*"
+def detect_language(text):
+    tl = text.lower()
+    en = sum(1 for w in ["hello","hi","the","my","flight","delay","delayed","cancel","yes","no","thanks"] if w in tl.split())
+    fr = sum(1 for w in ["bonjour","salut","le","mon","vol","retard","annul","oui","non","merci"] if w in tl.split())
+    return "en" if en > fr else "fr"
 
-def pax_recap_line(pax, lang):
-    """Ligne récap 👥 Passager(s) : N."""
-    n = _pax_int(pax)
-    if lang == "en":
-        label = "Passenger" if n == 1 else "Passengers"
+
+# ============================================
+# DEDUPLICATION
+# ============================================
+
+def _cleanup_dedup_caches(now):
+    for cache in [recent_event_ids, recent_payload_keys]:
+        to_del = [k for k, ts in cache.items() if (now - ts).total_seconds() > EVENT_ID_TTL_SECONDS]
+        for k in to_del: cache.pop(k, None)
+
+def _extract_event_id(data):
+    if not isinstance(data, dict): return ""
+    candidates = [data.get("messageId"), data.get("id"), data.get("whatsappMessageId")]
+    for c in candidates:
+        if c: return str(c).strip()
+    return ""
+
+def is_duplicate_event(phone, data, payload_signature):
+    now = datetime.now()
+    _cleanup_dedup_caches(now)
+    event_id = _extract_event_id(data)
+    if event_id:
+        if event_id in recent_event_ids: return True
+        recent_event_ids[event_id] = now
+    sig = (payload_signature or "").strip()
+    if sig:
+        key = hashlib.sha256(f"{phone}|{sig.lower()}".encode()).hexdigest()
+        if key in recent_payload_keys:
+            if (now - recent_payload_keys[key]).total_seconds() < DEDUP_WINDOW_SECONDS: return True
+        recent_payload_keys[key] = now
+    return False
+
+def _conversation_step_for_phone(phone):
+    conv = conversations.get(phone)
+    return str(conv.get("current_step") or "none") if conv else "none"
+
+def _cleanup_outbound_cache(now):
+    to_del = [k for k, ts in recent_outbound_sends.items() if (now - ts).total_seconds() > OUTBOUND_CACHE_TTL_SECONDS]
+    for k in to_del: recent_outbound_sends.pop(k, None)
+
+def _outbound_should_block(phone, step, kind, fp):
+    now = datetime.now()
+    _cleanup_outbound_cache(now)
+    key = hashlib.sha256(f"{phone}|{step}|{kind}|{fp}".encode()).hexdigest()
+    if key in recent_outbound_sends:
+        if (now - recent_outbound_sends[key]).total_seconds() < OUTBOUND_DEDUP_SECONDS:
+            print(f"[OUTBOUND_SKIP] {phone} {step} {kind}")
+            return True
+    return False
+
+def _register_outbound_success(phone, step, kind, fp):
+    now = datetime.now()
+    _cleanup_outbound_cache(now)
+    key = hashlib.sha256(f"{phone}|{step}|{kind}|{fp}".encode()).hexdigest()
+    recent_outbound_sends[key] = now
+
+def _fp_text(msg): return hashlib.sha256(msg.strip().encode()).hexdigest()
+def _fp_buttons(body, buttons, hdr, ftr):
+    return hashlib.sha256(json.dumps({"body":body,"btns":[b.get("title","") for b in (buttons or [])]}, sort_keys=True).encode()).hexdigest()
+def _fp_list(body, label, sections, hdr, ftr):
+    return hashlib.sha256(json.dumps({"body":body,"label":label,"s":str(sections)}, sort_keys=True).encode()).hexdigest()
+
+
+# ============================================
+# WATI — ENVOI
+# ============================================
+
+def send_whatsapp_text(phone, message, *, skip_outbound_dedup=False):
+    message = message.strip()
+    if not message: return 0
+    step = _conversation_step_for_phone(phone)
+    fp   = _fp_text(message)
+    if not skip_outbound_dedup and _outbound_should_block(phone, step, "text", fp): return 429
+    url  = f"{WATI_BASE_URL}/api/v1/sendSessionMessage/{phone}"
+    hdrs = {"Authorization": f"Bearer {WATI_API_TOKEN}", "accept": "*/*"}
+    r = requests.post(url, headers=hdrs, params={"messageText": message}, timeout=30)
+    print(f"Wati TEXT: {r.status_code}")
+    if r.status_code == 200 and not skip_outbound_dedup:
+        _register_outbound_success(phone, step, "text", fp)
+    return r.status_code
+
+
+def send_whatsapp_buttons(phone, body_text, buttons, header_text=None, footer_text=None):
+    url  = f"{WATI_BASE_URL}/api/v1/sendInteractiveButtonsMessage"
+    hdrs = {"Authorization": f"Bearer {WATI_API_TOKEN}", "Content-Type": "application/json", "accept": "*/*"}
+    payload = {"body": body_text, "buttons": [{"text": b["title"]} for b in buttons[:3]]}
+    if header_text: payload["header"] = header_text
+    if footer_text: payload["footer"] = footer_text
+    step = _conversation_step_for_phone(phone)
+    fp   = _fp_buttons(body_text, buttons, header_text, footer_text)
+    if _outbound_should_block(phone, step, "buttons", fp): return 429
+    r = requests.post(url, headers=hdrs, params={"whatsappNumber": phone}, json=payload, timeout=30)
+    print(f"Wati BUTTONS: {r.status_code} - {r.text[:150]}")
+    if r.status_code != 200:
+        fallback = body_text + "\n\n" + "\n".join(f"{i+1}. {b['title']}" for i, b in enumerate(buttons))
+        fallback += "\n\nRépondez avec le numéro de votre choix."
+        send_whatsapp_text(phone, fallback, skip_outbound_dedup=True)
     else:
-        label = "Passager" if n == 1 else "Passagers"
-    return f"👥 *{label} :* {n}"
+        _register_outbound_success(phone, step, "buttons", fp)
+    return r.status_code
 
-def pax_minors_intro(pax, lang):
-    """Intro question mineurs selon le nombre de passagers."""
-    n = _pax_int(pax)
+
+def send_whatsapp_list(phone, body_text, button_label, sections, header_text=None, footer_text=None):
+    url  = f"{WATI_BASE_URL}/api/v1/sendInteractiveListMessage"
+    hdrs = {"Authorization": f"Bearer {WATI_API_TOKEN}", "Content-Type": "application/json", "accept": "*/*"}
+    normalized = []
+    for sec in sections:
+        rows = []
+        for row in sec.get("rows", []):
+            rid = row.get("id") or row.get("rowId") or ""
+            rows.append({"id": rid, "rowId": rid, "title": row.get("title",""), "description": row.get("description","")})
+        normalized.append({"title": sec.get("title",""), "rows": rows})
+    payload = {"body": body_text, "buttonText": button_label, "sections": normalized}
+    if header_text: payload["header"] = header_text
+    if footer_text: payload["footer"] = footer_text
+    step = _conversation_step_for_phone(phone)
+    fp   = _fp_list(body_text, button_label, sections, header_text, footer_text)
+    if _outbound_should_block(phone, step, "list", fp): return 429
+    r = requests.post(url, headers=hdrs, params={"whatsappNumber": phone}, json=payload, timeout=30)
+    print(f"Wati LIST: {r.status_code} - {r.text[:150]}")
+    if r.status_code != 200:
+        fallback = body_text + "\n\n"
+        idx = 1
+        for sec in sections:
+            for row in sec["rows"]:
+                fallback += f"{idx}. {row['title']}\n"
+                idx += 1
+        fallback += "\nRépondez avec le numéro de votre choix."
+        send_whatsapp_text(phone, fallback, skip_outbound_dedup=True)
+    else:
+        _register_outbound_success(phone, step, "list", fp)
+    return r.status_code
+
+
+# ============================================
+# OPENAI
+# ============================================
+
+def call_openai(phone, user_message, image_data=None):
+    try:
+        conv = get_or_create_conversation(phone)
+        if image_data:
+            user_content = [
+                {"type": "text", "text": user_message or "Voici mon document de voyage"},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
+            ]
+            conv["messages"].append({"role": "user", "content": user_content})
+        else:
+            conv["messages"].append({"role": "user", "content": user_message})
+        if len(conv["messages"]) > 20:
+            conv["messages"] = conv["messages"][-20:]
+        system = (
+            "Tu es l'assistant IA de ROBIN DES AIRS, spécialiste indemnisation vols Afrique-Europe.\n\n"
+            "RÈGLES ABSOLUES :\n"
+            "- Réponses COURTES : 2-3 phrases maximum, jamais plus\n"
+            "- Toujours 2-3 emojis par message, ton friendly et chaleureux\n"
+            "- Jamais de listes à puces longues, jamais de paragraphes\n"
+            "- Toujours finir par rediriger vers le flux : 'Tapez *menu* pour démarrer 👇' ou 'Tapez *menu* pour reprendre 👇'\n"
+            "- Si question complexe ou juridique : 'Je laisse ça à notre expert 🙏 Tapez *menu* et on s'en occupe 👇'\n\n"
+            "INFOS CLÉS (à utiliser si pertinent) :\n"
+            "- 600€/passager, vols Afrique-Europe ou départ Europe\n"
+            "- 25% commission uniquement si succès\n"
+            "- 5 ans de rétroactivité\n"
+            "- Retard minimum : 3h à l'arrivée\n"
+        )
+        messages = [{"role": "system", "content": system}] + conv["messages"]
+        model = "gpt-4o" if image_data else "gpt-4o-mini"
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={"model": model, "messages": messages, "max_tokens": 150, "temperature": 0.7},
+            timeout=45
+        )
+        data = response.json()
+        if "choices" in data:
+            text = data["choices"][0]["message"]["content"].strip()
+            conv["messages"].append({"role": "assistant", "content": text})
+            return text
+        return None
+    except Exception as e:
+        print(f"OpenAI error: {e}")
+        return None
+
+
+# ============================================
+# LANGUES — LISTE + MESSAGES NATIFS
+# ============================================
+
+LANGUAGE_SECTIONS = [
+    {
+        "title": "🌍 Langues européennes",
+        "rows": [
+            {"id": "lang_fr", "title": "🇫🇷 Français"},
+            {"id": "lang_en", "title": "🇬🇧 English"},
+        ]
+    },
+    {
+        # Langues actives — classées par nb de locuteurs
+        "title": "🌍 Langues africaines",
+        "rows": [
+            {"id": "lang_yo",       "title": "🇳🇬 Yoruba"},        # ~50M locuteurs
+            {"id": "lang_lingala",  "title": "🇨🇩 Lingala"},       # ~40M
+            {"id": "lang_wo",       "title": "🇸🇳 Wolof"},         # ~12M
+            {"id": "lang_twi",      "title": "🇬🇭 Twi"},           # ~9M
+            {"id": "lang_mandinka", "title": "🇬🇲 Mandinka"},      # ~5M
+        ]
+    },
+    {
+        # Langues à venir — classées par nb de locuteurs
+        "title": "⏳ Bientôt disponibles",
+        "rows": [
+            {"id": "lang_soon_swahili",  "title": "🇰🇪 Swahili (bientôt)"},     # ~200M
+            {"id": "lang_soon_bambara",  "title": "🇲🇱 Bambara (bientôt)"},     # ~14M
+            {"id": "lang_soon_dioula",   "title": "🇨🇮 Dioula (bientôt)"},      # ~12M
+            {"id": "lang_soon_sonike",   "title": "🇸🇳 Soninké (bientôt)"},     # ~2M
+        ]
+    },
+]
+
+EXPERT_MSG = {
+    # Langues actives
+    "wo":       "🇸🇳 Dëkk sa Wolof, bëgg na la wax — expert bi dafa di xam Wolof, dafa di waxleen ci kanam. 🤝\n📱 +33 7 56 86 36 30",
+    "mandinka": "🇬🇲 An b'i Mandinka kalan — expert be i sɔrɔ ka kuma Mandinka la. 🤝\n📱 +33 7 56 86 36 30",
+    "twi":      "🇬🇭 Yɛte wo Twi kasa — obi nyansafo bɛfrɛ wo Twi so. 🤝\n📱 +33 7 56 86 36 30",
+    "yo":       "🇳🇬 A gbọ Yorùbá rẹ — akọwe wa yóò pe yín ní Yorùbá. 🤝\n📱 +33 7 56 86 36 30",
+    "lingala":  "🇨🇩 Toyebi lingala — moto ya biso akobeta yo telefone na lingala. 🤝\n📱 +33 7 56 86 36 30",
+}
+
+# Langues "bientôt" — message d'attente
+COMING_SOON_MSG = {
+    "fr": (
+        "⏳ *Cette langue arrive bientôt chez Robin des Airs !*\n\n"
+        "En attendant, un expert francophone prend en charge votre dossier. 🤝\n"
+        "Je continue à vous guider en français 👇"
+    ),
+    "en": (
+        "⏳ *This language is coming soon to Robin des Airs!*\n\n"
+        "In the meantime, a French-speaking expert handles your file. 🤝\n"
+        "Let me continue guiding you in French 👇"
+    ),
+}
+
+
+# ============================================
+# FLUX — FONCTIONS D'ENVOI
+# ============================================
+
+def send_welcome_hook(phone, conv):
+    """MSG 1 — Accroche commerciale + stat choc + bouton."""
+    lang = conv["data"].get("language", "fr")
+    if conv["data"].get("stat_variant") is None:
+        conv["data"]["stat_variant"] = random.randrange(len(STAT_VARIANTS))
+    idx = conv["data"]["stat_variant"]
+
     if lang == "en":
-        if n == 1:
-            return "For the passenger below, is anyone under 18?"
-        return "Among the passengers listed below, are any minors (under 18)?"
-    if n == 1:
-        return "Pour le passager ci-dessous, s’agit-il d’un mineur (moins de 18 ans) ?"
-    return "Parmi les passagers suivants, y a-t-il des mineurs (moins de 18 ans) ?"
+        stat = STAT_VARIANTS_EN[idx % len(STAT_VARIANTS_EN)]
+        body = with_bar("welcome", (
+            "👋 *Welcome to Robin des Airs* 🏹\n"
+            "*Specialists in delayed or cancelled African flights.*\n\n"
+            f"*\"{stat}\"*\n\n"
+            "✈️ EU law CE 261/2004 entitles you to *€600 per person*:\n"
+            "• All flights *departing from Europe* (any airline)\n"
+            "• Flights *arriving in Europe* with a *European airline*\n\n"
+            "*€0 if we don't win. No risk for you.*"
+        ))
+        buttons = [{"id": "start_check", "title": "🚀 Check my compensation"}]
+    else:
+        stat = STAT_VARIANTS[idx % len(STAT_VARIANTS)]
+        body = with_bar("welcome", (
+            "👋 *Bienvenue chez Robin des Airs* 🏹\n"
+            "*Spécialiste des vols africains retardés ou annulés.*\n\n"
+            f"*\"{stat}\"*\n\n"
+            "✈️ La loi européenne CE 261/2004 vous donne droit à *600 € par personne* "
+            "pour les vols :\n"
+            "• *Au départ de l'Europe* — toutes compagnies confondues\n"
+            "• *Vers l'Europe* — si la compagnie est européenne\n\n"
+            "*0€ si on ne gagne pas. Aucun risque pour vous.*"
+        ))
+        buttons = [{"id": "start_check", "title": "🚀 Vérifier mon indemnité"}]
+    send_whatsapp_buttons(phone, body, buttons)
+
+
+def ask_language(phone):
+    """MSG 2 — Choix de la langue."""
+    body = with_bar("language", (
+        "🌍 *Dans quelle langue souhaitez-vous être accompagné(e) ?*\n\n"
+        "Chez Robin des Airs, nous parlons votre langue — il est toujours plus facile de s'expliquer dans sa langue maternelle. 🤝\n\n"
+        "*In which language would you like to be assisted?*"
+    ))
+    sections = LANGUAGE_SECTIONS
+    send_whatsapp_list(phone, body, "Choisir 🌍", sections)
+
+
+def ask_route_qualify(phone, lang="fr"):
+    """MSG 3 — Qualification route (4 boutons reformulés)."""
+    if lang == "en":
+        body = with_bar("route_qualify", "🗺️ Where was your flight?\n\nThis determines if EU regulation CE 261/2004 applies.")
+        buttons = [
+            {"id": "zone_africa_europe", "title": "🌍 Africa ↔ Europe — our specialty"},
+            {"id": "zone_europe",        "title": "🇪🇺 Europe ↔ Europe"},
+            {"id": "zone_depart_europe", "title": "🛫 Departure/arrival in Europe"},
+            {"id": "zone_other",         "title": "🌐 Other"},
+        ]
+    else:
+        body = with_bar("route_qualify", "🗺️ Votre vol était sur quelle route ?\n\nCela détermine si le règlement européen CE 261/2004 s'applique.")
+        buttons = [
+            {"id": "zone_africa_europe", "title": "🌍 Afrique ↔ Europe — notre spécialité"},
+            {"id": "zone_europe",        "title": "🇪🇺 Europe ↔ Europe"},
+            {"id": "zone_depart_europe", "title": "🛫 Départ ou arrivée en Europe"},
+            {"id": "zone_other",         "title": "🌐 Autre"},
+        ]
+    # WhatsApp = max 3 boutons → on bascule en liste si 4
+    if len(buttons) > 3:
+        rows = [{"id": b["id"], "title": b["title"][:24], "description": ""} for b in buttons]
+        sections = [{"title": "Route", "rows": rows}]
+        send_whatsapp_list(phone, body, "Choisir 🗺️" if lang == "fr" else "Choose 🗺️", sections)
+    else:
+        send_whatsapp_buttons(phone, body, buttons)
+
+
+def ask_incident_type(phone, lang="fr"):
+    """MSG 4 — Type d'incident."""
+    if lang == "en":
+        body = with_bar("incident_type", "✈️ What happened with your flight?")
+        buttons = [
+            {"id": "inc_delay",  "title": "⏱️ Delay at arrival"},
+            {"id": "inc_cancel", "title": "❌ Cancellation"},
+            {"id": "inc_denied", "title": "🚫 Denied boarding"},
+        ]
+    else:
+        body = with_bar("incident_type", "✈️ Que s'est-il passé avec votre vol ?")
+        buttons = [
+            {"id": "inc_delay",  "title": "⏱️ Retard à l'arrivée"},
+            {"id": "inc_cancel", "title": "❌ Annulation"},
+            {"id": "inc_denied", "title": "🚫 Refus d'embarquement"},
+        ]
+    send_whatsapp_buttons(phone, body, buttons)
+
+
+def ask_delay_duration(phone, lang="fr"):
+    """MSG 4 — Durée retard (uniquement si retard)."""
+    if lang == "en":
+        body = with_bar("delay_duration", "⏱️ How many hours late were you at *arrival* ?")
+        buttons = [
+            {"id": "delay_3plus",   "title": "✅ More than 3 hours"},
+            {"id": "delay_lt3",     "title": "❌ Less than 3 hours"},
+            {"id": "delay_unknown", "title": "🤔 I'm not sure"},
+        ]
+    else:
+        body = with_bar("delay_duration", "⏱️ De combien d'heures était le retard à l'*arrivée* ?")
+        buttons = [
+            {"id": "delay_3plus",   "title": "✅ Plus de 3 heures"},
+            {"id": "delay_lt3",     "title": "❌ Moins de 3 heures"},
+            {"id": "delay_unknown", "title": "🤔 Je ne sais plus"},
+        ]
+    send_whatsapp_buttons(phone, body, buttons)
+
+
+def send_estimation(phone, conv):
+    """MSG 4 — Estimation générique (route inconnue à ce stade)."""
+    lang = conv["data"]["language"]
+    d    = conv["data"]
+    incident_labels = {
+        "delay":  "retard +3h"           if lang=="fr" else "delay +3h",
+        "cancel": "annulation"           if lang=="fr" else "cancellation",
+        "denied": "refus d'embarquement" if lang=="fr" else "denied boarding",
+    }
+    incident = incident_labels.get(d.get("incident_type",""), "incident")
+    if lang == "en":
+        msg = f"💡 Your flight with {incident} = potentially *€600 per passenger*. Let's continue!"
+    else:
+        msg = f"💡 Votre vol avec {incident} = potentiellement *600€ par passager*. Continuons !"
+    send_whatsapp_text(phone, with_bar("passengers", msg))
+    time.sleep(1)
+
+
+def ask_passengers(phone, lang="fr"):
+    """MSG 5 — Nombre de passagers (AVANT scan)."""
+    if lang == "en":
+        body  = with_bar("passengers", "👥 How many passengers are claiming on this flight?")
+        label = "Select 👥"
+    else:
+        body  = with_bar("passengers", "👥 Combien de passagers réclament sur ce vol ?")
+        label = "Choisir 👥"
+    sections = [{"title": "Passagers", "rows": [
+        {"id": "pax_1", "title": "1 passager" if lang=="fr" else "1 passenger", "description": "= 600 €"},
+        {"id": "pax_2", "title": "2 passagers" if lang=="fr" else "2 passengers","description": "= 1 200 €"},
+        {"id": "pax_3", "title": "3 passagers" if lang=="fr" else "3 passengers","description": "= 1 800 €"},
+        {"id": "pax_4", "title": "4 passagers" if lang=="fr" else "4 passengers","description": "= 2 400 €"},
+        {"id": "pax_5", "title": "5 passagers" if lang=="fr" else "5 passengers","description": "= 3 000 €"},
+        {"id": "pax_more","title":"6 ou plus" if lang=="fr" else "6 or more",   "description": "Dossier prioritaire" if lang=="fr" else "Priority file"},
+    ]}]
+    send_whatsapp_list(phone, body, label, sections)
+
+
+def ask_flight_type(phone, conv):
+    """MSG 6 — Direct ou escale (AVANT scan)."""
+    lang = conv["data"]["language"]
+    if lang == "en":
+        body    = with_bar("flight_type", "✈️ Was it a direct flight or with connection(s)?")
+        buttons = [
+            {"id": "type_direct",     "title": "✈️ Direct flight"},
+            {"id": "type_connection", "title": "🔄 With connection"},
+        ]
+    else:
+        body    = with_bar("flight_type", "✈️ C'était un vol direct ou avec escale(s) ?")
+        buttons = [
+            {"id": "type_direct",     "title": "✈️ Vol direct"},
+            {"id": "type_connection", "title": "🔄 Avec escale"},
+        ]
+    send_whatsapp_buttons(phone, body, buttons)
+
+
+def send_motivation(phone, conv):
+    """MSG 7 — Motivation + 25% (montant calculé avec nb pax connu)."""
+    lang  = conv["data"]["language"]
+    pax   = conv["data"]["passengers"]
+    total = 600 * pax
+    net   = int(total * 0.75)
+    if lang == "en":
+        msg = (
+            f"🎉 *{pax} passenger(s) = up to {total} € in compensation!*\n\n"
+            f"💶 You receive *{net} € net* (75%).\n"
+            f"Robin des Airs takes *25% success fee — only if we win.*\n"
+            f"If you receive nothing → we charge nothing.\n\n"
+            f"*Our interest is yours.* 🤝"
+        )
+    else:
+        msg = (
+            f"🎉 *{pax} passager(s) = jusqu'à {total} € d'indemnité !*\n\n"
+            f"💶 Vous percevez *{net} € nets* (75%).\n"
+            f"Robin des Airs prélève *25% de frais de succès — uniquement si nous obtenons le paiement.*\n"
+            f"Si vous ne touchez rien → nous ne touchons rien.\n\n"
+            f"*Notre intérêt est donc le vôtre.* 🤝"
+        )
+    send_whatsapp_text(phone, with_bar("flight_type", msg))
+    time.sleep(1)
+
+
+def ask_document(phone, conv):
+    """MSG 8 — Scan document (on sait combien de passagers)."""
+    lang = conv["data"]["language"]
+    pax  = conv["data"].get("passengers", 1)
+    if pax > 1:
+        scan_hint_fr = f"\n\n👥 Vous êtes *{pax} passagers* — on vous demandera la carte de chacun, un par un."
+        scan_hint_en = f"\n\n👥 You are *{pax} passengers* — we'll ask for each boarding pass, one by one."
+    else:
+        scan_hint_fr = scan_hint_en = ""
+    if lang == "en":
+        msg = with_bar("document", (
+            "⚡ *Let's save you time!*\n\n"
+            "Send a photo of your *boarding pass* or your *booking confirmation (e-ticket)* "
+            "— our system reads the information automatically so you don't have to type everything."
+            f"{scan_hint_en}\n\n"
+            "📎 Send your document\n"
+            "✏️ Or type *manual* to enter the info yourself"
+        ))
+    else:
+        msg = with_bar("document", (
+            "⚡ *On va vous faire gagner du temps !*\n\n"
+            "Envoyez une photo de votre *carte d'embarquement* ou de votre *confirmation de réservation (e-billet)* "
+            "— notre système lit les informations automatiquement pour vous éviter de tout retaper."
+            f"{scan_hint_fr}\n\n"
+            "📎 Envoyez votre document\n"
+            "✏️ Ou tapez *manuel* pour saisir les infos vous-même"
+        ))
+    send_whatsapp_text(phone, msg)
+
+
+def ask_scan_next_passenger(phone, conv):
+    """MSG 8 — Scan multi-passagers : demande le document du passager suivant."""
+    lang  = conv["data"]["language"]
+    pax   = conv["data"].get("passengers", 1)
+    idx   = conv["data"].get("scan_pax_index", 0)
+    num   = idx + 1
+    if lang == "en":
+        msg = with_bar("document", (
+            f"📸 *Passenger {num} of {pax}* — Send this passenger's boarding pass.\n"
+            f"✏️ Type *skip* if you already sent it or if the info is identical."
+        ))
+    else:
+        msg = with_bar("document", (
+            f"📸 *Passager {num} sur {pax}* — Envoyez la carte d'embarquement de ce passager.\n"
+            f"✏️ Tapez *passer* si vous l'avez déjà envoyée ou si les infos sont identiques."
+        ))
+    send_whatsapp_text(phone, msg)
+
+
+def _sort_scanned_docs(conv):
+    """Trie les docs scannés par heure de départ (ordre chronologique vol 1 → vol 2)."""
+    docs = conv["data"].get("scanned_docs", [])
+    if len(docs) <= 1:
+        return
+    def sort_key(d):
+        # Essayer date + heure de départ
+        dep = (d.get("departure_time") or d.get("date") or "").strip()
+        try:
+            # Formats possibles : "15/03/2023 06:30" ou "15/03/2023" ou "06:30"
+            for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y", "%H:%M"):
+                try: return datetime.strptime(dep, fmt)
+                except ValueError: pass
+        except Exception:
+            pass
+        return datetime.min
+    docs.sort(key=sort_key)
+    conv["data"]["scanned_docs"] = docs
+    # Mettre à jour route complète (vol 1 origine → ... → vol N destination)
+    origins = [d.get("origin","") for d in docs if d.get("origin")]
+    dests   = [d.get("destination","") for d in docs if d.get("destination")]
+    if origins and dests:
+        if len(docs) > 1:
+            # Route multi-segments : CDG → CMN → DSS
+            waypoints = [origins[0]] + [d.get("destination","") for d in docs]
+            conv["data"]["route"] = " → ".join(w for w in waypoints if w)
+        else:
+            conv["data"]["route"] = f"{origins[0]} → {dests[0]}"
+
+
+def _advance_after_scan(phone, conv):
+    """Après scan(s), passe à la collecte des noms/vol/date manquants."""
+    pax   = conv["data"].get("passengers", 1)
+    names = conv["data"].get("passenger_names", []) or []
+    if len(names) < pax:
+        # Reprendre la collecte des noms manquants
+        conv["data"]["current_pax_index"] = len(names)
+        conv["current_step"] = "passenger_collect"
+        ask_next_passenger(phone, conv)
+    else:
+        _after_names_collected(phone, conv)
+
+
+def _after_names_collected(phone, conv):
+    """Une fois tous les noms connus → vol & date (si manquants) puis mineurs."""
+    if conv["data"].get("flight_number"):
+        if conv["data"].get("flight_date"):
+            conv["current_step"] = "minor_check"
+            ask_minors(phone, conv)
+        else:
+            conv["current_step"] = "flight_date"
+            ask_flight_date(phone, conv)
+    else:
+        conv["current_step"] = "flight_number"
+        ask_flight_number(phone, conv)
+
+
+def ask_next_passenger(phone, conv):
+    """MSG 9 — Collecte passagers un par un (noms)."""
+    lang  = conv["data"]["language"]
+    pax   = conv["data"]["passengers"]
+    idx   = conv["data"].get("current_pax_index", 0)
+
+    if idx >= pax:
+        _after_names_collected(phone, conv)
+        return
+
+    num = idx + 1
+    if lang == "en":
+        msg = f"👤 *Passenger {num} of {pax}* — First name and last name?\n_(eg: John Doe)_"
+    else:
+        msg = f"👤 *Passager {num} sur {pax}* — Prénom et nom ?\n_(ex : Jean Dupont)_"
+    send_whatsapp_text(phone, with_bar("passenger_collect", msg))
+
+
+def confirm_passenger(phone, conv, name):
+    """Confirme le nom saisi pour un passager."""
+    lang = conv["data"]["language"]
+    idx  = conv["data"].get("current_pax_index", 0)
+    num  = idx + 1
+    if lang == "en":
+        body = with_bar("passenger_confirm", f"✅ Passenger {num}: *{name}*\nIs this correct?")
+        buttons = [
+            {"id": "pax_confirm_yes", "title": "✅ Yes, correct"},
+            {"id": "pax_confirm_no",  "title": "✏️ Correct it"},
+        ]
+    else:
+        body = with_bar("passenger_confirm", f"✅ Passager {num} : *{name}*\nC'est correct ?")
+        buttons = [
+            {"id": "pax_confirm_yes", "title": "✅ Oui, correct"},
+            {"id": "pax_confirm_no",  "title": "✏️ Corriger"},
+        ]
+    send_whatsapp_buttons(phone, body, buttons)
+
+
+def ask_flight_number(phone, conv):
+    """MSG 10 — Numéro de vol."""
+    lang = conv["data"]["language"]
+    if lang == "en":
+        msg = with_bar("flight_number", (
+            "📝 What is your *flight number* as shown on your ticket?\n\n"
+            "_(eg: AF718, KL563, SN271)_\n\n"
+            "ℹ️ This is the commercial number — use it even for codeshare flights.\n\n"
+            "📸 You can also send a photo of your boarding pass."
+        ))
+    else:
+        msg = with_bar("flight_number", (
+            "📝 Quel est le *numéro de vol* tel qu'il apparaît sur votre billet ?\n\n"
+            "_(ex : AF718, KL563, SN271)_\n\n"
+            "ℹ️ C'est le numéro commercial — utilisez-le même en cas de code share.\n\n"
+            "📸 Vous pouvez aussi envoyer une photo de votre carte d'embarquement."
+        ))
+    send_whatsapp_text(phone, msg)
+
+
+def confirm_flight_number(phone, conv, flight_number, airline):
+    """Confirme le numéro de vol et la compagnie déduite."""
+    lang = conv["data"]["language"]
+    if airline:
+        if lang == "en":
+            body = f"✅ Flight *{flight_number}* — *{airline}*\nIs this correct?"
+        else:
+            body = f"✅ Vol *{flight_number}* — *{airline}*\nC'est correct ?"
+    else:
+        if lang == "en":
+            body = f"✅ Flight *{flight_number}*\nIs this correct?"
+        else:
+            body = f"✅ Vol *{flight_number}*\nC'est correct ?"
+    buttons = [
+        {"id": "fn_confirm_yes", "title": "✅ Oui" if lang=="fr" else "✅ Yes"},
+        {"id": "fn_confirm_no",  "title": "✏️ Corriger" if lang=="fr" else "✏️ Correct it"},
+    ]
+    send_whatsapp_buttons(phone, with_bar("flight_number_confirm", body), buttons)
+
+
+def ask_flight_date(phone, conv):
+    """MSG 10 — Date du vol (saisie libre)."""
+    lang = conv["data"]["language"]
+    if lang == "en":
+        msg = "📅 What was the *date of the flight*?\n\n_(eg: 15/03/2023 or March 15 2023)_"
+    else:
+        msg = "📅 Quelle était la *date du vol* ?\n\n_(ex : 15/03/2023 ou 15 mars 2023)_"
+    send_whatsapp_text(phone, with_bar("flight_date", msg))
+
+
+def confirm_flight_date(phone, conv, date_str):
+    """Confirme la date saisie."""
+    lang = conv["data"]["language"]
+    if lang == "en":
+        body = f"✅ Date: *{date_str}*\nIs this correct?"
+    else:
+        body = f"✅ Date : *{date_str}*\nC'est correct ?"
+    buttons = [
+        {"id": "date_confirm_yes", "title": "✅ Oui" if lang=="fr" else "✅ Yes"},
+        {"id": "date_confirm_no",  "title": "✏️ Corriger" if lang=="fr" else "✏️ Correct it"},
+    ]
+    send_whatsapp_buttons(phone, with_bar("flight_date_confirm", body), buttons)
+
+
+def ask_minors(phone, conv):
+    """MSG 11 — Mineurs."""
+    lang = conv["data"]["language"]
+    pax  = conv["data"]["passengers"]
+    if pax == 1:
+        if lang == "en":
+            body    = with_bar("minor_check", "👤 Are you over 18 years old?")
+            buttons = [
+                {"id": "minor_no",   "title": "✅ Yes, adult"},
+                {"id": "minor_self", "title": "👶 No, I'm a minor"},
+            ]
+        else:
+            body    = with_bar("minor_check", "👤 Êtes-vous majeur(e) (18+ ans) ?")
+            buttons = [
+                {"id": "minor_no",   "title": "✅ Oui, majeur(e)"},
+                {"id": "minor_self", "title": "👶 Non, je suis mineur(e)"},
+            ]
+    else:
+        if lang == "en":
+            body    = with_bar("minor_check", f"👶 Among the {pax} passengers, are there any minors (under 18)?")
+            buttons = [
+                {"id": "minor_no",  "title": "✅ All adults"},
+                {"id": "minor_yes", "title": "👶 Yes, some minors"},
+            ]
+        else:
+            body    = with_bar("minor_check", f"👶 Parmi les {pax} passagers, y a-t-il des mineurs (moins de 18 ans) ?")
+            buttons = [
+                {"id": "minor_no",  "title": "✅ Tous majeurs"},
+                {"id": "minor_yes", "title": "👶 Oui, des mineurs"},
+            ]
+    send_whatsapp_buttons(phone, body, buttons)
+
+
+def ask_minor_select(phone, conv):
+    """Demande lesquels des passagers sont mineurs — liste de noms."""
+    lang  = conv["data"]["language"]
+    names = conv["data"].get("passenger_names", [])
+    if lang == "en":
+        body  = with_bar("minor_check", "👶 Which passengers are minors (under 18)?\n\nSelect each minor one by one and type *done* when finished.")
+        label = "Select minor"
+    else:
+        body  = with_bar("minor_check", "👶 Lesquels des passagers sont mineurs (moins de 18 ans) ?\n\nSélectionnez-les un par un et tapez *ok* quand c'est fini.")
+        label = "Choisir mineur"
+    rows = [{"id": f"minor_pax_{i}", "title": names[i], "description": "👶 Mineur" if lang=="fr" else "👶 Minor"} for i in range(len(names))]
+    sections = [{"title": "Passagers", "rows": rows}]
+    send_whatsapp_list(phone, body, label, sections)
+
+
+def _estimate_docs_time(conv):
+    """Estime le temps total de collecte des documents en minutes."""
+    pax = conv["data"].get("passengers", 1)
+    has_boarding = conv["data"].get("boarding_pass_confirmed", False)
+    minutes = pax * 0.5 + 0.5
+    if not has_boarding:
+        minutes += 0.5
+    return max(1, round(minutes))
+
+
+def ask_passport(phone, conv):
+    """MSG 13 — Séquence docs : intro puis passeports un par un."""
+    lang = conv["data"]["language"]
+
+    if not conv["data"].get("docs_intro_sent"):
+        conv["data"]["docs_intro_sent"] = True
+        mins = _estimate_docs_time(conv)
+        if lang == "en":
+            intro = with_bar("passport_collect", (
+                f"📁 *Documents — last step before your file is complete!*\n\n"
+                f"We need a few photos to build your official claim.\n"
+                f"*Estimated time : {mins} minute(s).*\n\n"
+                f"Everything is stored securely. 🔒"
+            ))
+        else:
+            intro = with_bar("passport_collect", (
+                f"📁 *Documents — dernière étape avant que votre dossier soit complet !*\n\n"
+                f"Nous avons besoin de quelques photos pour constituer votre dossier officiel.\n"
+                f"*Temps estimé : {mins} minute(s).*\n\n"
+                f"Tout est conservé en sécurité. 🔒"
+            ))
+        send_whatsapp_text(phone, intro)
+        time.sleep(1)
+
+    _ask_passport_next(phone, conv)
+
+
+def _ask_passport_next(phone, conv):
+    """Demande le prochain passeport."""
+    lang      = conv["data"]["language"]
+    names     = conv["data"].get("passenger_names", [])
+    passports = conv["data"].get("passports_collected", [])
+    idx       = len(passports)
+    total     = conv["data"].get("passengers", 1)
+
+    if idx >= total:
+        conv["current_step"] = "boarding_collect"
+        ask_boarding_collect(phone, conv)
+        return
+
+    name = names[idx] if idx < len(names) else f"Passager {idx+1}"
+    if lang == "en":
+        msg = with_bar("passport_collect", (
+            f"🛂 *Passport {idx+1}/{total} — {name}*\n\n"
+            f"Send a photo of the *photo page* of {name}'s passport.\n\n"
+            f"✏️ Type *skip* to send later by email."
+        ))
+    else:
+        msg = with_bar("passport_collect", (
+            f"🛂 *Passeport {idx+1}/{total} — {name}*\n\n"
+            f"Envoyez une photo de la *page photo* du passeport de {name}.\n\n"
+            f"✏️ Tapez *passer* pour l'envoyer plus tard par email."
+        ))
+    send_whatsapp_text(phone, msg)
+
+
+def ask_boarding_collect(phone, conv):
+    """Demande carte d'embarquement comme justificatif (si pas déjà scannée)."""
+    lang = conv["data"]["language"]
+    if conv["data"].get("boarding_pass_confirmed"):
+        conv["data"]["boarding_collected"] = True
+        conv["current_step"] = "ebillet_collect"
+        ask_ebillet(phone, conv)
+        return
+    if lang == "en":
+        msg = with_bar("boarding_collect", (
+            "🎫 *Boarding pass — proof of travel*\n\n"
+            "Send a photo of your *boarding pass* for the delayed/cancelled flight.\n\n"
+            "📧 No boarding pass? Your *booking confirmation email* works too.\n"
+            "✏️ Type *skip* to send later by email.\n"
+            "📞 Type *appel* if you've lost everything — an expert helps you."
+        ))
+    else:
+        msg = with_bar("boarding_collect", (
+            "🎫 *Carte d'embarquement — justificatif de voyage*\n\n"
+            "Envoyez une photo de votre *carte d'embarquement* pour le vol retardé/annulé.\n\n"
+            "📧 Pas de carte ? Votre *email de confirmation de réservation* fonctionne aussi.\n"
+            "✏️ Tapez *passer* pour l'envoyer plus tard par email.\n"
+            "📞 Tapez *appel* si vous avez tout perdu — un expert vous aide."
+        ))
+    send_whatsapp_text(phone, msg)
+
+
+def ask_ebillet(phone, conv):
+    """Demande confirmation de réservation (e-billet)."""
+    lang = conv["data"]["language"]
+    if lang == "en":
+        msg = with_bar("ebillet_collect", (
+            "📧 *Booking confirmation (e-ticket) — proof of travel*\n\n"
+            "Send a screenshot of your *booking confirmation email*.\n"
+            "_(Check your inbox, spam folder, or travel app like Booking/Expedia)_\n\n"
+            "✏️ Type *skip* to send later.\n"
+            "📞 Type *call* if you can't find it — an expert helps you retrieve it."
+        ))
+    else:
+        msg = with_bar("ebillet_collect", (
+            "📧 *Confirmation de réservation (e-billet) — justificatif de voyage*\n\n"
+            "Envoyez une capture d'écran de votre *email de confirmation de réservation*.\n"
+            "_(Vérifiez votre boîte mail, spams, ou votre appli voyage Booking/Expedia)_\n\n"
+            "✏️ Tapez *passer* pour l'envoyer plus tard.\n"
+            "📞 Tapez *appel* si vous ne trouvez pas — un expert vous aide à le récupérer."
+        ))
+    send_whatsapp_text(phone, msg)
+
+
+def ask_certificat_retard(phone, conv):
+    """Demande optionnelle du certificat de retard."""
+    lang = conv["data"]["language"]
+    if lang == "en":
+        msg = with_bar("certificat_collect", (
+            "📄 *Delay/cancellation certificate* _(optional)_\n\n"
+            "If the airline gave you a certificate, send it — it speeds up your case.\n\n"
+            "✏️ Type *skip* if you don't have one _(most common)_."
+        ))
+    else:
+        msg = with_bar("certificat_collect", (
+            "📄 *Certificat de retard/annulation* _(optionnel)_\n\n"
+            "Si la compagnie vous a remis un certificat, envoyez-le — il accélère votre dossier.\n\n"
+            "✏️ Tapez *passer* si vous n'en avez pas _(cas le plus fréquent)_."
+        ))
+    send_whatsapp_text(phone, msg)
+
+
+def show_recap(phone, conv):
+    """MSG 12 — Récapitulatif complet modifiable."""
+    lang = conv["data"]["language"]
+    d    = conv["data"]
+    pax  = d["passengers"]
+    net  = int(600 * pax * 0.75)
+
+    incident_labels = {
+        "delay":  "Retard +3h"          if lang=="fr" else "Delay +3h",
+        "cancel": "Annulation"           if lang=="fr" else "Cancellation",
+        "denied": "Refus d'embarquement" if lang=="fr" else "Denied boarding",
+    }
+    incident = incident_labels.get(d.get("incident_type",""), d.get("incident_type","?"))
+    names_str = ", ".join(d.get("passenger_names") or ["—"])
+    route_str = f"\n🗺️ {d.get('route')}" if d.get("route") else ""
+    op_str    = ""
+    if d.get("operating_airline") and d["operating_airline"].strip().lower() != (d.get("airline") or "").strip().lower():
+        op_label = "Operated by" if lang == "en" else "Opéré par"
+        op_str = f"\n🔧 {op_label} : {d['operating_airline']} (codeshare)"
+    ft_str    = ("Direct" if d.get("flight_type")=="direct" else "Avec escale") if lang=="fr" else ("Direct" if d.get("flight_type")=="direct" else "With connection")
+
+    if lang == "en":
+        recap = with_bar("recap", (
+            f"📋 *Summary — please confirm*\n\n"
+            f"👥 {pax} passenger(s): {names_str}\n"
+            f"✈️ {d.get('flight_number','?')} — {d.get('airline','?')}{op_str}{route_str}\n"
+            f"📅 {d.get('flight_date','?')} — {incident}\n"
+            f"🛤️ {ft_str}\n"
+            f"💵 *Target: {net} € net (75%)*"
+        ))
+        buttons = [
+            {"id": "recap_ok",     "title": "✅ All correct"},
+            {"id": "recap_modify", "title": "✏️ Modify"},
+        ]
+    else:
+        recap = with_bar("recap", (
+            f"📋 *Récapitulatif — confirmez svp*\n\n"
+            f"👥 {pax} passager(s) : {names_str}\n"
+            f"✈️ {d.get('flight_number','?')} — {d.get('airline','?')}{op_str}{route_str}\n"
+            f"📅 {d.get('flight_date','?')} — {incident}\n"
+            f"🛤️ {ft_str}\n"
+            f"💵 *Objectif : {net} € nets (75%)*"
+        ))
+        buttons = [
+            {"id": "recap_ok",     "title": "✅ Tout est correct"},
+            {"id": "recap_modify", "title": "✏️ Modifier"},
+        ]
+    send_whatsapp_buttons(phone, recap, buttons)
+
+
+def ask_what_to_modify(phone, lang="fr"):
+    """Menu de modification."""
+    if lang == "en":
+        body  = with_bar("recap_modify", "✏️ What would you like to modify?")
+        label = "Choose"
+    else:
+        body  = with_bar("recap_modify", "✏️ Que souhaitez-vous modifier ?")
+        label = "Choisir"
+    sections = [{"title": "Modifier", "rows": [
+        {"id": "mod_names",    "title": "👤 Noms passagers"   if lang=="fr" else "👤 Passenger names"},
+        {"id": "mod_flight",   "title": "✈️ Numéro de vol"    if lang=="fr" else "✈️ Flight number"},
+        {"id": "mod_date",     "title": "📅 Date du vol"      if lang=="fr" else "📅 Flight date"},
+        {"id": "mod_incident", "title": "⚡ Type d'incident"  if lang=="fr" else "⚡ Incident type"},
+        {"id": "mod_route",    "title": "🗺️ Trajet"           if lang=="fr" else "🗺️ Route"},
+    ]}]
+    send_whatsapp_list(phone, body, label, sections)
+
+
+def send_rgpd(phone, lang="fr"):
+    """MSG 14 — RGPD / CGV (juste avant le mandat)."""
+    if lang == "en":
+        rgpd = with_bar("rgpd", (
+            "🔒 *Your privacy first — before signing.*\n\n"
+            "Your documents are used *solely* to claim your compensation from the airline. "
+            "They are never sold or shared with commercial third parties. "
+            "You can request their deletion at any time.\n\n"
+            "By continuing you accept our:\n"
+            "• *Privacy policy* : robindesairs.eu/politique-confidentialite.html\n"
+            "• *Terms & Conditions* : robindesairs.eu/cgv.html"
+        ))
+    else:
+        rgpd = with_bar("rgpd", (
+            "🔒 *Avant la signature, votre vie privée d'abord.*\n\n"
+            "Vos documents servent *uniquement* à réclamer votre indemnité auprès de la compagnie. "
+            "Ils ne sont jamais vendus ni partagés à des tiers commerciaux. "
+            "Vous pouvez demander leur suppression à tout moment.\n\n"
+            "En continuant, vous acceptez notre :\n"
+            "• *Politique de confidentialité* : robindesairs.eu/politique-confidentialite.html\n"
+            "• *Conditions Générales de Vente* : robindesairs.eu/cgv.html"
+        ))
+    send_whatsapp_text(phone, rgpd)
+    time.sleep(1)
+
+
+def send_ia_fallback(phone, lang="fr"):
+    """Fallback IA — client écrit hors flux."""
+    if lang == "en":
+        body = (
+            "🤖 I'm the AI assistant of *Robin des Airs*.\n\n"
+            "I can answer your questions about your rights ✈️\n\n"
+            "To open your file, tap *menu* 👇\n"
+            "Or would you prefer an *expert to call you back*?"
+        )
+        buttons = [
+            {"id": "start_check",  "title": "📋 Start my file"},
+            {"id": "rappel_expert","title": "📞 Be called back"},
+        ]
+    else:
+        body = (
+            "🤖 Je suis l'assistant IA de *Robin des Airs*.\n\n"
+            "Je peux répondre à vos questions sur vos droits ✈️\n\n"
+            "Pour ouvrir votre dossier, tapez *menu* 👇\n"
+            "Ou préférez-vous qu'un *expert vous rappelle* ?"
+        )
+        buttons = [
+            {"id": "start_check",  "title": "📋 Démarrer mon dossier"},
+            {"id": "rappel_expert","title": "📞 Être rappelé"},
+        ]
+    send_whatsapp_buttons(phone, body, buttons)
+
+
+def _resume_step(phone, conv):
+    """Renvoie la question correspondant à l'étape en cours (reprise après abandon)."""
+    step = conv.get("current_step")
+    lang = conv["data"].get("language", "fr")
+
+    if step == "welcome":
+        send_welcome_hook(phone, conv)
+    elif step == "language":
+        ask_language(phone)
+    elif step == "route_qualify":
+        ask_route_qualify(phone, lang)
+    elif step == "incident_type":
+        ask_incident_type(phone, lang)
+    elif step == "delay_duration":
+        ask_delay_duration(phone, lang)
+    elif step == "passengers":
+        ask_passengers(phone, lang)
+    elif step == "flight_type":
+        ask_flight_type(phone, conv)
+    elif step in ("document", "doc_confirm", "doc_correction", "trip_select"):
+        ask_document(phone, conv)
+    elif step in ("passenger_collect", "passenger_confirm"):
+        ask_next_passenger(phone, conv)
+    elif step in ("flight_number", "flight_number_confirm"):
+        ask_flight_number(phone, conv)
+    elif step in ("flight_date", "flight_date_confirm"):
+        ask_flight_date(phone, conv)
+    elif step == "minor_check":
+        ask_minors(phone, conv)
+    elif step == "minor_select":
+        ask_minor_select(phone, conv)
+    elif step in ("passport_collect",):
+        ask_passport(phone, conv)
+    elif step == "boarding_collect":
+        ask_boarding_collect(phone, conv)
+    elif step == "ebillet_collect":
+        ask_ebillet(phone, conv)
+    elif step == "certificat_collect":
+        ask_certificat_retard(phone, conv)
+    elif step in ("recap", "recap_modify", "route_input"):
+        show_recap(phone, conv)
+    elif step in ("rgpd", "summary"):
+        show_summary_and_mandat(phone, conv)
+    else:
+        conv["current_step"] = "welcome"
+        send_welcome_hook(phone, conv)
+
+
+def show_summary_and_mandat(phone, conv):
+    """MSG 14 — RGPD puis Mandat pré-rempli + annonce expert humain (TOUT À LA FIN)."""
+    lang = conv["data"]["language"]
+    d    = conv["data"]
+    pax  = d["passengers"]
+    net  = int(600 * pax * 0.75)
+
+    send_rgpd(phone, lang)
+
+    ref  = conv.get("ref_dossier") or generate_ref_dossier(phone)
+    conv["ref_dossier"] = ref
+
+    fn0, ln0   = _mandat_fn_ln_from_names(d.get("passenger_names") or [])
+    name       = f"{fn0} {ln0}".strip() or (d.get("passenger_names") or ["—"])[0]
+    wa_disp    = _mandat_wa_display(phone)
+    names_joined = ",".join(d.get("passenger_names") or [])
+    motif_map  = {"delay": "Retard de vol", "cancel": "Annulation de vol", "denied": "Refus d'embarquement"}
+
+    params = {
+        "ref":       ref,
+        "phone":     wa_disp,
+        "name":      name,
+        "vol":       (d.get("flight_number") or "").strip(),
+        "date":      (d.get("flight_date")   or "").strip(),
+        "compagnie": (d.get("airline")        or "").strip(),
+        "motif":     motif_map.get(d.get("incident_type",""), "Retard de vol"),
+        "nbpax":     str(pax),
+        "source":    "whatsapp",
+    }
+    if names_joined and pax > 1:
+        params["paxlist"] = names_joined
+    mandat_url = f"{MANDAT_BASE_URL.split('?')[0]}?{urlencode({k:v for k,v in params.items() if v})}"
+    conv["mandat_url"] = mandat_url
+
+    incident_labels = {
+        "delay":  "Retard +3h"          if lang=="fr" else "Delay +3h",
+        "cancel": "Annulation"           if lang=="fr" else "Cancellation",
+        "denied": "Refus d'embarquement" if lang=="fr" else "Denied boarding",
+    }
+    incident  = incident_labels.get(d.get("incident_type",""), "?")
+    route_str = f"\n🗺️ {d.get('route')}" if d.get("route") else ""
+    op_str    = ""
+    if d.get("operating_airline") and d["operating_airline"].strip().lower() != (d.get("airline") or "").strip().lower():
+        op_label = "Operated by" if lang == "en" else "Opéré par"
+        op_str = f"\n🔧 {op_label} : {d['operating_airline']} (codeshare)"
+
+    if lang == "en":
+        msg_a = with_bar("summary", (
+            f"🎉 *File registered!* Ref. *{ref}*\n\n"
+            f"👤 {name}\n"
+            f"✈️ {d.get('flight_number','?')} — {d.get('airline','?')}{op_str}{route_str}\n"
+            f"📅 {d.get('flight_date','?')} — {incident}\n"
+            f"💵 *Target: {net} € net*\n\n"
+            f"Last step: sign your mandate in *2 minutes*."
+        ))
+        msg_b = with_bar("completed", (
+            f"✅ *File {ref}*\n\n"
+            f"Sign your *representation mandate* (readable before signing).\n"
+            f"*No bank details* asked at this step.\n\n"
+            f"👉 {mandat_url}\n\n"
+            f"Without signature we cannot act on your behalf.\n\n"
+            f"_Robin des Airs team_ 🏹"
+        ))
+    else:
+        msg_a = with_bar("summary", (
+            f"🎉 *Dossier enregistré !* Réf. *{ref}*\n\n"
+            f"👤 {name}\n"
+            f"✈️ {d.get('flight_number','?')} — {d.get('airline','?')}{op_str}{route_str}\n"
+            f"📅 {d.get('flight_date','?')} — {incident}\n"
+            f"💵 *Objectif : {net} € nets*\n\n"
+            f"Dernière étape : signez le mandat en *2 minutes*."
+        ))
+        msg_b = with_bar("completed", (
+            f"✅ *Dossier {ref}*\n\n"
+            f"Signez votre *mandat de représentation* (lisible avant signature).\n"
+            f"*Aucune information bancaire* demandée à cette étape.\n\n"
+            f"👉 {mandat_url}\n\n"
+            f"Sans signature nous ne pouvons pas agir en votre nom.\n\n"
+            f"_L'équipe Robin des Airs_ 🏹"
+        ))
+
+    # Airtable — récap validé (avant documents déjà fait), ici avant mandat
+    upsert_airtable(phone, conv)
+
+    send_whatsapp_text(phone, msg_a)
+    time.sleep(3)
+    send_whatsapp_text(phone, msg_b)
+    conv["data"]["dossier_status"] = "mandat_envoye"
+    # Airtable — statut mandat envoyé + amorce relances post-soumission
+    upsert_airtable(phone, conv)
+    _arm_post_submit(phone, conv)
+
+    time.sleep(5)
+    ref = conv.get("ref_dossier", "")
+    if lang == "en":
+        msg_c = (
+            f"🎉 *File {ref} — received!*\n\n"
+            f"We have everything we need. Our team is taking over your claim against the airline.\n\n"
+            f"⏱️ You'll receive an update within *48 working hours*.\n\n"
+            f"Thank you for your trust. *Robin des Airs team* 🏹"
+        )
+    else:
+        msg_c = (
+            f"🎉 *Dossier {ref} — bien reçu !*\n\n"
+            f"Nous avons tout ce qu'il nous faut. Notre équipe prend en charge votre réclamation contre la compagnie aérienne.\n\n"
+            f"⏱️ Vous recevrez une mise à jour sous *48h ouvrées*.\n\n"
+            f"Merci de votre confiance. *L'équipe Robin des Airs* 🏹"
+        )
+    send_whatsapp_text(phone, msg_c)
+
+    # Annonce expert humain — fin étape 14
+    time.sleep(2)
+    if lang == "en":
+        msg_d = (
+            "🤝 *At Robin des Airs, support is human.*\n\n"
+            "Your file is now in the hands of an expert. They will contact you to follow every step until payment.\n\n"
+            "*The AI opens the file. The human wins it.* 🏹"
+        )
+    else:
+        msg_d = (
+            "🤝 *Chez Robin des Airs, l'accompagnement est humain.*\n\n"
+            "Votre dossier est maintenant entre les mains d'un expert. Il vous contactera pour suivre chaque étape jusqu'au paiement.\n\n"
+            "*L'IA ouvre le dossier. L'humain le gagne.* 🏹"
+        )
+    send_whatsapp_text(phone, msg_d)
+
+    conv["current_step"] = "completed"
+    conv["data"]["dossier_status"] = "complet"
+
+    passports = conv["data"].get("passports_collected", [])
+    any_pp_skipped = any(p.get("skipped") for p in passports)
+    boarding_missing = (not conv["data"].get("boarding_collected")
+                        and not conv["data"].get("boarding_pass_confirmed"))
+    if any_pp_skipped or boarding_missing:
+        conv["data"]["dossier_status"] = "docs_en_attente"
+
+    # Airtable — statut final
+    upsert_airtable(phone, conv)
+
+
+# ============================================
+# AIRTABLE + CODESHARE + POST-SOUMISSION (repris/adapté du v11)
+# ============================================
+
+def at_headers():
+    return {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
+
+def at_url():
+    return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AT_TABLE_ID}"
 
 def fmt_date_for_airtable(date_str):
     """JJ/MM/AAAA → AAAA-MM-JJ"""
     parts = (date_str or "").split("/")
-    if len(parts) == 3:
-        return f"{parts[2]}-{parts[1]}-{parts[0]}"
+    if len(parts) == 3 and len(parts[2]) == 4:
+        return f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
     return None
 
-def detect_lang(text):
-    en = ["hello", "hi", "my", "flight", "delay", "yes", "no", "thanks", "cancel"]
-    fr = ["bonjour", "salut", "mon", "vol", "retard", "oui", "non", "merci", "annul"]
-    t  = text.lower()
-    if sum(1 for w in en if w in t) > sum(1 for w in fr if w in t):
-        return "en"
-    return "fr"
+def _calc_amounts(pax):
+    pax = max(1, int(pax or 1))
+    brut = 600 * pax
+    net  = round(brut * NET_PCT)
+    com  = round(brut * COMMISSION_PCT)
+    return brut, net, com
 
-def is_dup(phone, data, sig, step):
-    now    = datetime.now()
-    to_del = [k for k, ts in recent_event_ids.items() if (now - ts).total_seconds() > 900]
-    for k in to_del:
-        recent_event_ids.pop(k, None)
-    eid = data.get("messageId") or data.get("id") or data.get("whatsappMessageId")
-    if eid:
-        if eid in recent_event_ids:
-            return True
-        recent_event_ids[eid] = now
-    key = hashlib.sha256(f"{phone}|{sig}|{step}".encode()).hexdigest()
-    if key in recent_event_ids and (now - recent_event_ids[key]).total_seconds() < 25:
-        return True
-    recent_event_ids[key] = now
-    return False
-
-# ===== WATI =====
-
-def send(phone, msg):
-    msg = msg.strip()
-    if not msg:
-        return False
-    conv = conversations.get(phone)
-    pre = tunnel_progress_prefix(conv) if conv else ""
-    if pre:
-        first_line = msg.split("\n", 1)[0]
-        if not _first_line_looks_like_tunnel_progress_bar(first_line):
-            msg = pre + msg
-    if not WATI_API_TOKEN or not WATI_BASE_URL:
-        print("send: WATI_API_TOKEN ou WATI_BASE_URL manquant", flush=True)
-        return False
-    wa = _norm_wa_number(phone)
-    if not wa:
-        print(f"send: numéro invalide {phone!r}", flush=True)
-        return False
-    url = f"{WATI_BASE_URL}/api/v1/sendSessionMessage/{wa}"
-    headers = {"Authorization": f"Bearer {WATI_API_TOKEN}", "accept": "*/*"}
+def at_find(ref):
+    """Trouve les records par Référence Dossier."""
+    if not AIRTABLE_API_KEY or not ref:
+        return []
     try:
-        r = requests.post(url, headers=headers, params={"messageText": msg}, timeout=30)
-        ok = 200 <= r.status_code < 300
-        if ok:
-            print(f"Wati send OK {r.status_code} → {wa}", flush=True)
-        else:
-            print(f"Wati send FAIL {r.status_code} → {wa}: {r.text[:400]}", flush=True)
-        return ok
+        esc     = ref.replace("'", "''")
+        formula = f"{{{F_REF_DOSSIER}}}='{esc}'"
+        url     = f"{at_url()}?filterByFormula={requests.utils.quote(formula)}"
+        r       = requests.get(url, headers=at_headers(), timeout=10)
+        if r.status_code == 200:
+            return r.json().get("records", [])
+        print(f"at_find {r.status_code}: {r.text[:300]}")
     except Exception as e:
-        print(f"Wati send error → {wa}: {e}", flush=True)
-        return False
+        print(f"at_find error: {e}")
+    return []
 
-def _norm_wa_number(phone):
-    return re.sub(r"\D", "", str(phone or ""))
-
-def _norm_choice_key(s):
-    s = (s or "").strip().lower()
-    if not s:
-        return ""
-    s = unicodedata.normalize("NFD", s)
-    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
-    s = re.sub(r"[^\w\s]", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-def register_choice_map(conv, options):
-    """Associe libellés de boutons/liste WATI → id logique (« 1 », « 2 », …)."""
-    cmap = {}
-    for opt in options:
-        oid = str(opt["id"])
-        cmap[oid] = oid
-        for key in (opt.get("id"), opt.get("label"), opt.get("button"), opt.get("list_title")):
-            if not key:
-                continue
-            nk = _norm_choice_key(str(key))
-            if nk:
-                cmap[nk] = oid
-            short = str(key).strip()[:24]
-            if short:
-                cmap[_norm_choice_key(short)] = oid
-    conv.setdefault("data", {})["_choice_map"] = cmap
-
-def _iter_wati_interactive_reply_objects(data):
-    """Parcourt listReply / buttonReply (racine, champ data JSON, sous-objets)."""
-    if not isinstance(data, dict):
+def upsert_airtable(phone, conv):
+    """Sauvegarde progressive — crée ou met à jour les records Airtable (1 ligne / passager)."""
+    if not AIRTABLE_API_KEY:
+        print(f"❌ at: AIRTABLE_API_KEY manquant (tel={phone}, ref={conv.get('ref_dossier')})")
         return
-    seen = set()
-
-    def walk(node):
-        if not isinstance(node, dict) or id(node) in seen:
-            return
-        seen.add(id(node))
-        for field in (
-            "interactiveButtonReply",
-            "listReply",
-            "buttonReply",
-            "interactiveListReply",
-            "list_reply",
-        ):
-            obj = node.get(field)
-            if isinstance(obj, dict):
-                yield obj
-        inner = node.get("data")
-        if isinstance(inner, str) and inner.strip().startswith("{"):
-            try:
-                inner = json.loads(inner)
-            except (json.JSONDecodeError, TypeError):
-                inner = None
-        if isinstance(inner, dict):
-            walk(inner)
-        for key in ("reply", "context", "message", "interactive", "messageData"):
-            sub = node.get(key)
-            if isinstance(sub, dict):
-                yield from walk(sub)
-
-    yield from walk(data)
-
-
-def _has_wati_interactive(data):
-    if not isinstance(data, dict):
-        return False
-    if data.get("type") in ("button", "interactive", "list", "listReply"):
-        return True
-    if any(isinstance(data.get(f), dict) for f in ("interactiveButtonReply", "listReply", "buttonReply")):
-        return True
-    for _ in _iter_wati_interactive_reply_objects(data):
-        return True
-    return False
-
-
-def enrich_message_from_wati_interactive(data, message_text):
-    """Récupère le libellé du clic liste/bouton quand le champ text est vide."""
-    mt = (message_text or "").strip()
-    if mt:
-        return mt
-    if not isinstance(data, dict):
-        return mt
-    for obj in _iter_wati_interactive_reply_objects(data):
-        for key in ("id", "title", "text", "description", "rowId", "selectedRowId", "message"):
-            val = obj.get(key)
-            if val is not None and str(val).strip():
-                return str(val).strip()
-    top = (data.get("text") or "").strip()
-    if top and data.get("type") in ("interactive", "button", "list", "listReply"):
-        return top
-    return mt
-
-def _map_raw_to_choice_id(raw, cmap):
-    if not raw:
-        return None
-    if looks_like_full_date_input(raw):
-        return None
-    if raw in cmap:
-        return cmap[raw]
-    nk = _norm_choice_key(raw)
-    if nk in cmap:
-        return cmap[nk]
-    for k, v in cmap.items():
-        if len(k) >= 2 and (nk == k or nk.startswith(k) or k.startswith(nk)):
-            return v
-    m = re.match(r"^(\d{1,2})\s*(?:[·•.:\-–]|$|\s)", raw.strip())
-    if not m:
-        m = re.match(r"^(\d{1,2})\b", raw.strip())
-    if m:
-        digit = m.group(1)
-        if not cmap or digit in cmap:
-            return digit
-    return None
-
-def extract_poll_choice(conv, data, message_text):
-    """Réponse clic sondage WATI → id « 1 », « 2 », … (ou None)."""
-    if not isinstance(conv, dict):
-        return None
-    cmap = (conv.get("data") or {}).get("_choice_map") or {}
-    if not isinstance(cmap, dict):
-        cmap = {}
-    candidates = []
-    if message_text and str(message_text).strip():
-        candidates.append(str(message_text).strip())
-    if isinstance(data, dict):
-        for obj in _iter_wati_interactive_reply_objects(data):
-            for key in ("id", "title", "text", "description", "rowId", "selectedRowId", "message"):
-                val = obj.get(key)
-                if val is not None and str(val).strip():
-                    candidates.append(str(val).strip())
-        top = (data.get("text") or "").strip()
-        if top:
-            candidates.append(top)
-    for raw in candidates:
-        mapped = _map_raw_to_choice_id(raw, cmap)
-        if mapped:
-            return mapped
-    # Repli sans carte (redémarrage Railway) : chiffre 1–6 dans le libellé
-    for raw in candidates:
-        m = re.search(r"\b([1-6])\b", raw)
-        if m:
-            return m.group(1)
-    return None
-
-def resolve_tunnel_choice(conv, data, message_text):
-    """Choix tunnel : clic WATI puis repli chiffre en tête de texte."""
-    message_text = message_text or ""
-    c = extract_poll_choice(conv, data, message_text)
-    if c:
-        return c
-    if looks_like_full_date_input(message_text):
-        return None
-    for raw in [message_text] + list(
-        str(obj.get(k) or "")
-        for obj in _iter_wati_interactive_reply_objects(data or {})
-        for k in ("title", "id", "text", "description")
-    ):
-        if not raw or not str(raw).strip():
-            continue
-        m = re.match(r"^(\d{1,2})\s*(?:[·•.:\-–]|$|\s)", str(raw).strip())
-        if not m:
-            m = re.match(r"^(\d{1,2})\b", str(raw).strip())
-        if m:
-            return m.group(1)
-    return None
-
-def parse_wati_inbound_message(data):
-    """Texte + image depuis le webhook WATI (hors réponses interactives)."""
-    image_b64 = None
-    message_text = ""
-    if not isinstance(data, dict):
-        return message_text, image_b64
-    # Formats Wati courants (message reçu)
-    t = data.get("text")
-    if isinstance(t, str) and t.strip():
-        message_text = t.strip()
-    elif isinstance(t, dict):
-        message_text = (t.get("body") or t.get("text") or "").strip()
-    inner = data.get("data")
-    if not message_text and isinstance(inner, dict):
-        it = inner.get("text")
-        if isinstance(it, str):
-            message_text = it.strip()
-        elif isinstance(it, dict):
-            message_text = (it.get("body") or it.get("text") or "").strip()
-    if not message_text and isinstance(data.get("message"), dict):
-        mm = data["message"]
-        message_text = (mm.get("text") or mm.get("body") or "").strip()
-        if isinstance(message_text, dict):
-            message_text = (message_text.get("body") or "").strip()
-    if data.get("type") == "image" or data.get("image"):
-        media_url = data.get("data") or data.get("mediaUrl")
-        if media_url:
-            try:
-                r = requests.get(
-                    media_url,
-                    headers={"Authorization": f"Bearer {WATI_API_TOKEN}"},
-                    timeout=30,
-                )
-                if r.status_code == 200:
-                    image_b64 = base64.b64encode(r.content).decode()
-            except Exception:
-                pass
-        message_text = data.get("caption", "") or ""
-    else:
-        if isinstance(data.get("text"), dict):
-            message_text = data["text"].get("body", "") or ""
-        elif isinstance(data.get("text"), str):
-            message_text = data["text"]
-        elif data.get("body"):
-            body = data["body"]
-            if isinstance(body, dict):
-                message_text = body.get("body", "") or body.get("text", "") or ""
-            else:
-                message_text = str(body)
-    return (message_text or "").strip(), image_b64
-
-def _poll_body_with_progress(conv, body):
-    body = (body or "").strip()
-    pre = tunnel_progress_prefix(conv) if conv else ""
-    if pre:
-        fl = body.split("\n", 1)[0]
-        if not _first_line_looks_like_tunnel_progress_bar(fl):
-            body = pre + body
-    return body
-
-def send_wati_buttons(phone, body, button_texts, footer=None):
-    if not WATI_API_TOKEN or not WATI_BASE_URL:
-        return False
-    wa = _norm_wa_number(phone)
-    if not wa:
-        return False
-    payload = {
-        "body": (body or "")[:1024],
-        "buttons": [{"text": (t or "")[:20]} for t in button_texts[:3] if (t or "").strip()],
-    }
-    if footer:
-        payload["footer"] = footer[:60]
-    if not payload["buttons"]:
-        return False
-    url = f"{WATI_BASE_URL}/api/v1/sendInteractiveButtonsMessage"
-    headers = {"Authorization": f"Bearer {WATI_API_TOKEN}", "accept": "application/json"}
     try:
-        r = requests.post(
-            url, headers=headers, params={"whatsappNumber": wa}, json=payload, timeout=30
-        )
-        print(f"Wati buttons {r.status_code}")
-        return 200 <= r.status_code < 300
-    except Exception as e:
-        print(f"Wati buttons error: {e}")
-        return False
+        d   = conv["data"]
+        ref = conv.get("ref_dossier") or generate_ref_dossier(phone)
+        conv["ref_dossier"] = ref
 
-def send_wati_list(phone, body, button_text, rows, footer=None, header=None, section_title=None):
-    if not WATI_API_TOKEN or not WATI_BASE_URL:
-        return False
-    wa = _norm_wa_number(phone)
-    if not wa:
-        return False
-    section_rows = []
-    for row in rows[:10]:
-        title = (row.get("title") or "")[:24]
-        if not title:
-            continue
-        ent = {"title": title}
-        desc = (row.get("description") or "").strip()
-        if desc:
-            ent["description"] = desc[:72]
-        section_rows.append(ent)
-    if not section_rows:
-        return False
-    payload = {
-        "body": (body or "")[:1024],
-        "buttonText": (button_text or "Choisir")[:20],
-        "sections": [
-            {
-                "title": ((section_title or "Options")[:24]),
-                "rows": section_rows,
-            }
-        ],
-    }
-    if header:
-        payload["header"] = header[:60]
-    if footer:
-        payload["footer"] = footer[:60]
-    url = f"{WATI_BASE_URL}/api/v1/sendInteractiveListMessage"
-    headers = {"Authorization": f"Bearer {WATI_API_TOKEN}", "accept": "application/json"}
-    try:
-        r = requests.post(
-            url, headers=headers, params={"whatsappNumber": wa}, json=payload, timeout=30
-        )
-        print(f"Wati list {r.status_code}")
-        return 200 <= r.status_code < 300
-    except Exception as e:
-        print(f"Wati list error: {e}")
-        return False
+        pax   = d.get("passengers") or 1
+        names = d.get("passenger_names") or []
+        brut, net, com = _calc_amounts(pax)
 
-def send_tunnel_poll(phone, conv, body, options, footer=None, list_button_text=None, header=None):
-    """
-    Mode sondage : boutons (1–3 choix) ou liste WATI (4–10).
-    options: [{"id":"1", "label":"…", "button":"…", "list_title":"…", "desc":"…"}]
-    """
-    conv = conv or conversations.get(phone) or {"data": {}}
-    lang = (conv.get("data") or {}).get("lang", "fr")
-    body = _poll_body_with_progress(conv, body)
-    register_choice_map(conv, options)
-    if WATI_USE_INTERACTIVE and WATI_API_TOKEN and WATI_BASE_URL:
-        if 1 <= len(options) <= 3:
-            btns = [(o.get("button") or o.get("label") or str(o["id"]))[:20] for o in options]
-            if send_wati_buttons(phone, body, btns, footer=footer):
-                return True
-        if 4 <= len(options) <= 10:
-            rows = [
-                {
-                    "title": (o.get("list_title") or o.get("label") or str(o["id"]))[:24],
-                    "description": (o.get("desc") or "")[:72],
-                }
-                for o in options
-            ]
-            lbtn = (list_button_text or ("Choisir" if lang == "fr" else "Choose"))[:20]
-            if send_wati_list(phone, body, lbtn, rows, footer=footer, header=header):
-                return True
-    lines = "\n".join(f"{o['id']}️⃣  {o['label']}" for o in options)
-    hint = (
-        "\n\n👆 *Appuyez sur un bouton ou ouvrez la liste.*"
-        if lang == "fr"
-        else "\n\n👆 *Tap a button or open the list below.*"
-    )
-    send(phone, f"{body}\n\n{lines}{hint}")
-    return True
+        date_vol_at = fmt_date_for_airtable(d.get("flight_date") or "")
+        incident_at = INCIDENT_AT.get(d.get("incident_type") or "", "")
 
-def _gpt_hors_tunnel_format_rules(lang):
-    """Consignes de forme pour les réponses IA hors tunnel (step None ou completed)."""
-    if lang == "en":
-        return (
-            "Mandatory format: WhatsApp bullets starting with « • »; *each bullet line starts with one emoji* "
-            "(never a bullet without emoji). Use 2 to 6 short bullets; no long paragraphs."
-        )
-    return (
-        "Format obligatoire : puces WhatsApp « • » ; *chaque ligne commence par un emoji* "
-        "(jamais de puce sans emoji). 2 à 6 puces courtes ; pas de paragraphe long."
-    )
+        common = {
+            F_REF_DOSSIER:    ref,
+            F_DATE_DOSSIER:   datetime.now().strftime("%Y-%m-%d"),
+            F_WHATSAPP:       str(phone),
+            F_STATUT_DOSSIER: STATUT_DOSSIER_DEFAUT,
+            F_STATUT_SUIVI:   STATUT_SUIVI_DEFAUT,
+        }
+        if d.get("airline"):       common[F_COMPAGNIE]  = d["airline"]
+        if d.get("flight_number"): common[F_NUMERO_VOL] = d["flight_number"]
+        if date_vol_at:            common[F_DATE_VOL]    = date_vol_at
+        if d.get("pnr"):           common[F_PNR]         = str(d["pnr"]).strip().upper()
+        if incident_at:            common[F_TYPE_INCIDENT] = incident_at
+        if F_ITINERAIRE and d.get("route"):
+            common[F_ITINERAIRE] = str(d["route"])[:8000]
 
-def site_mandat_links_footer(lang="fr"):
-    """Liens courts hors tunnel — site et suivi (sans mandat / dépôt express en liste)."""
-    site = RDA_DOMAIN.rstrip("/")
-    if lang == "en":
-        return f"\n\n• 🌐 *Website:* {site}\n• 📂 *Track your file:* {SUIVI_URL}"
-    return f"\n\n• 🌐 *Site :* {site}\n• 📂 *Suivi dossier :* {SUIVI_URL}"
+        extra_bits = []
+        if d.get("route"):             extra_bits.append(f"Itinéraire: {d['route']}")
+        if d.get("codeshare_note"):    extra_bits.append(d["codeshare_note"])
+        if d.get("operating_airline"): extra_bits.append(f"Opéré par: {d['operating_airline']}")
+        if d.get("has_minors"):        extra_bits.append("Mineur(s): oui")
+        if d.get("dossier_status"):    extra_bits.append(f"Statut bot: {d['dossier_status']}")
+        rem_extra = (" | " + " ; ".join(extra_bits)) if extra_bits else ""
 
-# ===== RELANCES POST-DÉPÔT (mandat + pièces) =====
-# Fenêtre session WhatsApp / Meta : messages libres tant que last_user_inbound < META_SESSION_HOURS.
-# Après : uniquement templates (WATI_POST_SUBMIT_TEMPLATE_NAME + WATI_TEMPLATE_CHANNEL_NUMBER).
+        existing = at_find(ref)
 
-def touch_last_user_inbound(conv):
-    conv.setdefault("data", {})["last_user_inbound_at"] = datetime.now().isoformat(timespec="seconds")
-
-def session_message_allowed(conv):
-    raw = (conv.get("data") or {}).get("last_user_inbound_at")
-    if not raw:
-        return True
-    try:
-        last = datetime.fromisoformat(raw)
-    except Exception:
-        return True
-    return datetime.now() - last < timedelta(hours=META_SESSION_HOURS)
-
-def _first_name_from_conv(conv):
-    names = (conv.get("data") or {}).get("passenger_names") or []
-    if not names:
-        return ""
-    first = (names[0] or "").strip().split()
-    return first[0] if first else ""
-
-def _resume_mandat_link(phone, conv):
-    d = conv.get("data") or {}
-    ps = d.get("_post_submit") or {}
-    su = ps.get("short_sign_url")
-    if isinstance(su, str) and su.startswith("http"):
-        return su
-    params = ps.get("mandat_params")
-    if isinstance(params, dict) and params:
-        return mandat_signing_link(params)
-    ref = conv.get("ref") or make_ref(phone)
-    pax = d.get("passengers") or 1
-    names = d.get("passenger_names") or []
-    ph = re.sub(r"\D", "", str(phone or "")) or str(phone or "").strip()
-    params2 = {
-        "ref": ref,
-        "pax": pax,
-        "vol": d.get("flight_number", ""),
-        "date": d.get("flight_date", ""),
-        "compagnie": d.get("airline", ""),
-        "incident": d.get("incident_type", ""),
-        "noms": ",".join(names),
-        "source": "whatsapp_bot",
-    }
-    if d.get("pnr"):
-        params2["pnr"] = d["pnr"]
-    dep, arr, via = split_itinerary_for_mandat(d.get("itinerary") or "")
-    if dep:
-        params2["dep"] = dep
-    if arr:
-        params2["arr"] = arr
-    if via:
-        params2["esc1"] = via
-    if ph:
-        params2["phone"] = ph
-    if d.get("has_minors"):
-        params2["mineurs"] = "1"
-    return mandat_signing_link(params2)
-
-def _openai_doc_classify_available():
-    return bool((OPENAI_API_KEY or "").strip())
-
-def post_submit_mandate_satisfied(ps):
-    return bool(
-        ps.get("mandate_ack")
-        or ps.get("mandate_signed_server")
-        or ps.get("air_mandat_signed")
-    )
-
-def post_submit_id_satisfied(ps):
-    if ps.get("air_id_attachment"):
-        return True
-    if _openai_doc_classify_available():
-        return bool(ps.get("post_submit_has_id_image"))
-    # Sans vision : on ne devine pas la CNI à partir d’une carte d’embarquement seule.
-    return False
-
-def post_submit_boarding_satisfied(ps):
-    if not ps.get("needs_boarding_hint"):
-        return True
-    if ps.get("air_boarding_attachment"):
-        return True
-    if ps.get("post_submit_has_boarding_image"):
-        return True
-    n = int(ps.get("images_after_summary") or 0)
-    if not _openai_doc_classify_available():
-        return n >= 2
-    return False
-
-def post_submit_fully_done(conv):
-    d = conv.get("data") or {}
-    ps = d.get("_post_submit")
-    if not isinstance(ps, dict) or not ps.get("active"):
-        return True
-    refresh_post_submit_airtable_flags(conv)
-    # « C’est bon » / « tout envoyé » ne court-circuite plus le mandat ou la CNI.
-    return (
-        post_submit_mandate_satisfied(ps)
-        and post_submit_id_satisfied(ps)
-        and post_submit_boarding_satisfied(ps)
-    )
-
-def update_post_submit_inbound(phone, conv, message_text, image_b64):
-    """À l'étape completed : met à jour l'état des pièces / mandat pour arrêter les relances."""
-    d = conv.get("data") or {}
-    ps = d.get("_post_submit")
-    if not isinstance(ps, dict) or not ps.get("active"):
-        return
-    low = (message_text or "").lower()
-    if image_b64:
-        ps["images_after_summary"] = int(ps.get("images_after_summary") or 0) + 1
-        if _openai_doc_classify_available():
-            try:
-                info = read_boarding_pass_merged(image_b64)
-                if boarding_pass_info_usable(info):
-                    ps["post_submit_has_boarding_image"] = True
+        if not existing:
+            records = []
+            for i in range(pax):
+                f = dict(common)
+                f[F_NOM_PASSAGER] = names[i] if i < len(names) else f"Passager {i+1}"
+                f[F_REMARQUES]    = f"Ref: {ref} | Passager {i+1}/{pax} | Bot WhatsApp" + (rem_extra if i == 0 else "")
+                if i == 0:
+                    f[F_MONTANT_CLIENT]    = float(net)
+                    f[F_COMMISSION_RDA]    = float(com)
+                    f[F_MONTANT_INDEMNITE] = float(brut)
                 else:
-                    # Photo illisible ou autre doc : ne pas compter comme CNI automatiquement.
-                    ps["post_submit_has_unclassified_image"] = True
-            except Exception:
-                ps["post_submit_has_unclassified_image"] = True
-    if any(
-        x in low
-        for x in (
-            "signé",
-            "signe",
-            "signed",
-            "j'ai sign",
-            "mandat sign",
-            "mandat ok",
-            "signature faite",
-        )
-    ):
-        ps["mandate_ack"] = True
-    if any(
-        x in low
-        for x in (
-            "tout envoy",
-            "tout envoye",
-            "j'ai tout",
-            "terminé",
-            "termine",
-            "c'est bon",
-            "cest bon",
-            "all sent",
-            "everything sent",
-            "done everything",
-        )
-    ):
-        ps["user_declared_done"] = True
-    if post_submit_fully_done(conv):
-        ps["active"] = False
+                    f[F_MONTANT_CLIENT]    = 0.0
+                    f[F_COMMISSION_RDA]    = 0.0
+                    f[F_MONTANT_INDEMNITE] = 0.0
+                records.append({"fields": f})
+            r = requests.post(at_url(), headers=at_headers(), json={"records": records}, timeout=15)
+            if r.status_code in (200, 201):
+                print(f"✅ Airtable CREATE {pax} (ref={ref})")
+            else:
+                print(f"❌ Airtable CREATE {r.status_code}: {r.text[:400]}")
+        else:
+            updates = []
+            for i, rec in enumerate(existing[:pax]):
+                f = dict(common)
+                f[F_NOM_PASSAGER] = names[i] if i < len(names) else f"Passager {i+1}"
+                f[F_REMARQUES]    = f"Ref: {ref} | Passager {i+1}/{pax} | Bot WhatsApp" + (rem_extra if i == 0 else "")
+                if i == 0:
+                    f[F_MONTANT_CLIENT]    = float(net)
+                    f[F_COMMISSION_RDA]    = float(com)
+                    f[F_MONTANT_INDEMNITE] = float(brut)
+                updates.append({"id": rec["id"], "fields": f})
+            r = requests.patch(at_url(), headers=at_headers(), json={"records": updates}, timeout=15)
+            if r.status_code == 200:
+                print(f"✅ Airtable UPDATE {len(updates)} (ref={ref})")
+            else:
+                print(f"❌ Airtable PATCH {r.status_code}: {r.text[:400]}")
+    except Exception as e:
+        print(f"❌ Airtable exception: {e}")
+        import traceback
+        traceback.print_exc()
 
-def _post_submit_checklist(conv, lang, ref, net_s):
-    """Lignes ✅/❌ alignées sur la même logique que l'arrêt des relances."""
-    refresh_post_submit_airtable_flags(conv)
-    ps = conv.get("data", {}).get("_post_submit") or {}
-    d_m = post_submit_mandate_satisfied(ps)
-    d_id = post_submit_id_satisfied(ps)
-    need_b = bool(ps.get("needs_boarding_hint"))
-    d_bp = post_submit_boarding_satisfied(ps) if need_b else True
+# ===== UPLOAD PIÈCES JOINTES =====
 
-    def line(ok, fr, en):
-        return (f"{'✅' if ok else '❌'} *{fr}*" if lang == "fr" else f"{'✅' if ok else '❌'} *{en}*")
-
-    rows = [
-        line(True, "Infos du vol", "Flight details"),
-        line(True, "Calcul de l'indemnité", "Compensation estimate"),
-        line(d_m, "Signature du mandat", "Mandate signature"),
-        line(d_id, "Photo passeport / CNI", "Passport / ID photo"),
-    ]
-    if need_b:
-        rows.append(line(d_bp, "Carte d'embarquement / billet", "Boarding pass / ticket"))
-    return "\n".join(rows)
-
-def post_submit_after_image_ack(conv, lang):
-    """Retour court après envoi d’une photo en phase completed (évite « dossier reçu » ambigu)."""
-    refresh_post_submit_airtable_flags(conv)
-    ps = conv.get("data", {}).get("_post_submit") or {}
-    if not ps.get("active"):
+def _img_bytes(image_b64):
+    if not image_b64:
         return None
-    ref = (conv.get("ref") or "").strip()
-    ref_bit = f" ({ref})" if ref else ""
-    got_bp = post_submit_boarding_satisfied(ps)
-    got_id = post_submit_id_satisfied(ps)
-    got_m = post_submit_mandate_satisfied(ps)
-    if post_submit_fully_done(conv):
+    try:
+        return base64.b64decode(image_b64, validate=False)
+    except Exception:
         return None
-    if lang == "fr":
-        lines = [f"📎 *Pièce reçue{ref_bit}*"]
-        if ps.get("post_submit_has_boarding_image") or got_bp:
-            lines.append("• ✈️ Carte d’embarquement / billet noté")
-        if ps.get("post_submit_has_unclassified_image"):
-            lines.append(
-                "• 📷 Photo reçue — renvoyez une *CNI / passeport* lisible si ce n’était pas votre pièce d’identité"
-            )
-        missing = []
-        if not got_m:
-            missing.append("✍️ *Mandat signé* (lien envoyé plus haut)")
-        if not got_id:
-            missing.append("🪪 *Passeport ou CNI* en photo lisible")
-        if ps.get("needs_boarding_hint") and not got_bp:
-            missing.append("✈️ *Carte d’embarquement*")
-        if missing:
-            lines.append("• ⏳ *Il manque encore :*")
-            for m in missing:
-                lines.append(f"  • {m}")
-        lines.append("• ⚖️ Le dossier n’est *pas complet* tant que le mandat n’est pas signé")
-        return "\n".join(lines)
-    lines = [f"📎 *Document received{ref_bit}*"]
-    if ps.get("post_submit_has_boarding_image") or got_bp:
-        lines.append("• ✈️ Boarding pass / ticket noted")
-    if ps.get("post_submit_has_unclassified_image"):
-        lines.append("• 📷 Photo received — resend a clear *passport / ID* if that wasn’t ID")
-    missing = []
-    if not got_m:
-        missing.append("✍️ *Signed mandate* (link above)")
-    if not got_id:
-        missing.append("🪪 *Passport or national ID* photo")
-    if ps.get("needs_boarding_hint") and not got_bp:
-        missing.append("✈️ *Boarding pass*")
-    if missing:
-        lines.append("• ⏳ *Still needed:*")
-        for m in missing:
-            lines.append(f"  • {m}")
-    lines.append("• ⚖️ File *not complete* until the mandate is signed")
-    return "\n".join(lines)
 
-def completed_phase_fallback_reply(conv, lang):
-    """
-    Réponse par défaut quand step=completed (le client écrit après le message « dossier prêt »).
-    Ne signifie pas que mandat + pièces sont reçus — voir post_submit_fully_done().
-    """
-    refresh_post_submit_airtable_flags(conv)
-    ref = (conv.get("ref") or "").strip()
-    ref_bit = f" (*{ref}*)" if ref else ""
-    if post_submit_fully_done(conv):
-        if lang == "fr":
-            return (
-                f"✅ *Dossier complet{ref_bit}*\n\n"
-                "• 💬 Posez votre question ici (court de préférence)\n"
-                "• 🔄 Nouveau dossier : *menu* ou *recommencer*"
-            )
-        return (
-            f"✅ *File complete{ref_bit}*\n\n"
-            "• 💬 Ask your question here (keep it short)\n"
-            "• 🔄 New claim: *menu* or *restart*"
-        )
-    checklist = _post_submit_checklist(conv, lang, ref, "")
-    if lang == "fr":
-        return (
-            f"✅ *Infos enregistrées{ref_bit}*\n\n"
-            "📋 *État du dossier :*\n"
-            f"{checklist}\n\n"
-            "• 💬 Répondez ici ou envoyez mandat / pièces sur ce fil\n"
-            "• 🔄 Nouveau dossier : *menu* ou *recommencer*"
-        )
-    return (
-        f"✅ *Details saved{ref_bit}*\n\n"
-        "📋 *File status:*\n"
-        f"{checklist}\n\n"
-        "• 💬 Reply here or send mandate / documents in this chat\n"
-        "• 🔄 New claim: *menu* or *restart*"
+def _img_suffix(raw):
+    if not raw or len(raw) < 8:
+        return ".jpg", "image/jpeg"
+    if raw[:8] == b"\x89PNG\r\n\x1a\n": return ".png", "image/png"
+    if raw[:2] == b"\xff\xd8":          return ".jpg", "image/jpeg"
+    if raw[:4] == b"GIF8":              return ".gif", "image/gif"
+    if raw[:4] == b"RIFF" and len(raw) >= 12 and raw[8:12] == b"WEBP": return ".webp", "image/webp"
+    return ".jpg", "image/jpeg"
+
+def at_upload_attachment(record_id, field_id, raw_bytes, fname):
+    """POST uploadAttachment (API Airtable) sur un champ attachment."""
+    if not AIRTABLE_API_KEY or not field_id or not record_id or not raw_bytes:
+        return False
+    if len(raw_bytes) > 5 * 1024 * 1024:
+        print("at_upload_attachment: fichier > 5 Mo")
+        return False
+    ext, mime = _img_suffix(raw_bytes)
+    if not fname.endswith(ext):
+        fname += ext
+    b64 = base64.b64encode(raw_bytes).decode("ascii")
+    payload = {"contentType": mime, "file": b64, "filename": fname}
+    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
+    urls = (
+        f"https://content.airtable.com/v0/{AIRTABLE_BASE_ID}/{record_id}/{field_id}/uploadAttachment",
+        f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{record_id}/{field_id}/uploadAttachment",
     )
+    last_err = None
+    for url in urls:
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=90)
+            if r.status_code in (200, 201):
+                return True
+            last_err = f"{url.split('/')[2]} {r.status_code}: {r.text[:300]}"
+        except Exception as e:
+            last_err = f"{url.split('/')[2]} exc: {e}"
+    print(f"Airtable uploadAttachment failed: {last_err}")
+    return False
 
-def _build_relance_body(phone, conv, stage):
+def _at_record_id_for_index(recs, names, idx0):
+    if not recs or idx0 < 0:
+        return None
+    target = str(names[idx0]).strip() if (isinstance(names, list) and idx0 < len(names)) else ""
+    if target:
+        for r in recs:
+            fn = (r.get("fields") or {}).get(F_NOM_PASSAGER)
+            if fn and str(fn).strip() == target:
+                return r.get("id")
+    if idx0 < len(recs):
+        return recs[idx0].get("id")
+    return None
+
+def at_attach_image(phone, conv, image_b64, field_id, idx0=0, tag="doc"):
+    """Upload une image sur le champ attachment de la ligne passager idx0. Crée le dossier si besoin."""
+    if not AIRTABLE_API_KEY or not field_id or not image_b64:
+        return False
+    raw = _img_bytes(image_b64)
+    if not raw:
+        return False
+    ref = conv.get("ref_dossier") or generate_ref_dossier(phone)
+    conv["ref_dossier"] = ref
+    recs = at_find(ref)
+    if not recs:
+        upsert_airtable(phone, conv)
+        recs = at_find(ref)
+    names = conv["data"].get("passenger_names") or []
+    rid = _at_record_id_for_index(recs, names, idx0)
+    if not rid:
+        return False
+    fname = f"{tag}_{ref}_p{idx0+1}"
+    return at_upload_attachment(rid, field_id, raw, fname)
+
+# ===== CODESHARE — RECHERCHE OPÉRATEUR RÉEL =====
+
+def lookup_operating_airline(conv):
+    """
+    Recherche en arrière-plan de l'opérateur réel (codeshare).
+    Base locale IATA : si le préfixe du n° de vol commercial diffère d'un opérateur connu,
+    on tente de détecter via les codes déjà extraits (scan billet) ou via le préfixe.
+    Stocke operating_airline / codeshare_note si l'exploitant diffère de la compagnie marketing.
+    """
     d = conv["data"]
-    lang = d.get("lang", "fr")
-    pax = d.get("passengers") or 1
-    ref = conv.get("ref") or ""
-    _, net, _, _ = calc_amounts(pax)
-    net_s = fmt_money_space(net)
-    ps = d.get("_post_submit") or {}
-    prenom = _first_name_from_conv(conv) or ("vous" if lang == "fr" else "there")
-    link = _resume_mandat_link(phone, conv)
-    checklist = _post_submit_checklist(conv, lang, ref, net_s)
+    fn = (d.get("flight_number") or "").strip().upper()
+    marketing = (d.get("airline") or "").strip()
 
-    if stage == "30m":
-        if lang == "en":
-            return (
-                f"⌛ *Almost done, {prenom}!*\n\n"
-                f"Your file for *{net_s} €* is on our side — it only needs a quick validation.\n\n"
-                "*Status:*\n"
-                f"{checklist}\n\n"
-                f"👇 *Tap here to finish in ~30 seconds:*\n{link}\n\n"
-                "🏹 The Robin des Airs team is ready to start the procedure as soon as you confirm!"
-                + site_mandat_links_footer("en")
-            )
-        return (
-            f"⌛ *Presque fini, {prenom} !*\n\n"
-            f"Votre dossier pour *{net_s} €* est prêt de notre côté — il ne manque qu'une validation rapide.\n\n"
-            "*État de votre dossier :*\n"
-            f"{checklist}\n\n"
-            f"👇 *Cliquez ici pour finaliser en ~30 secondes :*\n{link}\n\n"
-            "🏹 *L'équipe Robin des Airs* est prête à lancer la procédure dès que vous validez !"
-            + site_mandat_links_footer("fr")
-        )
+    mark_iata = re.sub(r"[^A-Z]", "", (d.get("marketing_carrier_iata") or "").upper())
+    op_iata   = re.sub(r"[^A-Z]", "", (d.get("operating_carrier_iata") or "").upper())
 
-    if stage == "4h":
-        if lang == "en":
-            return (
-                "🔔 *We wouldn't want you to miss this…*\n\n"
-                f"You still have *{net_s} €* pending on your claim. *Is a technical issue blocking you?*\n\n"
-                "📸 *Unsure about the passport / ID?* A simple, readable photo with your phone is enough — "
-                "no official scan needed.\n\n"
-                f"👉 *Pick up where you left off:*\n{link}\n\n"
-                "⚖️ The sooner we receive your documents, the sooner the airline receives our formal notice."
-                + site_mandat_links_footer("en")
-            )
-        return (
-            "🔔 *On ne voudrait pas que vous passiez à côté…*\n\n"
-            f"Vous avez laissé une indemnité d'environ *{net_s} €* en attente. *Un souci technique vous bloque ?*\n\n"
-            "📸 *Un doute sur le passeport / la CNI ?* Une simple photo bien lisible avec votre téléphone suffit, "
-            "pas besoin de scan officiel !\n\n"
-            f"👉 *Reprendre là où j'en étais :*\n{link}\n\n"
-            "⚖️ Plus vite nous avons vos documents, plus vite la compagnie reçoit notre mise en demeure."
-            + site_mandat_links_footer("fr")
-        )
+    # Cas 1 : codes marketing/opérateur déjà lus sur le billet (scan vision)
+    if mark_iata and op_iata and mark_iata[:2] != op_iata[:2]:
+        mn = airline_from_iata(mark_iata) or marketing or mark_iata[:2]
+        on = airline_from_iata(op_iata) or op_iata[:2]
+        if on.strip().lower() != mn.strip().lower():
+            d["operating_airline"] = on
+            d["codeshare_note"] = f"Code-share : commercial {mn} ({mark_iata[:2]}) / opéré par {on} ({op_iata[:2]})"
+            if not d.get("airline"):
+                d["airline"] = mn
+            return d["operating_airline"]
 
-    if stage == "23h":
-        if lang == "en":
-            return (
-                f"⚠️ *LAST REMINDER — File {ref}*\n\n"
-                f"{prenom}, we may need to *put your file on hold* and focus our capacity on other claims "
-                "if we do not receive your mandate and proof *very soon*.\n\n"
-                "*Status:*\n"
-                f"{checklist}\n\n"
-                f"👇 *Finalize here (mandate + photos):*\n{link}\n\n"
-                "🏹 *Robin des Airs* — we're ready to launch as soon as you validate."
-                + site_mandat_links_footer("en")
-            )
-        return (
-            f"⚠️ *DERNIER RAPPEL — Dossier {ref}*\n\n"
-            f"{prenom}, nous allons devoir *mettre votre dossier en attente* et libérer notre capacité "
-            "pour d'autres dossiers si nous ne recevons *pas très vite* votre mandat et vos pièces.\n\n"
-            "*État de votre dossier :*\n"
-            f"{checklist}\n\n"
-            f"👇 *Finaliser ici (mandat + photos) :*\n{link}\n\n"
-            "🏹 *Robin des Airs* — nous sommes prêts à lancer dès votre validation."
-            + site_mandat_links_footer("fr")
-        )
+    # Cas 2 : la compagnie marketing saisie diffère du préfixe du n° de vol
+    if fn and marketing:
+        prefix_air = guess_airline(fn)
+        if prefix_air and prefix_air.strip().lower() != marketing.strip().lower():
+            # Le préfixe du n° de vol = transporteur commercial réel ; marketing saisi = exploitant probable
+            d["operating_airline"] = marketing
+            d["airline"] = prefix_air
+            d["codeshare_note"] = f"Code-share possible : n° de vol {fn} ({prefix_air}) / saisi {marketing}"
+            return d["operating_airline"]
+    return None
+
+def lookup_operating_airline_async(phone):
+    """Lance la recherche codeshare en arrière-plan sans bloquer le flux."""
+    def _run():
+        try:
+            conv = conversations.get(phone)
+            if not conv:
+                return
+            res = lookup_operating_airline(conv)
+            if res:
+                print(f"[CODESHARE] {phone} → opéré par {res}")
+                if conv["data"].get("dossier_status") in ("en_cours", "mandat_envoye"):
+                    upsert_airtable(phone, conv)
+        except Exception as e:
+            print(f"lookup_operating_airline_async: {e}")
+    threading.Thread(target=_run, daemon=True, name=f"codeshare_{phone}").start()
+
+# ===== TEMPLATE WATI POST-SOUMISSION =====
+
+def _first_name(conv):
+    names = conv["data"].get("passenger_names") or []
+    if names:
+        return (names[0] or "").strip().split(" ")[0]
     return ""
 
 def send_wati_template_v2(phone, conv):
-    """Envoie le template Meta/Wati (hors fenêtre 24 h). Paramètres : noms alignés sur le template Wati."""
+    """Envoie le template Meta/Wati (hors fenêtre 24 h)."""
     if not WATI_API_TOKEN or not WATI_BASE_URL:
         return False
     if not WATI_POST_SUBMIT_TEMPLATE_NAME or not WATI_TEMPLATE_CHANNEL_NUMBER:
-        print("send_wati_template_v2: WATI_POST_SUBMIT_TEMPLATE_NAME ou WATI_TEMPLATE_CHANNEL_NUMBER manquant")
+        print("send_wati_template_v2: template_name ou channel_number manquant")
         return False
     d = conv["data"]
-    lang = d.get("lang", "fr")
+    lang = d.get("language", "fr")
     pax = d.get("passengers") or 1
-    ref = conv.get("ref") or ""
-    _, net, _, _ = calc_amounts(pax)
-    net_s = fmt_money_space(net)
-    prenom = _first_name_from_conv(conv) or ("Client" if lang == "fr" else "Client")
-    link = _resume_mandat_link(phone, conv)
+    ref = conv.get("ref_dossier") or ""
+    _, net, _ = _calc_amounts(pax)
+    prenom = _first_name(conv) or "Client"
+    link = conv.get("mandat_url") or MANDAT_BASE_URL
     names_csv = os.environ.get("WATI_POST_SUBMIT_TEMPLATE_PARAM_NAMES", "").strip()
-    if names_csv:
-        keys = [k.strip() for k in names_csv.split(",") if k.strip()]
-    else:
-        keys = ["first_name", "amount", "reference", "link"]
-    values = [prenom, f"{net_s} €", ref, link]
+    keys = [k.strip() for k in names_csv.split(",") if k.strip()] or ["first_name", "amount", "reference", "link"]
+    values = [prenom, f"{net} €", ref, link]
     parameters = []
     for i, k in enumerate(keys):
         v = values[i] if i < len(values) else ""
         if v:
             parameters.append({"name": k, "value": str(v)[:1024]})
     url = f"{WATI_BASE_URL}/api/v2/sendTemplateMessage"
-    headers = {
-        "Authorization": f"Bearer {WATI_API_TOKEN}",
-        "Content-Type": "application/json",
-        "accept": "*/*",
-    }
+    headers = {"Authorization": f"Bearer {WATI_API_TOKEN}", "Content-Type": "application/json", "accept": "*/*"}
     body = {
-        "template_name": WATI_POST_SUBMIT_TEMPLATE_NAME,
+        "template_name":  WATI_POST_SUBMIT_TEMPLATE_NAME,
         "broadcast_name": WATI_POST_SUBMIT_TEMPLATE_BROADCAST,
         "channel_number": WATI_TEMPLATE_CHANNEL_NUMBER,
-        "parameters": parameters,
+        "parameters":     parameters,
     }
     try:
-        r = requests.post(
-            url,
-            headers=headers,
-            params={"whatsappNumber": phone},
-            json=body,
-            timeout=45,
-        )
+        r = requests.post(url, headers=headers, params={"whatsappNumber": phone}, json=body, timeout=45)
         print(f"Wati template v2 {r.status_code} {r.text[:200]}")
         ok_http = 200 <= r.status_code < 300
         try:
@@ -1653,65 +1782,102 @@ def send_wati_template_v2(phone, conv):
         print(f"Wati template error: {e}")
         return False
 
-def process_post_submit_reminders():
-    """Un tick par minute : au plus une relance par conversation."""
+# ===== POST-SOUMISSION : flags Airtable + relances =====
+
+def _airtable_field_has_attachment(records, field_id):
+    if not field_id or not records:
+        return False
+    for rec in records:
+        val = (rec.get("fields") or {}).get(field_id)
+        if isinstance(val, list) and len(val) > 0:
+            return True
+    return False
+
+def _airtable_relance_halt(records):
+    if not records:
+        return False
+    if F_STOP_RELANCE:
+        for rec in records:
+            if (rec.get("fields") or {}).get(F_STOP_RELANCE) is True:
+                return True
+        return False
+    if F_SEQUENCE_ACTIVE:
+        flds = (records[0].get("fields") or {})
+        if F_SEQUENCE_ACTIVE not in flds:
+            return False
+        return flds.get(F_SEQUENCE_ACTIVE) is not True
+    return False
+
+def refresh_post_submit_airtable_flags(conv):
+    """Met à jour _post_submit depuis Airtable (pièces jointes / mandat signé). Throttlé ~90 s."""
+    d = conv.get("data") or {}
+    ps = d.get("_post_submit")
+    if not isinstance(ps, dict) or not ps.get("active"):
+        return
     now = time.time()
+    if now - float(ps.get("_at_sync_at") or 0) < 90:
+        return
+    ps["_at_sync_at"] = now
+    ref = (conv.get("ref_dossier") or "").strip()
+    if not ref or not AIRTABLE_API_KEY:
+        return
+    try:
+        recs = at_find(ref)
+    except Exception as e:
+        print(f"refresh_post_submit_airtable_flags: {e}")
+        return
+    if F_CARTE_EMBARQUEMENT:
+        ps["air_boarding_attachment"] = bool(_airtable_field_has_attachment(recs, F_CARTE_EMBARQUEMENT))
+    if F_PIECE_IDENTITE:
+        ps["air_id_attachment"] = bool(_airtable_field_has_attachment(recs, F_PIECE_IDENTITE))
+    if F_MANDAT_SIGNE:
+        ps["air_mandat_signed"] = bool(_airtable_field_has_attachment(recs, F_MANDAT_SIGNE))
+    if _airtable_relance_halt(recs):
+        ps["active"] = False
+
+def post_submit_fully_done(conv):
+    ps = (conv.get("data") or {}).get("_post_submit") or {}
+    if ps.get("mandate_signed_server") or ps.get("air_mandat_signed"):
+        return True
+    return False
+
+def _arm_post_submit(phone, conv):
+    """Amorce la séquence de relances post-soumission (relances template hors fenêtre 24 h)."""
+    ps = conv["data"].setdefault("_post_submit", {})
+    ps["active"]        = True
+    ps["summary_at"]    = time.time()
+    ps["last_template_at"] = 0
+    ps["template_mode"] = False
+    ps.setdefault("relances_sent", [])
+    ps.setdefault("mandate_signed_server", False)
+    ps.setdefault("air_mandat_signed", False)
+
+def process_post_submit_reminders():
+    """Tick par minute : relance template post-soumission si mandat non signé."""
+    now = time.time()
+    repeat_h = max(6, int(os.environ.get("POST_SUBMIT_TEMPLATE_REPEAT_HOURS", "48") or "48"))
     for phone, conv in list(conversations.items()):
         d = conv.get("data") or {}
         ps = d.get("_post_submit")
         if not isinstance(ps, dict) or not ps.get("active"):
             continue
-        if conv.get("step") != "completed":
+        if conv.get("current_step") != "completed":
             continue
+        refresh_post_submit_airtable_flags(conv)
         if post_submit_fully_done(conv):
             ps["active"] = False
             continue
-
-        _sync_relance_halt_from_airtable(conv)
-        if ps.get("air_relance_halt_airtable"):
-            ps["active"] = False
+        if not ps.get("active"):
             continue
-
-        summary_at = float(ps.get("summary_at") or 0)
-        if summary_at <= 0:
-            continue
-        elapsed = now - summary_at
-        sent = list(ps.get("relances_sent") or [])
-        sent_set = set(sent)
-        session_ok = session_message_allowed(conv)
-
-        if not ps.get("template_mode") and not session_ok:
-            ps["template_mode"] = True
-
-        if not ps.get("template_mode") and session_ok:
-            stages = [("30m", 1800), ("4h", 4 * 3600), ("23h", 23 * 3600)]
-            for key, sec in stages:
-                if key in sent_set:
-                    continue
-                if elapsed < sec:
-                    break
-                msg = _build_relance_body(phone, conv, key)
-                if msg and send(phone, msg):
-                    sent.append(key)
-                    ps["relances_sent"] = sent
-                break
-            continue
-
-        if ps.get("template_mode") and WATI_POST_SUBMIT_TEMPLATE_NAME and WATI_TEMPLATE_CHANNEL_NUMBER:
+        if WATI_POST_SUBMIT_TEMPLATE_NAME and WATI_TEMPLATE_CHANNEL_NUMBER:
             last_tpl = float(ps.get("last_template_at") or 0)
-            interval = max(6, POST_SUBMIT_TEMPLATE_REPEAT_H) * 3600
-            if last_tpl <= 0 or (now - last_tpl) >= interval:
+            interval = repeat_h * 3600
+            # 1re relance après ~24h, puis selon interval
+            since_summary = now - float(ps.get("summary_at") or now)
+            due = (last_tpl <= 0 and since_summary >= 24 * 3600) or (last_tpl > 0 and (now - last_tpl) >= interval)
+            if due:
                 if send_wati_template_v2(phone, conv):
                     ps["last_template_at"] = now
-        elif ps.get("template_mode"):
-            warn_key = "_tpl_missing_config_warned"
-            if not ps.get(warn_key):
-                ps[warn_key] = True
-                print(
-                    "process_post_submit_reminders: template_mode actif mais "
-                    "WATI_POST_SUBMIT_TEMPLATE_NAME / WATI_TEMPLATE_CHANNEL_NUMBER non configurés — "
-                    "impossible d'écrire au client hors fenêtre 24 h."
-                )
 
 def _post_submit_reminder_loop():
     while True:
@@ -1730,3281 +1896,1221 @@ def start_post_submit_reminder_thread():
         if _reminder_started:
             return
         _reminder_started = True
-    t = threading.Thread(target=_post_submit_reminder_loop, daemon=True, name="post_submit_relances")
-    t.start()
+    threading.Thread(target=_post_submit_reminder_loop, daemon=True, name="post_submit_relances").start()
 
-# ===== AIRTABLE =====
 
-def at_headers():
-    return {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
+# ============================================
+# TRAITEMENT BOUTONS / LISTES
+# ============================================
 
-def at_url():
-    return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AT_TABLE_ID}"
+def process_button_reply(phone, button_id, button_title, conv):
+    print(f"[BTN] {button_id} = {button_title}")
+    button_id    = (button_id    or "").strip()
+    button_title = (button_title or "").strip().lower()
+    lang = conv["data"].get("language", "fr")
+    touch_activity(conv)
 
-def at_find(ref):
-    """Trouve les records par Référence Dossier."""
-    if not AIRTABLE_API_KEY or not ref:
-        return []
-    try:
-        esc     = ref.replace("'", "''")
-        formula = f"{{{F_REF_DOSSIER}}}='{esc}'"
-        url     = f"{at_url()}?filterByFormula={requests.utils.quote(formula)}"
-        r       = requests.get(url, headers=at_headers(), timeout=10)
-        if r.status_code == 200:
-            return r.json().get("records", [])
-        print(f"at_find {r.status_code}: {r.text[:300]}")
-    except Exception as e:
-        print(f"at_find error: {e}")
-    return []
-
-def _airtable_field_has_attachment(records, field_id):
-    if not field_id or not records:
-        return False
-    for rec in records:
-        flds = rec.get("fields") or {}
-        val = flds.get(field_id)
-        if isinstance(val, list) and len(val) > 0:
-            return True
-    return False
-
-def _airtable_relance_halt_from_records(records):
-    """
-    True = ne plus envoyer de relances pour ce dossier.
-    - Stop_Relance (AIRTABLE_F_STOP_RELANCE) : coché sur n'importe quelle ligne → arrêt.
-    - Sequence_Active (AIRTABLE_F_SEQUENCE_ACTIVE) : lu sur la 1re ligne ; décoché → arrêt ; absent → pas d'arrêt.
-    """
-    if not records:
-        return False
-    if F_STOP_RELANCE:
-        for rec in records:
-            if (rec.get("fields") or {}).get(F_STOP_RELANCE) is True:
-                return True
-        return False
-    if F_SEQUENCE_ACTIVE:
-        flds = (records[0].get("fields") or {})
-        if F_SEQUENCE_ACTIVE not in flds:
-            return False
-        return flds.get(F_SEQUENCE_ACTIVE) is not True
-    return False
-
-def _sync_relance_halt_from_airtable(conv):
-    """Lit la case Airtable (throttle 60 s) pour arrêter les relances sans toucher au reste du dossier."""
-    d = conv.get("data") or {}
-    ps = d.get("_post_submit")
-    if not isinstance(ps, dict) or not ps.get("active"):
-        return
-    if not (F_STOP_RELANCE or F_SEQUENCE_ACTIVE):
-        return
-    ref = (conv.get("ref") or "").strip()
-    if not ref or not AIRTABLE_API_KEY:
-        return
-    now = time.time()
-    if now - float(ps.get("_at_relance_halt_sync_at") or 0) < 60:
-        return
-    ps["_at_relance_halt_sync_at"] = now
-    try:
-        recs = at_find(ref)
-        ps["air_relance_halt_airtable"] = _airtable_relance_halt_from_records(recs)
-    except Exception as e:
-        print(f"_sync_relance_halt_from_airtable: {e}")
-
-def refresh_post_submit_airtable_flags(conv):
-    """Met à jour _post_submit depuis Airtable (pièces jointes). Throttlé (~90 s)."""
-    d = conv.get("data") or {}
-    ps = d.get("_post_submit")
-    if not isinstance(ps, dict) or not ps.get("active"):
-        return
-    now = time.time()
-    if now - float(ps.get("_at_sync_at") or 0) < 90:
-        return
-    ps["_at_sync_at"] = now
-    ref = (conv.get("ref") or "").strip()
-    if not ref or not AIRTABLE_API_KEY:
-        return
-    try:
-        recs = at_find(ref)
-    except Exception as e:
-        print(f"refresh_post_submit_airtable_flags: {e}")
-        return
-    if F_CARTE_EMBARQUEMENT:
-        ps["air_boarding_attachment"] = bool(_airtable_field_has_attachment(recs, F_CARTE_EMBARQUEMENT))
-    if F_PIECE_IDENTITE:
-        ps["air_id_attachment"] = bool(_airtable_field_has_attachment(recs, F_PIECE_IDENTITE))
-    if F_MANDAT_SIGNE:
-        ps["air_mandat_signed"] = bool(_airtable_field_has_attachment(recs, F_MANDAT_SIGNE))
-
-def at_save(phone, conv):
-    """Sauvegarde progressive — crée ou met à jour les records Airtable."""
-    if not AIRTABLE_API_KEY:
-        print(
-            f"❌ CRITICAL at_save: AIRTABLE_API_KEY manquant — aucune persistance Airtable "
-            f"(tel={phone}, ref={conv.get('ref')}, step={conv.get('step')})"
-        )
+    # ── MSG 1 — ACCROCHE → LANGUE ───────────────────────────────
+    if button_id == "start_check":
+        conv["current_step"] = "language"
+        ask_language(phone)
         return
 
-    try:
-        d   = conv["data"]
-        ref = conv.get("ref") or make_ref(phone)
-        conv["ref"] = ref
-
-        pax   = d.get("passengers") or 1
-        names = d.get("passenger_names") or []
-        brut, net, com, per_pax = calc_amounts(pax)
-
-        # Date vol → YYYY-MM-DD
-        date_vol_at = fmt_date_for_airtable(d.get("flight_date") or "")
-
-        # Incident → option singleSelect exacte
-        incident_at = INCIDENT_AT.get(d.get("incident_type") or "", "")
-
-        # Champs communs à toutes les lignes du dossier
-        common = {
-            F_REF_DOSSIER:    ref,
-            F_DATE_DOSSIER:   datetime.now().strftime("%Y-%m-%d"),
-            F_WHATSAPP:       str(phone),
-            F_STATUT_DOSSIER: STATUT_DOSSIER_DEFAUT,
-            F_STATUT_SUIVI:   STATUT_SUIVI_DEFAUT,
-        }
-        if d.get("airline"):
-            common[F_COMPAGNIE] = d["airline"]
-        if d.get("flight_number"):
-            common[F_NUMERO_VOL] = d["flight_number"]
-        if date_vol_at:
-            common[F_DATE_VOL] = date_vol_at
-        if d.get("pnr"):
-            common[F_PNR] = d["pnr"].strip().upper()
-        if incident_at:
-            common[F_TYPE_INCIDENT] = incident_at
-        if F_ITINERAIRE:
-            it_main = (d.get("itinerary") or "").strip()
-            it_compl = (d.get("itinerary_compl_note") or "").strip()
-            if it_main and it_compl:
-                it_persist = f"{it_main} | {it_compl}"[:8000]
-            elif it_main:
-                it_persist = it_main[:8000]
-            elif it_compl:
-                it_persist = it_compl[:8000]
-            else:
-                it_persist = ""
-            if it_persist:
-                common[F_ITINERAIRE] = it_persist
-
-        existing = at_find(ref)
-
-        extra_bits = []
-        if d.get("itinerary"):
-            extra_bits.append(f"Itinéraire: {d['itinerary']}")
-        if d.get("itinerary_compl_note") and not d.get("itinerary"):
-            extra_bits.append(f"Compl. trajet: {d['itinerary_compl_note']}")
-        if d.get("codeshare_note"):
-            extra_bits.append(d["codeshare_note"])
-        if d.get("operating_airline"):
-            extra_bits.append(f"Opéré par: {d['operating_airline']}")
-        if d.get("has_minors"):
-            extra_bits.append("Mineur(s): oui")
-        if d.get("claim_rt_leg"):
-            extra_bits.append(f"Sens voyage déclaré: {d['claim_rt_leg']}")
-        if d.get("itinerary_compl_note") and d.get("itinerary"):
-            extra_bits.append(f"Compl. trajet: {d['itinerary_compl_note']}")
-        if d.get("early_route_shape"):
-            extra_bits.append(f"Parcours déclaré: {d['early_route_shape']}")
-        if d.get("expert_phone_lang"):
-            extra_bits.append(f"Langue expert (vocal): {d['expert_phone_lang']}")
-        rem_extra = (" | " + " ; ".join(extra_bits)) if extra_bits else ""
-
-        if not existing:
-            # CRÉATION — 1 ligne par passager
-            records = []
-            for i in range(pax):
-                f = dict(common)
-                f[F_NOM_PASSAGER] = names[i] if i < len(names) else f"Passager {i+1}"
-                f[F_REMARQUES]    = f"Ref: {ref} | Passager {i+1}/{pax} | Bot WhatsApp" + (rem_extra if i == 0 else "")
-                if i == 0:
-                    f[F_MONTANT_CLIENT]    = float(net)
-                    f[F_COMMISSION_RDA]    = float(com)
-                    f[F_MONTANT_INDEMNITE] = float(brut)
-                else:
-                    f[F_MONTANT_CLIENT]    = 0.0
-                    f[F_COMMISSION_RDA]    = 0.0
-                    f[F_MONTANT_INDEMNITE] = 0.0
-                records.append({"fields": f})
-
-            r = requests.post(at_url(), headers=at_headers(),
-                              json={"records": records}, timeout=15)
-            if r.status_code in (200, 201):
-                print(f"✅ Airtable CREATE {pax} records (ref={ref})")
-            else:
-                print(f"❌ Airtable CREATE {r.status_code}: {r.text[:400]}")
-
+    # ── FALLBACK IA — DEMANDE RAPPEL EXPERT ─────────────────────
+    if button_id == "rappel_expert":
+        conv["data"]["dossier_status"] = "escalade_expert"
+        conv["data"]["escalade_reason"] = "demande_rappel"
+        if lang == "en":
+            send_whatsapp_text(phone, (
+                "📱 *A Robin des Airs expert is contacting you.*\n"
+                "Keep this conversation open — they'll write to you directly here.\n"
+                "_The Robin des Airs team_"
+            ))
         else:
-            # UPDATE — patch les records existants
-            updates = []
-            for i, rec in enumerate(existing[:pax]):
-                f = dict(common)
-                f[F_NOM_PASSAGER] = names[i] if i < len(names) else f"Passager {i+1}"
-                f[F_REMARQUES]    = f"Ref: {ref} | Passager {i+1}/{pax} | Bot WhatsApp" + (rem_extra if i == 0 else "")
-                if i == 0:
-                    f[F_MONTANT_CLIENT]    = float(net)
-                    f[F_COMMISSION_RDA]    = float(com)
-                    f[F_MONTANT_INDEMNITE] = float(brut)
-                updates.append({"id": rec["id"], "fields": f})
+            send_whatsapp_text(phone, (
+                "📱 *Un expert Robin des Airs vous contacte.*\n"
+                "Laissez cette conversation ouverte — il vous écrit directement ici.\n"
+                "_L'équipe Robin des Airs_"
+            ))
+        return
 
-            r = requests.patch(at_url(), headers=at_headers(),
-                               json={"records": updates}, timeout=15)
-            if r.status_code == 200:
-                print(f"✅ Airtable UPDATE {len(updates)} records (ref={ref})")
+    # ── MSG 2 — LANGUE ──────────────────────────────────────────
+    if button_id.startswith("lang_soon_"):
+        # Langue "bientôt disponible" → message d'attente + continue en FR
+        soon_lang = button_id.replace("lang_soon_", "")
+        conv["data"]["preferred_language"] = soon_lang
+        lang = conv["data"].get("language", "fr")
+        msg = COMING_SOON_MSG.get(lang, COMING_SOON_MSG["fr"])
+        send_whatsapp_text(phone, msg)
+        time.sleep(1)
+        conv["data"]["language"] = "fr"
+        conv["current_step"] = "route_qualify"
+        ask_route_qualify(phone, "fr")
+        return
+
+    if button_id.startswith("lang_"):
+        chosen = button_id.replace("lang_", "")
+        conv["data"]["preferred_language"] = chosen
+        if chosen in ("fr", "en"):
+            conv["data"]["language"] = chosen
+            conv["current_step"]     = "route_qualify"
+            ask_route_qualify(phone, chosen)
+        else:
+            conv["data"]["dossier_status"] = "escalade_expert"
+            conv["data"]["escalade_reason"] = "langue_africaine"
+            expert_msg = EXPERT_MSG.get(chosen, "Un expert vous rappelle directement 🤝\n📱 +33 7 56 86 36 30")
+            send_whatsapp_text(phone, expert_msg)
+            time.sleep(1)
+            send_whatsapp_text(phone, (
+                "🤝 *Votre dossier est entre de bonnes mains.*\n\n"
+                "Un expert parlant votre langue vous contactera en cours de dossier.\n\n"
+                "En attendant, je continue à vous guider en français. 👇"
+            ))
+            time.sleep(1)
+            conv["data"]["language"] = "fr"
+            conv["current_step"]     = "route_qualify"
+            ask_route_qualify(phone, "fr")
+        return
+
+    # ── MSG 3 — ZONE (qualification route) ──────────────────────
+    if button_id == "zone_africa_europe":
+        conv["data"]["route_zone"]  = "africa_europe"
+        conv["current_step"]        = "incident_type"
+        ask_incident_type(phone, lang)
+        return
+
+    if button_id == "zone_europe":
+        conv["data"]["route_zone"]  = "europe"
+        conv["current_step"]        = "incident_type"
+        if lang == "en":
+            send_whatsapp_text(phone, "🇪🇺 Intra-European flights are covered by CE 261 ✅\nOur specialty is Africa ↔ Europe routes, but let's continue.")
+        else:
+            send_whatsapp_text(phone, "🇪🇺 Les vols intra-européens sont couverts par le CE 261 ✅\nNotre spécialité c'est les routes Afrique ↔ Europe, mais on continue.")
+        time.sleep(1)
+        ask_incident_type(phone, lang)
+        return
+
+    if button_id == "zone_depart_europe":
+        conv["data"]["route_zone"]  = "depart_europe"
+        conv["current_step"]        = "incident_type"
+        if lang == "en":
+            send_whatsapp_text(phone, "🛫 A departure or arrival in Europe can be eligible — especially with a European airline or airport. Let's check it together. ✅")
+        else:
+            send_whatsapp_text(phone, "🛫 Un départ ou une arrivée en Europe peut être éligible — surtout avec une compagnie ou un aéroport européen. Vérifions ensemble. ✅")
+        time.sleep(1)
+        ask_incident_type(phone, lang)
+        return
+
+    if button_id == "zone_other":
+        conv["data"]["dossier_status"] = "non_eligible"
+        conv["data"]["non_eligibility_reason"] = "route_hors_europe"
+        if lang == "en":
+            send_whatsapp_text(phone, (
+                "😔 *Your flight does not appear to be covered by European law.*\n\n"
+                "EU Regulation CE 261/2004 applies only to flights:\n"
+                "• Departing from or arriving at a European airport, or\n"
+                "• Operated by a European airline.\n\n"
+                "From what you've indicated, your flight doesn't meet these conditions.\n\n"
+                "❓ *If you think there's an error*, type *menu* to restart and choose a different route — it only takes a few seconds.\n\n"
+                "_The Robin des Airs team_"
+            ))
+        else:
+            send_whatsapp_text(phone, (
+                "😔 *Votre vol ne semble pas couvert par la loi européenne.*\n\n"
+                "Le règlement CE 261/2004 s'applique uniquement aux vols :\n"
+                "• Au départ ou à l'arrivée d'un aéroport européen, ou\n"
+                "• Opérés par une compagnie européenne.\n\n"
+                "D'après ce que vous avez indiqué, votre vol ne remplit aucune de ces conditions.\n\n"
+                "❓ *Si vous pensez qu'il y a une erreur*, tapez *menu* pour recommencer et choisir une autre route — cela ne prend que quelques secondes.\n\n"
+                "_L'équipe Robin des Airs_"
+            ))
+        conv["current_step"] = None
+        return
+
+    # ── MSG 4 — INCIDENT ────────────────────────────────────────
+    if button_id in ("inc_delay", "inc_cancel", "inc_denied"):
+        mapping = {"inc_delay": "delay", "inc_cancel": "cancel", "inc_denied": "denied"}
+        conv["data"]["incident_type"] = mapping[button_id]
+        if button_id == "inc_delay":
+            conv["current_step"] = "delay_duration"
+            ask_delay_duration(phone, lang)
+        else:
+            conv["data"]["delay_ok"] = True
+            send_estimation(phone, conv)
+            conv["current_step"] = "passengers"
+            ask_passengers(phone, lang)
+        return
+
+    # ── MSG 4 — DURÉE RETARD ────────────────────────────────────
+    if button_id == "delay_lt3":
+        conv["data"]["dossier_status"] = "non_eligible"
+        conv["data"]["non_eligibility_reason"] = "retard_trop_court"
+        if lang == "en":
+            send_whatsapp_text(phone, (
+                "😔 *Delay under 3 hours — no compensation available.*\n\n"
+                "EU law CE 261/2004 requires a minimum delay of *3 hours at arrival* to trigger flat-rate compensation.\n\n"
+                "Below this threshold, no compensation is provided by law, regardless of the circumstances.\n\n"
+                "💡 *Not sure of the exact delay?* Type *menu* and choose 'I'm not sure' — an expert checks for free.\n\n"
+                "_Robin des Airs team_"
+            ))
+        else:
+            send_whatsapp_text(phone, (
+                "😔 *Retard inférieur à 3 heures — pas d'indemnisation possible.*\n\n"
+                "La loi européenne CE 261/2004 fixe un seuil minimum de *3 heures de retard à l'arrivée* pour ouvrir droit à une indemnité forfaitaire.\n\n"
+                "En dessous de ce seuil, aucune compensation n'est prévue par la loi, quelles que soient les circonstances.\n\n"
+                "💡 *Vous n'êtes pas sûr de la durée exacte ?* Tapez *menu* et choisissez 'Je ne sais plus' — un expert vérifie pour vous gratuitement.\n\n"
+                "_L'équipe Robin des Airs_"
+            ))
+        conv["current_step"] = None
+        return
+
+    if button_id == "delay_unknown":
+        conv["data"]["delay_ok"] = True
+        conv["data"]["dossier_status"] = "escalade_expert"
+        conv["data"]["escalade_reason"] = "duree_inconnue"
+        if lang == "en":
+            send_whatsapp_text(phone, (
+                "🤔 *No problem — we'll check for you.*\n\n"
+                "The exact delay is recorded in aviation databases. Our team can retrieve it from your flight number and date.\n\n"
+                "Let's keep filling in your file. If the delay turns out to be under 3h, we'll let you know at no cost.\n\n"
+                "📱 *An expert will contact you* to confirm the duration before starting the procedure."
+            ))
+        else:
+            send_whatsapp_text(phone, (
+                "🤔 *Pas de problème — on vérifie pour vous.*\n\n"
+                "La durée exacte du retard figure dans les bases de données aériennes. Notre équipe peut la retrouver à partir de votre numéro de vol et de votre date.\n\n"
+                "Continuons à remplir votre dossier. Si le retard s'avère inférieur à 3h, nous vous en informerons sans frais.\n\n"
+                "📱 *Un expert vous contactera* pour confirmer la durée avant d'engager la procédure."
+            ))
+        time.sleep(1)
+        send_estimation(phone, conv)
+        conv["current_step"] = "passengers"
+        ask_passengers(phone, lang)
+        return
+
+    if button_id == "delay_3plus":
+        conv["data"]["delay_ok"] = True
+        send_estimation(phone, conv)
+        conv["current_step"] = "passengers"
+        ask_passengers(phone, lang)
+        return
+
+    # ── MSG 5 — PASSAGERS ───────────────────────────────────────
+    if button_id.startswith("pax_") and button_id not in ("pax_confirm_yes", "pax_confirm_no"):
+        if button_id == "pax_more":
+            conv["data"]["dossier_status"] = "escalade_expert"
+            conv["data"]["escalade_reason"] = "groupe_6plus"
+            if lang == "en":
+                send_whatsapp_text(phone, (
+                    "👥 *Group of 6+ passengers — priority file!*\n\n"
+                    "Potentially *more than €3,600*.\n\n"
+                    "For groups we handle files manually.\n\n"
+                    "👉 robindesairs.eu/depot-express\n\n"
+                    "*The Robin des Airs team*"
+                ))
             else:
-                print(f"❌ Airtable PATCH {r.status_code}: {r.text[:400]}")
+                send_whatsapp_text(phone, (
+                    "👥 *Groupe de 6+ passagers — dossier prioritaire !*\n\n"
+                    "Potentiellement *plus de 3 600€*.\n\n"
+                    "Pour les groupes nous traitons les dossiers manuellement.\n\n"
+                    "👉 robindesairs.eu/depot-express\n\n"
+                    "*L'équipe Robin des Airs*"
+                ))
+            conv["current_step"] = None
+            return
+        conv["data"]["passengers"] = int(button_id.split("_")[1])
+        upsert_airtable(phone, conv)  # Airtable — après confirmation nb passagers
+        conv["current_step"]       = "flight_type"
+        ask_flight_type(phone, conv)
+        return
+
+    # ── CONFIRMATION PASSAGER ────────────────────────────────────
+    if button_id == "pax_confirm_yes":
+        name = conv["data"].pop("_temp_pax_name", "")
+        if name:
+            conv["data"]["passenger_names"].append(name)
+        idx = conv["data"].get("current_pax_index", 0) + 1
+        conv["data"]["current_pax_index"] = idx
+        conv["current_step"] = "passenger_collect"
+        ask_next_passenger(phone, conv)
+        return
+
+    if button_id == "pax_confirm_no":
+        conv["current_step"] = "passenger_collect"
+        idx  = conv["data"].get("current_pax_index", 0)
+        num  = idx + 1
+        if lang == "en":
+            send_whatsapp_text(phone, f"✍️ Passenger {num} — Please type the correct first name and last name:")
+        else:
+            send_whatsapp_text(phone, f"✍️ Passager {num} — Tapez le prénom et nom corrects :")
+        return
+
+    # ── MSG 10 — CONFIRMATION NUMÉRO DE VOL ─────────────────────
+    if button_id == "fn_confirm_yes":
+        # Recherche codeshare en arrière-plan (opérateur réel) — flux continue normalement
+        lookup_operating_airline_async(phone)
+        if conv["data"].get("flight_date"):
+            conv["current_step"] = "flight_date_confirm"
+            confirm_flight_date(phone, conv, conv["data"]["flight_date"])
+        else:
+            conv["current_step"] = "flight_date"
+            ask_flight_date(phone, conv)
+        return
+
+    if button_id == "fn_confirm_no":
+        conv["current_step"] = "flight_number"
+        if lang == "en":
+            send_whatsapp_text(phone, "✍️ Please type the correct flight number:")
+        else:
+            send_whatsapp_text(phone, "✍️ Tapez le numéro de vol correct :")
+        return
+
+    # ── MSG 10 — CONFIRMATION DATE ──────────────────────────────
+    if button_id == "date_confirm_yes":
+        date_str = conv["data"].get("flight_date", "")
+        flight_date_obj = None
+        for fmt in ("%d/%m/%Y", "%d-%m-%Y"):
+            try:
+                flight_date_obj = datetime.strptime(date_str.strip(), fmt)
+                break
+            except ValueError:
+                pass
+        if flight_date_obj is None:
+            year_match = re.search(r'\b(20\d{2})\b', date_str)
+            if year_match:
+                flight_date_obj = datetime(int(year_match.group(1)), 6, 1)
+
+        if flight_date_obj and (datetime.now() - flight_date_obj).days > 5 * 365:
+                conv["data"]["dossier_status"] = "non_eligible"
+                conv["data"]["non_eligibility_reason"] = "vol_trop_ancien"
+                if lang == "en":
+                    send_whatsapp_text(phone, (
+                        "😔 *Flight too old — legal time limit exceeded.*\n\n"
+                        "The law provides a *5-year limitation period* from the date of the flight.\n"
+                        "Beyond that, no legal action or claim is possible, even if the delay was real.\n\n"
+                        f"📅 Your flight is dated *{date_str}*, more than 5 years ago. We cannot process this file.\n\n"
+                        "❓ *If the date is incorrect*, type *menu* to correct it.\n\n"
+                        "_Robin des Airs team_"
+                    ))
+                else:
+                    send_whatsapp_text(phone, (
+                        "😔 *Vol trop ancien — délai légal dépassé.*\n\n"
+                        "La loi prévoit une *prescription de 5 ans* à compter de la date du vol.\n"
+                        "Au-delà, aucune action en justice ou réclamation n'est possible, même si le retard était réel.\n\n"
+                        f"📅 Votre vol date de *{date_str}*, soit plus de 5 ans. Nous ne pouvons pas traiter ce dossier.\n\n"
+                        "❓ *Si la date est incorrecte*, tapez *menu* pour corriger.\n\n"
+                        "_L'équipe Robin des Airs_"
+                    ))
+                conv["current_step"] = None
+                return
+        upsert_airtable(phone, conv)  # Airtable — après confirmation vol + date
+        conv["current_step"] = "minor_check"
+        ask_minors(phone, conv)
+        return
+
+    if button_id == "date_confirm_no":
+        conv["current_step"] = "flight_date"
+        if lang == "en":
+            send_whatsapp_text(phone, "✍️ Please type the correct date (eg: 15/03/2023):")
+        else:
+            send_whatsapp_text(phone, "✍️ Tapez la date correcte (ex : 15/03/2023) :")
+        return
+
+    # ── MSG 6 — TYPE VOL → SCAN ─────────────────────────────────
+    if button_id in ("type_direct", "type_connection"):
+        conv["data"]["flight_type"] = "direct" if button_id == "type_direct" else "connection"
+        send_motivation(phone, conv)
+        conv["current_step"] = "document"
+        ask_document(phone, conv)
+        return
+
+    # ── MSG 11 — MINEURS ────────────────────────────────────────
+    if button_id == "minor_no":
+        conv["data"]["has_minors"]   = False
+        conv["data"]["minors_count"] = 0
+        conv["current_step"]         = "recap"
+        show_recap(phone, conv)
+        return
+
+    if button_id == "minor_self":
+        conv["data"]["dossier_status"] = "escalade_expert"
+        conv["data"]["escalade_reason"] = "mineur_seul"
+        if lang == "en":
+            send_whatsapp_text(phone, (
+                "👶 *Minor passenger travelling alone — parental signature required.*\n\n"
+                "The law requires a parent or legal guardian to sign the representation mandate for a minor.\n\n"
+                "We'll handle this file with you directly.\n\n"
+                "📱 *A Robin des Airs expert will call you back within 24h* to guide you through the procedure.\n\n"
+                "_Robin des Airs team_"
+            ))
+        else:
+            send_whatsapp_text(phone, (
+                "👶 *Passager mineur voyageant seul — signature parentale requise.*\n\n"
+                "La loi exige qu'un parent ou tuteur légal signe le mandat de représentation pour un mineur.\n\n"
+                "Nous allons traiter ce dossier avec vous directement.\n\n"
+                "📱 *Un expert Robin des Airs vous rappelle dans les 24h* pour accompagner la procédure.\n\n"
+                "_L'équipe Robin des Airs_"
+            ))
+        return
+
+    if button_id == "minor_yes":
+        conv["data"]["has_minors"] = True
+        conv["current_step"] = "minor_select"
+        ask_minor_select(phone, conv)
+        return
+
+    if button_id.startswith("minor_pax_"):
+        idx = int(button_id.split("_")[2])
+        names = conv["data"].get("passenger_names", [])
+        minors = conv["data"].get("minor_names", [])
+        if idx < len(names) and names[idx] not in minors:
+            minors.append(names[idx])
+        conv["data"]["minor_names"] = minors
+        if lang == "en":
+            send_whatsapp_text(phone, f"✅ *{names[idx]}* marked as minor. Select another or type *done*.")
+        else:
+            send_whatsapp_text(phone, f"✅ *{names[idx]}* marqué comme mineur. Sélectionnez un autre ou tapez *ok*.")
+        return
+
+    # ── MSG 12 — RÉCAP ──────────────────────────────────────────
+    if button_id == "recap_ok":
+        upsert_airtable(phone, conv)  # Airtable — après récap validé (avant documents)
+        conv["current_step"] = "passport_collect"
+        ask_passport(phone, conv)
+        return
+
+    if button_id == "recap_modify":
+        conv["current_step"] = "recap_modify"
+        ask_what_to_modify(phone, lang)
+        return
+
+    # ── MENU MODIFICATION ────────────────────────────────────────
+    if button_id == "mod_names":
+        conv["data"]["passenger_names"]   = []
+        conv["data"]["current_pax_index"] = 0
+        conv["current_step"]              = "passenger_collect"
+        ask_next_passenger(phone, conv)
+        return
+
+    if button_id == "mod_flight":
+        conv["current_step"] = "flight_number"
+        ask_flight_number(phone, conv)
+        return
+
+    if button_id == "mod_date":
+        conv["current_step"] = "flight_date"
+        ask_flight_date(phone, conv)
+        return
+
+    if button_id == "mod_incident":
+        conv["current_step"] = "incident_type"
+        ask_incident_type(phone, lang)
+        return
+
+    if button_id == "mod_route":
+        conv["current_step"] = "route_input"
+        if lang == "en":
+            send_whatsapp_text(phone, "🗺️ Type your route:\n_(eg: Paris CDG → Dakar DSS)_")
+        else:
+            send_whatsapp_text(phone, "🗺️ Tapez votre trajet :\n_(ex : Paris CDG → Dakar DSS)_")
+        return
+
+
+# ============================================
+# WEBHOOK PRINCIPAL
+# ============================================
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"status": "no data"}), 200
+
+        try:
+            print("[WEBHOOK] IN POST preview=", json.dumps(data, ensure_ascii=False)[:300])
+        except Exception:
+            pass
+
+        phone = data.get("waId") or data.get("from") or data.get("phone")
+        if not phone:
+            return jsonify({"status": "no phone"}), 200
+        if data.get("owner") is True:
+            return jsonify({"status": "ignored own"}), 200
+
+        conv = get_or_create_conversation(phone)
+        lang = conv["data"].get("language", "fr")
+
+        # ── BOUTONS / LISTES ────────────────────────────────────
+        button_reply = (
+            data.get("buttonReply")
+            or data.get("interactiveButtonReply")
+            or (data.get("interactive") or {}).get("button_reply")
+            or data.get("button_reply")
+        )
+        list_reply = (
+            data.get("listReply")
+            or data.get("interactiveListReply")
+            or (data.get("interactive") or {}).get("list_reply")
+            or data.get("list_reply")
+        )
+
+        if button_reply:
+            btn_id    = button_reply.get("id") or button_reply.get("buttonId") or button_reply.get("payload") or ""
+            btn_title = button_reply.get("title") or button_reply.get("text") or ""
+            if is_duplicate_event(phone, data, f"button|{btn_id}|{btn_title}"):
+                return jsonify({"status": "duplicate"}), 200
+            if btn_id in ("trip_outbound", "trip_return", "trip_both"):
+                _handle_trip_select(phone, btn_id, conv)
+                return jsonify({"status": "ok"}), 200
+            if btn_id in ("doc_confirm_yes", "doc_confirm_no"):
+                _handle_doc_confirm(phone, btn_id == "doc_confirm_yes", conv)
+                return jsonify({"status": "ok"}), 200
+            process_button_reply(phone, btn_id, btn_title, conv)
+            return jsonify({"status": "ok"}), 200
+
+        if list_reply:
+            row_id    = list_reply.get("id") or list_reply.get("rowId") or list_reply.get("payload") or ""
+            row_title = list_reply.get("title") or list_reply.get("text") or ""
+            if is_duplicate_event(phone, data, f"list|{row_id}|{row_title}"):
+                return jsonify({"status": "duplicate"}), 200
+            process_button_reply(phone, row_id, row_title, conv)
+            return jsonify({"status": "ok"}), 200
+
+        # ── MESSAGE TEXTE OU IMAGE ───────────────────────────────
+        message_type = data.get("type", "text")
+        image_data   = None
+        message_text = ""
+
+        if message_type == "image" or "image" in data:
+            print(f"[IMAGE] reçue de {phone}")
+            media_url = data.get("data") or data.get("mediaUrl")
+            if media_url:
+                try:
+                    r = requests.get(media_url, headers={"Authorization": f"Bearer {WATI_API_TOKEN}"}, timeout=30)
+                    if r.status_code == 200:
+                        image_data = base64.b64encode(r.content).decode("utf-8")
+                except Exception as e:
+                    print(f"[IMAGE] erreur download: {e}")
+            message_text = data.get("caption", "") or ""
+        else:
+            if "text" in data:
+                message_text = data["text"].get("body","") if isinstance(data["text"], dict) else str(data["text"])
+            elif "body" in data:
+                message_text = str(data["body"])
+
+        if not message_text and not image_data:
+            return jsonify({"status": "ignored empty"}), 200
+
+        payload_sig = f"text|{message_text.strip().lower()}|img:{bool(image_data)}"
+        if is_duplicate_event(phone, data, payload_sig):
+            return jsonify({"status": "duplicate"}), 200
+
+        touch_activity(conv)
+        print(f"[MSG] from={phone} step={conv.get('current_step')} text={message_text[:50]!r} img={bool(image_data)}")
+
+        current_step = conv.get("current_step")
+        txt_lower    = message_text.strip().lower()
+
+        # ── RESET / MENU ─────────────────────────────────────────
+        if txt_lower in ("nouveau", "new", "reset", "/reset", "recommencer"):
+            if phone in conversations:
+                del conversations[phone]
+            conv = get_or_create_conversation(phone)
+            conv["ref_dossier"]  = generate_ref_dossier(phone)
+            conv["current_step"] = "welcome"
+            send_welcome_hook(phone, conv)
+            return jsonify({"status": "restarted"}), 200
+
+        if txt_lower in ("menu", "restart", "start", "reprendre", "continuer", "suite"):
+            step = conv.get("current_step")
+            if step and step not in (None, "completed"):
+                lang = conv["data"].get("language", "fr")
+                if lang == "en":
+                    send_whatsapp_text(phone, "👋 Welcome back! Let's pick up where you left off.")
+                else:
+                    send_whatsapp_text(phone, "👋 Re-bonjour ! On reprend votre dossier là où vous vous étiez arrêté.")
+                time.sleep(1)
+                _resume_step(phone, conv)
+            else:
+                conv["ref_dossier"]  = generate_ref_dossier(phone)
+                conv["current_step"] = "welcome"
+                send_welcome_hook(phone, conv)
+            return jsonify({"status": "resumed"}), 200
+
+        # ── DÉMARRAGE — MSG 1 : ACCROCHE ─────────────────────────
+        if current_step in (None, "completed"):
+            conv["ref_dossier"]  = generate_ref_dossier(phone)
+            conv["current_step"] = "welcome"
+            send_welcome_hook(phone, conv)
+            return jsonify({"status": "flow started"}), 200
+
+        if message_text and not conv["data"].get("preferred_language"):
+            conv["data"]["language"] = detect_language(message_text)
+            lang = conv["data"]["language"]
+
+        # ── SCAN DOCUMENT (image envoyée) — MSG 8 ────────────────
+        if image_data and current_step in ("document", "flight_number", "doc_confirm"):
+            print(f"[SCAN] document pour {phone}")
+            extracted_json = call_openai(
+                phone,
+                'Extract from this travel document and reply ONLY with valid JSON: '
+                '{"flight_number":"...","date":"DD/MM/YYYY","departure_time":"HH:MM","passenger_name":"...","airline":"...","marketing_carrier_iata":"...","operating_carrier_iata":"...","pnr":"...","origin":"IATA_CODE","destination":"IATA_CODE","return_flight_number":"...","return_date":"..."}. '
+                'departure_time = scheduled departure time on the card (HH:MM). origin/destination = 3-letter IATA airport codes. '
+                'marketing_carrier_iata = 2-letter code of the marketing/ticketing carrier. '
+                'operating_carrier_iata = 2-letter code of the operating carrier ONLY if "Operated by / Opéré par" is printed (codeshare), else "". '
+                'pnr = 6-char record locator if visible.',
+                image_data
+            )
+            if extracted_json:
+                try:
+                    match = re.search(r'\{.*\}', extracted_json, re.DOTALL)
+                    if match:
+                        info = json.loads(match.group())
+                        fn   = (info.get("flight_number") or "").strip().upper()
+                        if fn:
+                            conv["data"]["flight_number"] = fn
+                            guessed = guess_airline(fn)
+                            if guessed: conv["data"]["airline"] = guessed
+                        if info.get("date"):    conv["data"]["flight_date"] = info["date"]
+                        if info.get("airline"): conv["data"]["airline"]     = info["airline"]
+                        if info.get("marketing_carrier_iata"):
+                            conv["data"]["marketing_carrier_iata"] = re.sub(r"[^A-Za-z]", "", info["marketing_carrier_iata"]).upper()
+                        if info.get("operating_carrier_iata"):
+                            conv["data"]["operating_carrier_iata"] = re.sub(r"[^A-Za-z]", "", info["operating_carrier_iata"]).upper()
+                        if info.get("pnr"):
+                            conv["data"]["pnr"] = re.sub(r"[^A-Za-z0-9]", "", str(info["pnr"]).upper())[:8]
+                        # Résoudre l'opérateur réel (codeshare) à partir des codes lus
+                        lookup_operating_airline(conv)
+                        if info.get("origin") and info.get("destination"):
+                            conv["data"]["route"] = f"{info['origin']} → {info['destination']}"
+                        if info.get("passenger_name"):
+                            names = conv["data"].get("passenger_names") or []
+                            if info["passenger_name"] not in names:
+                                names.append(info["passenger_name"])
+                            conv["data"]["passenger_names"] = names
+                        # Stocker le doc scanné avec heure de départ pour tri chronologique
+                        scanned = conv["data"].setdefault("scanned_docs", [])
+                        scanned.append({
+                            "flight_number":  fn,
+                            "passenger_name": info.get("passenger_name"),
+                            "date":           info.get("date"),
+                            "departure_time": info.get("departure_time", ""),
+                            "origin":         info.get("origin", ""),
+                            "destination":    info.get("destination", ""),
+                        })
+
+                        pax_total   = conv["data"].get("passengers", 1)
+                        scanned_cnt = len(scanned)
+
+                        # Si vol avec escale ET plusieurs cartes à scanner
+                        if conv["data"].get("flight_type") == "connection" and scanned_cnt < pax_total:
+                            # Proposer de scanner la carte suivante
+                            if lang == "en":
+                                more_msg = with_bar("document", (
+                                    f"✅ Card {scanned_cnt}/{pax_total} scanned!\n\n"
+                                    f"📸 Send the *next boarding pass* (passenger {scanned_cnt+1}).\n"
+                                    f"✏️ Or type *done* if you've sent all cards."
+                                ))
+                            else:
+                                more_msg = with_bar("document", (
+                                    f"✅ Carte {scanned_cnt}/{pax_total} scannée !\n\n"
+                                    f"📸 Envoyez la *carte suivante* (passager {scanned_cnt+1}).\n"
+                                    f"✏️ Ou tapez *fini* si vous avez tout envoyé."
+                                ))
+                            send_whatsapp_text(phone, more_msg)
+                            conv["current_step"] = "document"
+                            return jsonify({"status": "ok"}), 200
+
+                        # Si vol avec escale et 1 seul passager → peut avoir 2 cartes (2 segments)
+                        if conv["data"].get("flight_type") == "connection" and pax_total == 1 and scanned_cnt == 1:
+                            if lang == "en":
+                                seg_msg = with_bar("document", (
+                                    f"✅ Segment 1 scanned!\n\n"
+                                    f"📸 Do you have a *second boarding pass* (connecting flight)?\n"
+                                    f"✏️ Type *fini* if this was your only card."
+                                ))
+                            else:
+                                seg_msg = with_bar("document", (
+                                    f"✅ Segment 1 scanné !\n\n"
+                                    f"📸 Avez-vous une *deuxième carte* (vol de correspondance) ?\n"
+                                    f"✏️ Tapez *fini* si c'est votre seule carte."
+                                ))
+                            send_whatsapp_text(phone, seg_msg)
+                            conv["current_step"] = "document"
+                            return jsonify({"status": "ok"}), 200
+
+                        # Trier les docs scannés par heure de départ (ordre chronologique)
+                        _sort_scanned_docs(conv)
+
+                        # Aller-retour ? (2 trajets détectés)
+                        if info.get("return_flight_number") or info.get("return_date"):
+                            if lang == "en":
+                                body = with_bar("trip_select", (
+                                    f"🔄 Your booking has *2 trips*:\n\n"
+                                    f"1️⃣ *{info.get('origin','?')} → {info.get('destination','?')}* "
+                                    f"({info.get('date','?')}) — {fn}\n"
+                                    f"2️⃣ *{info.get('destination','?')} → {info.get('origin','?')}* "
+                                    f"({info.get('return_date','?')})\n\n"
+                                    f"Which trip are you claiming for?"
+                                ))
+                                buttons = [
+                                    {"id": "trip_outbound", "title": f"1️⃣ {info.get('origin','?')} → {info.get('destination','?')}"[:24]},
+                                    {"id": "trip_return",   "title": f"2️⃣ {info.get('destination','?')} → {info.get('origin','?')}"[:24]},
+                                    {"id": "trip_both",     "title": "🔄 Both trips"},
+                                ]
+                            else:
+                                body = with_bar("trip_select", (
+                                    f"🔄 Votre réservation contient *2 trajets* :\n\n"
+                                    f"1️⃣ *{info.get('origin','?')} → {info.get('destination','?')}* "
+                                    f"({info.get('date','?')}) — {fn}\n"
+                                    f"2️⃣ *{info.get('destination','?')} → {info.get('origin','?')}* "
+                                    f"({info.get('return_date','?')})\n\n"
+                                    f"Pour quel trajet réclamez-vous ?"
+                                ))
+                                buttons = [
+                                    {"id": "trip_outbound", "title": f"1️⃣ {info.get('origin','?')} → {info.get('destination','?')}"[:24]},
+                                    {"id": "trip_return",   "title": f"2️⃣ {info.get('destination','?')} → {info.get('origin','?')}"[:24]},
+                                    {"id": "trip_both",     "title": "🔄 Les deux trajets"},
+                                ]
+                            send_whatsapp_buttons(phone, body, buttons)
+                            conv["current_step"] = "trip_select"
+                            return jsonify({"status": "ok"}), 200
+
+                        # Confirmer les infos lues
+                        airline_display = conv["data"].get("airline","?")
+                        route_display   = conv["data"].get("route","")
+                        if lang == "en":
+                            confirm = with_bar("doc_confirm", (
+                                f"✅ *Document read!*\n\n"
+                                f"✈️ Flight: *{fn or '?'}* — {airline_display}\n"
+                                f"📅 Date: *{conv['data'].get('flight_date','?')}*\n"
+                                f"👤 Passenger: *{info.get('passenger_name','?')}*\n"
+                                + (f"🗺️ Route: *{route_display}*\n" if route_display else "") +
+                                f"\nIs this correct?"
+                            ))
+                        else:
+                            confirm = with_bar("doc_confirm", (
+                                f"✅ *Document lu !*\n\n"
+                                f"✈️ Vol : *{fn or '?'}* — {airline_display}\n"
+                                f"📅 Date : *{conv['data'].get('flight_date','?')}*\n"
+                                f"👤 Passager : *{info.get('passenger_name','?')}*\n"
+                                + (f"🗺️ Trajet : *{route_display}*\n" if route_display else "") +
+                                f"\nC'est correct ?"
+                            ))
+                        buttons = [
+                            {"id": "doc_confirm_yes", "title": "✅ Oui" if lang=="fr" else "✅ Yes"},
+                            {"id": "doc_confirm_no",  "title": "✏️ Corriger" if lang=="fr" else "✏️ Correct it"},
+                        ]
+                        send_whatsapp_buttons(phone, confirm, buttons)
+                        conv["current_step"] = "doc_confirm"
+                        return jsonify({"status": "ok"}), 200
+                except Exception as e:
+                    print(f"[SCAN] erreur parsing: {e}")
+
+            # Scan échoué → message d'excuse puis collecte manuelle
+            if lang == "en":
+                send_whatsapp_text(phone, with_bar("document", (
+                    "😕 *Sorry, the image quality didn't allow automatic reading.*\n"
+                    "Try again with more light, or answer the questions below — it only takes 2 minutes. 👇"
+                )))
+            else:
+                send_whatsapp_text(phone, with_bar("document", (
+                    "😕 *Désolé, la qualité de l'image n'a pas permis une lecture automatique.*\n"
+                    "Essayez avec plus de lumière, ou répondez aux questions ci-dessous — ça prend 2 minutes. 👇"
+                )))
+            time.sleep(1)
+            _advance_after_scan(phone, conv)
+            return jsonify({"status": "ok"}), 200
+
+        # ── RÉCEPTION PASSEPORT — MSG 13 ─────────────────────────
+        if current_step == "passport_collect" and image_data:
+            passports = conv["data"].get("passports_collected", [])
+            names = conv["data"].get("passenger_names", [])
+            idx   = len(passports)
+            name  = names[idx] if idx < len(names) else f"Passager {idx+1}"
+            passports.append({"name": name, "received": True})
+            conv["data"]["passports_collected"] = passports
+            # Airtable — upload pièce d'identité + sauvegarde après document reçu
+            if F_PIECE_IDENTITE:
+                at_attach_image(phone, conv, image_data, F_PIECE_IDENTITE, idx0=idx, tag="passeport")
+            upsert_airtable(phone, conv)
+            if lang == "en":
+                send_whatsapp_text(phone, with_bar("passport_collect", f"✅ Passport *{name}* received! ({idx+1}/{conv['data'].get('passengers',1)})"))
+            else:
+                send_whatsapp_text(phone, with_bar("passport_collect", f"✅ Passeport de *{name}* reçu ! ({idx+1}/{conv['data'].get('passengers',1)})"))
+            time.sleep(1)
+            _ask_passport_next(phone, conv)
+            return jsonify({"status": "ok"}), 200
+
+        # ── IMAGE : carte d'embarquement justificatif ────────────
+        if current_step == "boarding_collect" and image_data:
+            conv["data"]["boarding_collected"] = True
+            # Airtable — upload carte d'embarquement + sauvegarde après document reçu
+            if F_CARTE_EMBARQUEMENT:
+                at_attach_image(phone, conv, image_data, F_CARTE_EMBARQUEMENT, idx0=0, tag="carte")
+            upsert_airtable(phone, conv)
+            if lang == "en":
+                send_whatsapp_text(phone, with_bar("boarding_collect", "✅ Boarding pass received!"))
+            else:
+                send_whatsapp_text(phone, with_bar("boarding_collect", "✅ Carte d'embarquement reçue !"))
+            time.sleep(1)
+            conv["current_step"] = "ebillet_collect"
+            ask_ebillet(phone, conv)
+            return jsonify({"status": "ok"}), 200
+
+        # ── IMAGE : e-billet ─────────────────────────────────────
+        if current_step == "ebillet_collect" and image_data:
+            conv["data"]["ebillet_collected"] = True
+            if lang == "en":
+                send_whatsapp_text(phone, with_bar("ebillet_collect", "✅ Booking confirmation received!"))
+            else:
+                send_whatsapp_text(phone, with_bar("ebillet_collect", "✅ Confirmation de réservation reçue !"))
+            time.sleep(1)
+            conv["current_step"] = "certificat_collect"
+            ask_certificat_retard(phone, conv)
+            return jsonify({"status": "ok"}), 200
+
+        # ── IMAGE : certificat de retard ─────────────────────────
+        if current_step == "certificat_collect" and image_data:
+            conv["data"]["certificat_collected"] = True
+            if lang == "en":
+                send_whatsapp_text(phone, with_bar("certificat_collect", "✅ Certificate received! Excellent — this will speed up your case."))
+            else:
+                send_whatsapp_text(phone, with_bar("certificat_collect", "✅ Certificat reçu ! Excellent — il va accélérer votre dossier."))
+            time.sleep(1)
+            conv["current_step"] = "summary"
+            show_summary_and_mandat(phone, conv)
+            return jsonify({"status": "ok"}), 200
+
+        # ── MANUEL (option sans photo) — passe aux noms ──────────
+        if current_step == "document" and txt_lower in ("manuel","manual","manuellement","manually","✏️"):
+            _advance_after_scan(phone, conv)
+            return jsonify({"status": "ok"}), 200
+
+        # ── SCAN MULTI-PAX : fini / passer ───────────────────────
+        if current_step == "document" and txt_lower in ("fini","done","terminé","termine","passer","skip","c'est tout","that's all"):
+            scanned = conv["data"].get("scanned_docs", [])
+            if scanned:
+                _sort_scanned_docs(conv)
+                # Afficher récap des cartes scannées
+                if lang == "en":
+                    lines = "\n".join(f"✅ {d.get('flight_number','?')} — {d.get('passenger_name','?')} ({d.get('date','?')})" for d in scanned)
+                    send_whatsapp_text(phone, f"📋 *All scanned cards:*\n{lines}\n\n{'🗺️ Route: ' + conv['data'].get('route','') if conv['data'].get('route') else ''}")
+                else:
+                    lines = "\n".join(f"✅ {d.get('flight_number','?')} — {d.get('passenger_name','?')} ({d.get('date','?')})" for d in scanned)
+                    send_whatsapp_text(phone, f"📋 *Cartes scannées :*\n{lines}\n\n{'🗺️ Trajet : ' + conv['data'].get('route','') if conv['data'].get('route') else ''}")
+                time.sleep(1)
+            _advance_after_scan(phone, conv)
+            return jsonify({"status": "ok"}), 200
+
+        # ── CONFIRMATION DOCUMENT (texte) ────────────────────────
+        if current_step == "doc_confirm":
+            if txt_lower in ("oui","yes","ok","correct","c'est bon","👍","yep"):
+                _handle_doc_confirm(phone, True, conv)
+            else:
+                _handle_doc_confirm(phone, False, conv)
+            return jsonify({"status": "ok"}), 200
+
+        # ── CORRECTION DOCUMENT ──────────────────────────────────
+        if current_step == "doc_correction":
+            fn_match = re.search(r'\b([A-Z]{2}\d{2,4})\b', message_text.upper())
+            if fn_match:
+                fn = fn_match.group(1)
+                conv["data"]["flight_number"] = fn
+                guessed = guess_airline(fn)
+                if guessed: conv["data"]["airline"] = guessed
+            date_match = re.search(r'\b(\d{1,2})[/\-\. ](\d{1,2})[/\-\. ](\d{4})\b', message_text)
+            if date_match:
+                conv["data"]["flight_date"] = f"{date_match.group(1)}/{date_match.group(2)}/{date_match.group(3)}"
+            if lang == "en":
+                send_whatsapp_text(phone, "✅ Updated! Let's continue.")
+            else:
+                send_whatsapp_text(phone, "✅ Mis à jour ! On continue.")
+            _advance_after_scan(phone, conv)
+            return jsonify({"status": "ok"}), 200
+
+        # ── SÉLECTION TRAJET (aller-retour) ──────────────────────
+        if current_step == "trip_select":
+            _handle_trip_select(phone, "trip_outbound", conv)
+            return jsonify({"status": "ok"}), 200
+
+        # ── COLLECTE PASSAGER UN PAR UN — MSG 9 ──────────────────
+        if current_step == "passenger_collect":
+            name = message_text.strip()
+            if len(name) >= 2:
+                conv["data"]["_temp_pax_name"] = name
+                conv["current_step"]           = "passenger_confirm"
+                confirm_passenger(phone, conv, name)
+            else:
+                if lang == "en":
+                    send_whatsapp_text(phone, "✍️ Please type the first name and last name (eg: Jean Dupont):")
+                else:
+                    send_whatsapp_text(phone, "✍️ Tapez le prénom et le nom (ex : Jean Dupont) :")
+            return jsonify({"status": "ok"}), 200
+
+        if current_step == "passenger_confirm":
+            if txt_lower in ("oui","yes","ok","correct","c'est bon","👍"):
+                name = conv["data"].pop("_temp_pax_name", "")
+                if name:
+                    conv["data"]["passenger_names"].append(name)
+                idx = conv["data"].get("current_pax_index", 0) + 1
+                conv["data"]["current_pax_index"] = idx
+                conv["current_step"] = "passenger_collect"
+                ask_next_passenger(phone, conv)
+            else:
+                conv["current_step"] = "passenger_collect"
+                idx = conv["data"].get("current_pax_index", 0)
+                num = idx + 1
+                if lang == "en":
+                    send_whatsapp_text(phone, f"✍️ Passenger {num} — Type the correct first name and last name:")
+                else:
+                    send_whatsapp_text(phone, f"✍️ Passager {num} — Tapez le prénom et nom corrects :")
+            return jsonify({"status": "ok"}), 200
+
+        # ── SAISIE NUMÉRO DE VOL — MSG 10 ────────────────────────
+        if current_step == "flight_number":
+            fn_match = re.search(r'\b([A-Z]{2,3}\d{1,4})\b', message_text.upper())
+            fn = fn_match.group(1) if fn_match else message_text.strip().upper()
+            conv["data"]["flight_number"] = fn
+            guessed = guess_airline(fn)
+            if guessed and not conv["data"].get("airline"):
+                conv["data"]["airline"] = guessed
+            conv["current_step"] = "flight_number_confirm"
+            confirm_flight_number(phone, conv, fn, conv["data"].get("airline"))
+            return jsonify({"status": "ok"}), 200
+
+        # ── SAISIE DATE — MSG 10 ─────────────────────────────────
+        if current_step == "flight_date":
+            date_match = (
+                re.search(r'\b(\d{1,2})[/\-\. ](\d{1,2})[/\-\. ](\d{4})\b', message_text) or
+                re.search(r'\b(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})\b', message_text)
+            )
+            if date_match:
+                grps = date_match.groups()
+                if len(grps[0]) == 4:
+                    date_str = f"{grps[2]}/{grps[1]}/{grps[0]}"
+                else:
+                    date_str = f"{grps[0]}/{grps[1]}/{grps[2]}"
+            else:
+                date_str = message_text.strip()
+            conv["data"]["flight_date"] = date_str
+            conv["current_step"]        = "flight_date_confirm"
+            confirm_flight_date(phone, conv, date_str)
+            return jsonify({"status": "ok"}), 200
+
+        # ── SÉLECTION MINEURS (validation) — MSG 11 ──────────────
+        if current_step == "minor_select":
+            if txt_lower in ("ok", "done", "fini", "c'est bon", "terminé"):
+                minors = conv["data"].get("minor_names", [])
+                conv["data"]["minors_count"] = len(minors)
+                if len(minors) == conv["data"].get("passengers") and conv["data"].get("passengers") == 1:
+                    conv["data"]["dossier_status"] = "escalade_expert"
+                    conv["data"]["escalade_reason"] = "mineur_seul"
+                    if lang == "en":
+                        send_whatsapp_text(phone, (
+                            "👶 *Minor passenger travelling alone — parental signature required.*\n\n"
+                            "The law requires a parent or legal guardian to sign the representation mandate for a minor.\n\n"
+                            "We'll handle this file with you directly.\n\n"
+                            "📱 *A Robin des Airs expert will call you back within 24h* to guide you through the procedure.\n\n"
+                            "_Robin des Airs team_"
+                        ))
+                    else:
+                        send_whatsapp_text(phone, (
+                            "👶 *Passager mineur voyageant seul — signature parentale requise.*\n\n"
+                            "La loi exige qu'un parent ou tuteur légal signe le mandat de représentation pour un mineur.\n\n"
+                            "Nous allons traiter ce dossier avec vous directement.\n\n"
+                            "📱 *Un expert Robin des Airs vous rappelle dans les 24h* pour accompagner la procédure.\n\n"
+                            "_L'équipe Robin des Airs_"
+                        ))
+                    return jsonify({"status": "ok"}), 200
+                conv["current_step"] = "recap"
+                show_recap(phone, conv)
+            return jsonify({"status": "ok"}), 200
+
+        # ── PASSER PASSEPORT — MSG 13 ────────────────────────────
+        if current_step == "passport_collect":
+            if txt_lower in ("passer", "skip", "plus tard", "later"):
+                passports = conv["data"].get("passports_collected", [])
+                names     = conv["data"].get("passenger_names", [])
+                idx       = len(passports)
+                name      = names[idx] if idx < len(names) else f"Passager {idx+1}"
+                passports.append({"name": name, "received": False, "skipped": True})
+                conv["data"]["passports_collected"] = passports
+                if lang == "en":
+                    send_whatsapp_text(phone, f"⏭️ Passport *{name}* — to send later by email. Noted.")
+                else:
+                    send_whatsapp_text(phone, f"⏭️ Passeport *{name}* — à envoyer plus tard par email. Noté.")
+                time.sleep(1)
+                _ask_passport_next(phone, conv)
+            return jsonify({"status": "ok"}), 200
+
+        if current_step == "boarding_collect":
+            if txt_lower in ("appel", "call", "perdu", "lost", "je n'ai plus", "i lost"):
+                conv["data"]["dossier_status"]  = "escalade_expert"
+                conv["data"]["escalade_reason"] = "document_perdu"
+                if lang == "en":
+                    send_whatsapp_text(phone, "📞 *No worries — our expert can help you retrieve your documents.*\n\nLeave this conversation open. An expert will contact you directly to help.\n\n_Robin des Airs team_")
+                else:
+                    send_whatsapp_text(phone, "📞 *Pas de panique — notre expert peut vous aider à retrouver vos documents.*\n\nLaissez cette conversation ouverte. Un expert vous contacte directement pour vous aider.\n\n_L'équipe Robin des Airs_")
+                return jsonify({"status": "ok"}), 200
+            if txt_lower in ("passer", "skip", "plus tard", "later"):
+                conv["data"]["boarding_collected"] = False
+                if lang == "en": send_whatsapp_text(phone, "⏭️ Boarding pass — to send later by email. Noted.")
+                else: send_whatsapp_text(phone, "⏭️ Carte d'embarquement — à envoyer plus tard par email. Noté.")
+                time.sleep(1)
+                conv["current_step"] = "ebillet_collect"
+                ask_ebillet(phone, conv)
+            return jsonify({"status": "ok"}), 200
+
+        if current_step == "ebillet_collect":
+            if txt_lower in ("appel", "call", "perdu", "lost", "je ne trouve pas", "can't find"):
+                conv["data"]["dossier_status"]  = "escalade_expert"
+                conv["data"]["escalade_reason"] = "document_perdu"
+                if lang == "en":
+                    send_whatsapp_text(phone, "📞 *Our expert will help you find your booking confirmation.*\n\nCheck your spam folder or your travel app (Booking, Expedia, airline website).\nIf you still can't find it — leave this conversation open, an expert contacts you.\n\n_Robin des Airs team_")
+                else:
+                    send_whatsapp_text(phone, "📞 *Notre expert peut vous aider à retrouver votre confirmation.*\n\nVérifiez vos spams ou votre appli voyage (Booking, Expedia, site de la compagnie).\nSi vous ne trouvez toujours pas — laissez cette conversation ouverte, un expert vous contacte.\n\n_L'équipe Robin des Airs_")
+                return jsonify({"status": "ok"}), 200
+            if txt_lower in ("passer", "skip", "plus tard", "later"):
+                conv["data"]["ebillet_collected"] = False
+                if lang == "en": send_whatsapp_text(phone, "⏭️ Booking confirmation — to send later by email. Noted.")
+                else: send_whatsapp_text(phone, "⏭️ Confirmation de réservation — à envoyer plus tard par email. Noté.")
+                time.sleep(1)
+                conv["current_step"] = "certificat_collect"
+                ask_certificat_retard(phone, conv)
+            return jsonify({"status": "ok"}), 200
+
+        if current_step == "certificat_collect":
+            if txt_lower in ("passer", "skip", "plus tard", "later", "non", "no", "j'en ai pas", "i don't have one"):
+                conv["data"]["certificat_collected"] = False
+                if lang == "en": send_whatsapp_text(phone, "⏭️ No certificate — noted. Most common case, no worries!")
+                else: send_whatsapp_text(phone, "⏭️ Pas de certificat — noté. C'est le cas le plus fréquent, pas de souci !")
+                time.sleep(1)
+                conv["current_step"] = "summary"
+                show_summary_and_mandat(phone, conv)
+            return jsonify({"status": "ok"}), 200
+
+        # ── SAISIE ROUTE (modification) ──────────────────────────
+        if current_step == "route_input":
+            conv["data"]["route"]    = message_text.strip()
+            conv["current_step"]     = "recap"
+            show_recap(phone, conv)
+            return jsonify({"status": "ok"}), 200
+
+        # ── FALLBACK IA — CLIENT HORS FLUX ───────────────────────
+        send_ia_fallback(phone, lang)
+        return jsonify({"status": "ok"}), 200
 
     except Exception as e:
-        print(f"❌ Airtable exception: {e}")
+        print(f"Erreur webhook: {e}")
         import traceback
         traceback.print_exc()
+        return jsonify({"status": "error"}), 500
 
-def _boarding_image_bytes(image_b64):
-    if not image_b64:
-        return None
-    try:
-        return base64.b64decode(image_b64, validate=False)
-    except Exception:
-        return None
 
-def _guess_image_suffix(raw_bytes):
-    if not raw_bytes or len(raw_bytes) < 8:
-        return ".jpg", "image/jpeg"
-    if raw_bytes[:8] == b"\x89PNG\r\n\x1a\n":
-        return ".png", "image/png"
-    if raw_bytes[:2] == b"\xff\xd8":
-        return ".jpg", "image/jpeg"
-    if raw_bytes[:4] == b"GIF8":
-        return ".gif", "image/gif"
-    if raw_bytes[:4] == b"RIFF" and len(raw_bytes) >= 12 and raw_bytes[8:12] == b"WEBP":
-        return ".webp", "image/webp"
-    return ".jpg", "image/jpeg"
+def _handle_trip_select(phone, btn_id, conv):
+    """Sélection trajet aller-retour → confirme et continue vers la suite du scan/noms."""
+    touch_activity(conv)
+    if btn_id == "trip_return":
+        rt = conv["data"].get("route","")
+        if "→" in rt:
+            parts = rt.split("→")
+            conv["data"]["route"] = f"{parts[1].strip()} → {parts[0].strip()}"
+    conv["data"]["boarding_pass_confirmed"] = True
+    _advance_after_scan(phone, conv)
 
-def at_upload_boarding_attachment(record_id, raw_bytes, ref_tag, pax_index):
-    """POST uploadAttachment (API Airtable) sur le champ F_CARTE_EMBARQUEMENT."""
-    fid = F_CARTE_EMBARQUEMENT
-    if not AIRTABLE_API_KEY or not fid or not record_id or not raw_bytes:
-        return False
-    if len(raw_bytes) > 5 * 1024 * 1024:
-        print("at_upload_boarding_attachment: fichier > 5 Mo (limite Airtable)")
-        return False
-    ext, mime = _guess_image_suffix(raw_bytes)
-    fname = f"carte_{ref_tag or 'dossier'}_p{int(pax_index) + 1}{ext}"
-    b64 = base64.b64encode(raw_bytes).decode("ascii")
-    payload = {"contentType": mime, "file": b64, "filename": fname}
-    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
-    # Airtable sert souvent l’upload sur content.airtable.com ; api… peut renvoyer 404 selon les bases.
-    urls = (
-        f"https://content.airtable.com/v0/{AIRTABLE_BASE_ID}/{record_id}/{fid}/uploadAttachment",
-        f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{record_id}/{fid}/uploadAttachment",
-    )
-    last_err = None
-    for url in urls:
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=90)
-            if r.status_code in (200, 201):
-                return True
-            last_err = f"{url.split('/')[2]} {r.status_code}: {r.text[:400]}"
-        except Exception as e:
-            last_err = f"{url.split('/')[2]} exc: {e}"
-    print(f"Airtable uploadAttachment failed: {last_err}")
-    return False
 
-def at_pick_record_id_for_passenger(recs, names, i_0based):
-    """Record Airtable pour le passager i (0-based)."""
-    if not recs or i_0based < 0:
-        return None
-    target = ""
-    if isinstance(names, list) and i_0based < len(names):
-        target = str(names[i_0based]).strip()
-    if target:
-        for r in recs:
-            fn = (r.get("fields") or {}).get(F_NOM_PASSAGER)
-            if fn and str(fn).strip() == target:
-                return r.get("id")
-    if i_0based < len(recs):
-        return recs[i_0based].get("id")
-    return None
-
-def at_boarding_attach_to_indices(phone, conv, image_b64, indices_0based, lang):
-    """
-    Enregistre la même image sur les lignes passagers indiquées (indices 0-based).
-    Crée les lignes Airtable si le dossier n'existe pas encore.
-    Retourne le nombre d'uploads réussis.
-    """
-    if not F_CARTE_EMBARQUEMENT or not image_b64:
-        if image_b64 and not F_CARTE_EMBARQUEMENT:
-            print("at_boarding_attach_to_indices: AIRTABLE_F_CARTE_EMB vide — skip upload")
-        return 0
-    raw = _boarding_image_bytes(image_b64)
-    if not raw:
-        return 0
-    if len(raw) > 5 * 1024 * 1024:
-        send(
-            phone,
-            "⚠️ *Image trop lourde* (max 5 Mo pour l’enregistrement du billet sur notre dossier). "
-            "Réduisez la taille ou renvoyez une capture plus compressée."
-            if lang == "fr"
-            else "⚠️ *Image too large* (max 5 MB for boarding-pass storage). Please send a smaller or more compressed photo.",
-        )
-        print(f"at_boarding_attach_to_indices: image {len(raw)} bytes > 5 Mo (tel={phone})")
-        return 0
-    d = conv["data"]
-    ref = conv.get("ref") or make_ref(phone)
-    conv["ref"] = ref
-    names = list(d.get("passenger_names") or [])
-    clean = []
-    seen = set()
-    for x in indices_0based or []:
-        try:
-            i = int(x)
-        except (TypeError, ValueError):
-            continue
-        if i < 0 or i in seen:
-            continue
-        seen.add(i)
-        clean.append(i)
-    if not clean:
-        return 0
-    recs = at_find(ref)
-    if not recs:
-        at_save(phone, conv)
-        recs = at_find(ref)
-    if not recs:
-        print(f"at_boarding_attach_to_indices: aucun record Airtable pour ref={ref} après at_save — skip upload")
-        return 0
-    n_ok = 0
-    for i in sorted(clean):
-        rid = at_pick_record_id_for_passenger(recs, names, i)
-        if rid and at_upload_boarding_attachment(rid, raw, ref, i):
-            n_ok += 1
-    return n_ok
-
-def _boarding_attach_idx_plan(d, info, step_before, after_passengers, idx_for_attach):
-    """Indices 0-based des lignes passager où attacher la même image de billet."""
-    max_p = int(d.get("passengers") or 6)
-    if max_p < 1:
-        max_p = 1
-    pax = int(d.get("passengers") or 1)
-    inf = info if isinstance(info, dict) else {}
-    vis_list = _passenger_names_from_vision(inf, max_p)
-    if step_before == "passenger_names":
-        return [min(idx_for_attach, max(0, pax - 1))]
-    if step_before == "passenger_names_confirm":
-        nm = d.get("passenger_names") or []
-        return list(range(min(len(nm), pax)))
-    if after_passengers:
-        return [0]
-    if vis_list:
-        return list(range(min(len(vis_list), pax)))
-    return [0]
-
-# ===== MESSAGES DU FLUX =====
-
-def _privacy_consent_footer(lang):
-    """
-    Bloc légal + confidentialité au démarrage de la collecte « utile » (après choix passagers).
-    Structure inspirée des plateformes type AirHelp : nature du service, honoraires, alternatives,
-    droit de rétractation, données — adapté Robin des Airs / robindesairs.eu (pas un copier-coller).
-    """
-    if lang == "en":
-        return (
-            "──────────────\n"
-            "📜 *What this service is*\n\n"
-            "*Robin des Airs* (" + RDA_DOMAIN.rstrip("/") + ") helps you **open and follow** a passenger "
-            "compensation file under **EU Regulation 261/2004** (and related rules where applicable). "
-            "This WhatsApp flow collects **information** only; the **contractual relationship and mandate** "
-            "are those on **our website / mandate document**.\n\n"
-            "We are **not a law firm** and this bot does **not** provide tailored legal advice. Amounts shown "
-            "(e.g. *600 € gross* tier) are **indicative**; any payment depends on **facts**, **distance** and the airline.\n\n"
-            "💶 *Fees:* you owe **nothing** unless compensation is **actually obtained**; if we succeed, "
-            "Robin des Airs’ fee is as set out in the **mandate** (e.g. **25%** commission on the amount recovered — "
-            "the net share shown in the flow is an **example**).\n\n"
-            "🔄 *Other options:* you may claim **directly** from the airline, use **public ADR / mediation** schemes "
-            "(varies by country), or a lawyer. Some routes are **free**; airline participation is not always mandatory.\n\n"
-            "🛡️ *Right of withdrawal (EU / UK-style consumers):* if you are a **consumer**, you generally have "
-            "**14 days** to cancel a distance contract — **unless** you expressly request **immediate performance** "
-            "before that period ends (*Consumer Code / similar*).\n\n"
-            "──────────────\n"
-            "🔒 *Personal data*\n\n"
-            "We are about to open your claim file. Your data are processed **for this claim**, stored securely "
-            "and in line with **GDPR**. They are **not sold** and are shared **only with the airline** as needed.\n\n"
-            "By continuing you accept this processing and confirm you have seen our **Terms** and **Privacy policy**:\n"
-            f"👉 *Terms:* {TERMS_URL}\n"
-            f"👉 *Privacy:* {PRIVACY_POLICY_URL}"
-        )
-    return (
-        "──────────────\n"
-        "📜 *Nature du service (résumé)*\n\n"
-        "*Robin des Airs* (" + RDA_DOMAIN.rstrip("/") + ") vous assiste pour **constituer et suivre** un dossier "
-        "d’indemnisation passagers sur la base du **règlement (UE) n°261/2004** (et textes connexes le cas échéant). "
-        "Ce fil WhatsApp sert à la **collecte d’informations** ; la **relation contractuelle** et les **pouvoirs** "
-        "figurent sur **robindesairs.eu** et dans le **document de mandat**.\n\n"
-        "Robin des Airs **n’est pas un cabinet d’avocats** : pas de **conseil juridique personnalisé** via ce bot. "
-        "Les montants affichés (ex. *600 € bruts* / palier) sont **indicatifs** ; tout versement dépend des **faits**, "
-        "des **distances** et de la **compagnie**.\n\n"
-        "💶 *Rémunération* : vous ne devez **rien** tant qu’aucune indemnité n’est **effectivement obtenue** ; "
-        "en cas de succès, la rémunération est celle du **mandat** (p.ex. commission **25 %** sur l’indemnité — "
-        "le **net** affiché dans le tunnel est un **exemple**).\n\n"
-        "🔄 *Autres voies* : réclamation **directe** auprès de la compagnie, **médiation / conciliation** des transports "
-        "(selon pays), avocat. Souvent **gratuites** ; la participation des compagnies n’est pas toujours obligatoire.\n\n"
-        "🛡️ *Rétractation (consommateur)* : si vous êtes **consommateur**, vous disposez en principe de **14 jours** "
-        "pour revenir sur un contrat à distance — **sauf** si vous demandez l’**exécution immédiate** avant la fin de ce délai "
-        "(*art. L. 221-25 Code de la consommation*).\n\n"
-        "──────────────\n"
-        "🔒 *Données personnelles*\n\n"
-        "Nous allons constituer votre dossier. Vos données sont traitées **pour cette réclamation**, hébergées de façon "
-        "sécurisée et **conformes au RGPD**. Elles ne sont **pas vendues** et ne sont transmises **qu’à la compagnie aérienne** "
-        "dans le cadre utile au dossier.\n\n"
-        "En poursuivant, vous acceptez ce traitement et prenez connaissance des **CGU** et de la **politique de confidentialité** :\n"
-        f"👉 *Conditions générales* : {TERMS_URL}\n"
-        f"👉 *Confidentialité* : {PRIVACY_POLICY_URL}"
-    )
-
-def _privacy_short_notice(lang):
-    """
-    Mention courte au tout premier message (comme un bandeau + lien sur un site),
-    avant le simple choix du nombre de passagers — pas le paragraphe détaillé.
-    """
-    if os.environ.get("PRIVACY_HIDE_SHORT_NOTICE", "").strip().lower() in ("1", "true", "yes", "on"):
-        return ""
-    if lang == "en":
-        return (
-            "\n\n📋 *Legal (short):* this channel helps open an EU261-related file on robindesairs.eu — "
-            "not legal advice; fees only if we obtain compensation. "
-            f"*Terms:* {TERMS_URL} · *Privacy:* {PRIVACY_POLICY_URL}"
-        )
-    return (
-        "\n\n📋 *Rappel légal (court) :* ce canal sert à ouvrir un dossier lié au règlement UE 261 sur robindesairs.eu — "
-        "pas de conseil juridique personnalisé ; rémunération uniquement en cas de succès. "
-        f"*Conditions :* {TERMS_URL} · *Confidentialité :* {PRIVACY_POLICY_URL}"
-    )
-
-def q_passengers(phone, lang, conv=None):
-    """Étape 1 — Accueil + choix passagers (1–5 dossier auto, 6 = rappel expert 6+)."""
-    conv = conv or conversations.get(phone) or {"data": {"lang": lang}}
-    options = []
-    for n in range(1, 6):
-        brut, net, _, _ = calc_amounts(n)
-        bs = fmt_money_space(brut)
-        ns = fmt_money_space(net)
+def _handle_doc_confirm(phone, yes, conv):
+    """Confirmation des données lues sur le document → suite (noms ou vol/date)."""
+    touch_activity(conv)
+    lang = conv["data"].get("language", "fr")
+    if yes:
+        conv["data"]["boarding_pass_confirmed"] = True
+        _advance_after_scan(phone, conv)
+    else:
         if lang == "en":
-            lab = f"{n} person{'s' if n > 1 else ''} · up to {bs} €"
-            desc = f"~{ns} € net for you"
+            send_whatsapp_text(phone, "✍️ What would you like to correct?\nType the correct flight number and/or date.")
         else:
-            lab = f"{n} pers. · jusqu'à {bs} €" if n > 1 else "1 pers. · 600 €"
-            desc = f"~{ns} € nets pour vous"
-        options.append(
-            {
-                "id": str(n),
-                "label": lab,
-                "list_title": f"{n} · {bs} €",
-                "desc": desc,
-            }
-        )
-    options.append(
-        {
-            "id": "6",
-            "label": "6+ · expert vous rappelle" if lang == "fr" else "6+ · expert calls you",
-            "list_title": "6+ · expert 📞",
-            "desc": "Climbie" if lang == "fr" else "Expert callback",
+            send_whatsapp_text(phone, "✍️ Qu'est-ce que vous voulez corriger ?\nTapez le numéro de vol et/ou la date corrects.")
+        conv["current_step"] = "doc_correction"
+
+
+# ============================================
+# ENDPOINTS UTILITAIRES
+# ============================================
+
+@app.route("/test_flow/<phone>", methods=["GET"])
+def test_flow(phone):
+    conv = get_or_create_conversation(phone)
+    conv["ref_dossier"]  = generate_ref_dossier(phone)
+    conv["current_step"] = "welcome"
+    send_welcome_hook(phone, conv)
+    return jsonify({"status": "started", "phone": phone}), 200
+
+@app.route("/dossier_status/<phone>", methods=["GET"])
+def dossier_status(phone):
+    conv = conversations.get(phone)
+    if not conv:
+        return jsonify({"status": "not_found"}), 404
+    d = conv["data"]
+    return jsonify({
+        "phone": phone,
+        "dossier_status": d.get("dossier_status", "en_cours"),
+        "non_eligibility_reason": d.get("non_eligibility_reason"),
+        "escalade_reason": d.get("escalade_reason"),
+        "current_step": conv.get("current_step"),
+        "ref_dossier": conv.get("ref_dossier"),
+        "stat_variant": d.get("stat_variant"),
+        "passengers": d.get("passengers"),
+        "flight_number": d.get("flight_number"),
+        "flight_date": d.get("flight_date"),
+        "airline": d.get("airline"),
+        "route": d.get("route"),
+        "incident_type": d.get("incident_type"),
+        "passenger_names": d.get("passenger_names", []),
+        "preferred_language": d.get("preferred_language"),
+        "docs": {
+            "passports": len([p for p in d.get("passports_collected", []) if p.get("received")]),
+            "passports_skipped": len([p for p in d.get("passports_collected", []) if p.get("skipped")]),
+            "boarding_collected": d.get("boarding_collected"),
+            "ebillet_collected": d.get("ebillet_collected"),
+            "certificat_collected": d.get("certificat_collected"),
+            "scanned_docs": len(d.get("scanned_docs", [])),
+        },
+        "last_activity": conv.get("last_activity", conv["created"]).isoformat(),
+    }), 200
+
+
+@app.route("/conversations", methods=["GET"])
+def list_conversations():
+    result = {}
+    for phone, conv in conversations.items():
+        result[phone] = {
+            "step": conv.get("current_step"),
+            "data": conv["data"],
+            "messages": len(conv["messages"]),
+            "created": conv["created"].isoformat(),
+            "last_activity": conv.get("last_activity", conv["created"]).isoformat(),
         }
-    )
+    return jsonify(result), 200
+
+def _relance_message(conv, lang, montant):
+    """Choisit le message de relance selon le nombre de relances déjà envoyées."""
+    count = conv.get("relance_count", 0)
+    ref   = conv.get("ref_dossier", "")
+    ref_str = f" (réf. {ref})" if ref else ""
+
+    # Variantes de relance 2 (preuve sociale) — rotation par stat_variant ou aléatoire
+    import random as _random
+    r2_idx = conv["data"].get("stat_variant", _random.randrange(3)) % 3
+
     if lang == "en":
-        body = (
-            "👋 Welcome to *Robin des Airs* 🏹\n\n"
-            "Don't leave money with the airline.\n\n"
-            "A delayed or cancelled flight may entitle you to\n"
-            "*up to €600 per person* in legal compensation (long-haul example).\n\n"
-            "💶 *Examples (indicative):*\n"
-            "• 1 person → *€600*\n"
-            "• 2 people → *€1,200*\n"
-            "• 3 people → *€1,800*\n"
-            "_(You keep ~75% net if we recover — 25% fee only on success.)_\n\n"
-            "⚖️ *Zero upfront fees.* We take *25%*\n"
-            "only when you receive your money.\n\n"
-            "⏱️ *Your file opens in about 2 minutes* — a few short questions here.\n\n"
-            "👥 *How many people are you claiming for?*"
-        )
-        lbtn = "Choose"
-    else:
-        body = (
-            "👋 Bienvenue chez *Robin des Airs* 🏹\n\n"
-            "Ne laissez pas votre argent\n"
-            "à la compagnie aérienne.\n\n"
-            "Votre vol retardé ou annulé peut donner droit\n"
-            "à *600 € par personne* (indemnité légale, vol long-courrier).\n\n"
-            "💶 *Exemples indicatifs :*\n"
-            "• 1 personne → *600 €*\n"
-            "• 2 personnes → *1 200 €*\n"
-            "• 3 personnes → *1 800 €*\n"
-            "_(Vous touchez ~75 % nets si indemnité obtenue — 25 % de commission seulement en cas de succès.)_\n\n"
-            "⚖️ *Zéro frais.* On prend 25%\n"
-            "uniquement si vous recevez votre argent.\n\n"
-            "⏱️ *Votre dossier s’ouvre en environ 2 minutes* — quelques questions courtes ici.\n\n"
-            "👥 *Pour combien réclamez-vous ?*"
-        )
-        lbtn = "Choisir"
-    ok_poll = send_tunnel_poll(phone, conv, body, options, list_button_text=lbtn)
-    if not ok_poll:
-        lines = "\n".join(f"*{o['id']}* — {o['label']}" for o in options)
-        send(
-            phone,
-            f"{body}\n\n{lines}\n\n"
-            + (
-                "Répondez par un chiffre *1* à *6*."
-                if lang == "fr"
-                else "Reply with a number *1* to *6*."
-            ),
-        )
-
-def user_wants_fresh_start(text):
-    """Recommencer le dossier depuis le début (hors étape terminée)."""
-    if not text or len(text.strip()) < 3:
-        return False
-    low = text.lower().strip()
-    needles = (
-        "recommencer", "recommence", "nouveau dossier",
-        "effacer le dossier", "effacer dossier", "efface le dossier", "efface dossier",
-        "tout effacer", "repartir de zero", "repartir à zéro", "repartir a zero",
-        "reset dossier", "restart", "start over", "new claim", "new dossier",
-        "annule le dossier", "j annule", "j'annule", "annuler le dossier",
-        "on recommence", "refaire le dossier", "efface tout", "effacer tout",
-        "efface conversation", "zapper le dossier", "perte de temps recommencer",
-        "menu dossier", "raz dossier", "from scratch",
-    )
-    if low in ("recommencer", "restart", "reset") or re.search(r"\bmenu\b", low):
-        return True
-    return any(n in low for n in needles)
-
-def user_wants_expertise_rappel(text):
-    """Demande explicite de rappel / expert (option 6 = 6 personnes ou plus)."""
-    low = (text or "").lower().strip()
-    needles = (
-        "rappel expertise", "rappel d'expertise", "rappel expert",
-        "me rappeler", "rappel téléphonique", "rappel telephonique",
-        "appelez-moi", "appelez moi", "être rappelé", "etre rappele", "etre rappelé",
-        "rappel climbie", "parler à un expert", "parler a un expert",
-        "besoin d'un expert", "besoin dun expert", "conseiller humain",
-        "expertise prioritaire",
-    )
-    return any(n in low for n in needles)
-
-def amount_potential_box(pax):
-    """Bloc montant indicatif (même rendu que l'étape incident)."""
-    brut, net, _, _ = calc_amounts(pax)
-    box = (
-        f"╔══════════════════════╗\n"
-        f"║  💶 MONTANT POTENTIEL  ║\n"
-        f"║                        ║\n"
-        f"║   *{brut} EUR*{' ' * (8 - len(str(brut)))}         ║\n"
-        f"║                        ║\n"
-        f"║  ✅ NET POUR VOUS :    ║\n"
-        f"║   *{net} EUR* (75%)    ║\n"
-        f"╚══════════════════════╝"
-    )
-    return brut, net, box
-
-def q_boarding_after_pax(phone, lang, conv, pax=None):
-    """Message 3 : preuves carte / billet — sondage photo / saisie manuelle."""
-    if lang == "en":
-        body = (
-            "*📸 PROOF — Boarding pass / booking confirmation*\n\n"
-            "👍 We'll save you time.\n\n"
-            "*The upside:* our system reads a sharp photo and fills in your file — it's the fastest step!\n\n"
-            "*How would you like to continue?*"
-        )
-        options = [
-            {"id": "1", "label": "Send a boarding pass photo", "button": "📸 Photo"},
-            {"id": "2", "label": "Enter details manually", "button": "⌨️ Manual"},
+        relance2_variants = [
+            f"💬 *Passengers like you are already getting paid.*\n\nThis week, a Paris-Dakar traveller received *1 350€* thanks to Robin des Airs.\n\nYour file{ref_str} is still open. Type *menu* 👇",
+            f"👨‍👩‍👧 *A family of 3 just recovered 1 800€ this week.*\n\nTheir file took less than 5 minutes to open.\n\nYours{ref_str} is ready. Type *menu* 👇",
+            f"✍️ *A passenger from Abidjan-Paris just signed their mandate.*\n\nYours{ref_str} is waiting — don't leave money on the table.\n\nType *menu* 👇",
+        ]
+        messages = [
+            f"✈️ *Your file is waiting!*\n\nYou were 2 minutes away from claiming *{montant}€*.\n\nType *menu* to pick up where you left off 👇",
+            relance2_variants[r2_idx],
+            f"⏳ *Last chance today.*\n\nWe can only keep this conversation open a little longer. Don't let the airline keep your money.\n\nType *menu* now 👇\n\n_Robin des Airs team_",
         ]
     else:
-        body = (
-            "*📸 PREUVES — Carte d'embarquement / confirmation*\n\n"
-            "👍 On va vous faire gagner du temps.\n\n"
-            "*L'avantage* : une photo nette permet de remplir le dossier automatiquement — c'est le plus rapide !\n\n"
-            "*Comment souhaitez-vous continuer ?*"
-        )
-        options = [
-            {"id": "1", "label": "Envoyer une photo de carte", "button": "📸 Photo"},
-            {"id": "2", "label": "Saisir les infos à la main", "button": "⌨️ Manuel"},
+        relance2_variants = [
+            f"💬 *Des passagers comme vous ont déjà récupéré leur argent.*\n\nCette semaine, un voyageur Paris-Dakar a reçu *1 350€* grâce à Robin des Airs.\n\nVotre dossier{ref_str} est toujours ouvert. Tapez *menu* 👇",
+            f"👨‍👩‍👧 *Une famille de 3 vient de récupérer 1 800€ cette semaine.*\n\nLeur dossier a été ouvert en moins de 5 minutes.\n\nLe vôtre{ref_str} est prêt. Tapez *menu* 👇",
+            f"✍️ *Un passager Abidjan-Paris vient de signer son mandat.*\n\nLe vôtre{ref_str} vous attend — ne laissez pas cet argent à la compagnie.\n\nTapez *menu* 👇",
         ]
-    send_tunnel_poll(phone, conv, body, options)
-
-def q_boarding_next_passenger(phone, lang, pax_index, total_pax):
-    """Après le 1er billet : même logique pour les passagers suivants (photo ou nom seul, billet demandé plus tard)."""
-    if lang == "en":
-        msg = (
-            f"*📸 PROOF — Boarding pass / booking confirmation (passenger {pax_index}/{total_pax})*\n\n"
-            "👍 Same idea as before: send a *photo* of this passenger’s boarding pass or e-ticket "
-            "*(flat, no glare)*.\n\n"
-            "*The upside:* our system can still fill in flight details automatically.\n\n"
-            "⌨️ *No pass handy?* Reply *2* or *B*: you can send *First LAST* right away — "
-            "we’ll ask for a *boarding-pass photo later* to complete the file.\n\n"
-            "_A photo is still useful when you have it (airline / PNR / route)._"
-        )
-    else:
-        msg = (
-            f"*📸 PREUVES — Carte d'embarquement / confirmation de réservation (passager {pax_index}/{total_pax})*\n\n"
-            "👍 Même principe que pour le premier passager : envoyez une *photo* de la carte ou du billet "
-            "de cette personne *(bien à plat, sans reflets)*.\n\n"
-            "*L'avantage* : notre système peut encore compléter automatiquement les infos du vol.\n\n"
-            "⌨️ *Pas la carte sous la main ?* Tapez *2* ou *B* : vous pouvez envoyer tout de suite le "
-            "*prénom* et le *nom* — nous vous demanderons une *photo du billet plus tard* pour finaliser le dossier.\n\n"
-            "_La photo reste utile dès que vous l’avez (compagnie, PNR, trajet)._"
-        )
-    send(phone, msg)
-
-def q_passenger_name_post_add_confirm(phone, lang, conv, recorded_name):
-    """Après chaque nom saisi : confirmer ou corriger avant le passager suivant."""
-    if lang == "en":
-        body = f"✅ *{recorded_name}* saved."
-        options = [
-            {"id": "1", "label": "Correct — continue", "button": "✅ Correct"},
-            {"id": "2", "label": "Fix this name", "button": "✏️ Fix"},
+        messages = [
+            f"✈️ *Votre dossier vous attend !*\n\nVous étiez à 2 minutes de réclamer *{montant}€*.\n\nTapez *menu* pour reprendre là où vous vous êtes arrêté 👇",
+            relance2_variants[r2_idx],
+            f"⏳ *Dernière chance aujourd'hui.*\n\nNous ne pouvons garder cette conversation ouverte que peu de temps encore. Ne laissez pas la compagnie garder votre argent.\n\nTapez *menu* maintenant 👇\n\n_L'équipe Robin des Airs_",
         ]
-    else:
-        body = f"✅ *{recorded_name}* enregistré."
-        options = [
-            {"id": "1", "label": "C'est correct", "button": "✅ Correct"},
-            {"id": "2", "label": "Corriger ce nom", "button": "✏️ Corriger"},
-        ]
-    send_tunnel_poll(phone, conv, body, options)
+    return messages[min(count, len(messages)-1)]
 
-def q_pax_ack_route(phone, lang, conv):
-    """Juste après le nombre de passagers : direct vs correspondance."""
-    pax = (conv.get("data") or {}).get("passengers") or 1
-    if lang == "en":
-        body = (
-            f"{pax_registered_ack(pax, 'en')}\n\n"
-            "✈️ For this trip: *direct flight* or *with a connection*?"
-        )
-        options = [
-            {"id": "1", "label": "Direct flight", "button": "✈️ Direct"},
-            {"id": "2", "label": "With connection", "button": "🔄 Connection"},
-        ]
-    else:
-        body = (
-            f"{pax_registered_ack(pax, 'fr')}\n\n"
-            "✈️ Sur ce trajet : vol *direct* ou *avec correspondance* ?"
-        )
-        options = [
-            {"id": "1", "label": "Vol direct", "button": "✈️ Direct"},
-            {"id": "2", "label": "Avec correspondance", "button": "🔄 Escale"},
-        ]
-    send_tunnel_poll(phone, conv, body, options)
 
-def q_pax_contact_lang(phone, lang, conv):
-    """Après le type de parcours : montant indicatif + choix de langue pour les experts."""
-    d = conv.get("data") or {}
-    pax = d.get("passengers") or 1
-    _, net, _, _ = calc_amounts(pax)
-    net_s = fmt_money_space(net)
-    options = []
-    for i, (_c, fl, lab_fr, lab_en) in enumerate(EXPERT_LANG_OPTIONS, start=1):
-        lab = lab_fr if lang == "fr" else lab_en
-        options.append(
-            {
-                "id": str(i),
-                "label": f"{fl} {lab}",
-                "list_title": f"{fl} {lab}"[:24],
-            }
-        )
-    if lang == "en":
-        body = (
-            f"✅ *Got it* — we'll push for *up to {net_s} € net* for your group. 🚀\n\n"
-            "Which language should our experts use for voice notes and follow-up?"
-        )
-        lbtn = "Language"
-    else:
-        body = (
-            f"✅ *C'est noté* — nous visons jusqu'à *{net_s} € net* pour votre groupe. 🚀\n\n"
-            "Dans quelle langue nos experts doivent-ils vous contacter *(vocal, suivi)* ?"
-        )
-        lbtn = "Langue"
-    send_tunnel_poll(phone, conv, body, options, list_button_text=lbtn)
+@app.route("/check_abandoned", methods=["GET"])
+def check_abandoned():
+    """Liste les conversations abandonnées (step != completed) selon les paliers RELANCE_THRESHOLDS_HOURS.
+    Pour un cron externe. Avec ?send=1, envoie la relance correspondant au prochain palier dû."""
+    now = datetime.now()
+    do_send = request.args.get("send") in ("1", "true", "yes")
+    abandoned = []
+    for phone, conv in conversations.items():
+        step = conv.get("current_step")
+        if step in (None, "completed"):
+            continue
+        last = conv.get("last_activity", conv["created"])
+        idle_hours = (now - last).total_seconds() / 3600.0
+        count = conv.get("relance_count", 0)
 
-def q_pax_voice_confirm(phone, lang, conv):
-    """Confirmation courte après le choix de langue expert — avant l’incident."""
-    d = conv.get("data") or {}
-    code = d.get("expert_phone_lang") or "fr"
-    label = _expert_lang_display(code, lang)
-    if lang == "en":
-        body = (
-            f"Perfect! ✅ Voice notes, if needed, will be in *{label}*.\n\n"
-            "Ready to continue?"
-        )
-        options = [{"id": "1", "label": "Continue", "button": "✅ Continue"}]
-    else:
-        body = (
-            f"Parfait ! ✅ Les vocaux, si besoin, seront en *{label}*.\n\n"
-            "On continue ?"
-        )
-        options = [{"id": "1", "label": "Continuer", "button": "✅ Continuer"}]
-    send_tunnel_poll(phone, conv, body, options)
+        # Plus de relances disponibles
+        if count >= len(RELANCE_THRESHOLDS_HOURS):
+            continue
+        # Le palier de la prochaine relance n'est pas encore atteint
+        threshold = RELANCE_THRESHOLDS_HOURS[count]
+        if idle_hours < threshold:
+            continue
 
-def q_incident(phone, lang, conv, pax=None):
-    """Choix du type d’incident (après langue / confirmation vocale)."""
-    if lang == "en":
-        body = "⚖️ *What happened on this flight?*"
-        options = [
-            {"id": "1", "label": "Delay (+3 h at arrival)", "button": "⏱ Delay"},
-            {"id": "2", "label": "Flight cancelled", "button": "❌ Cancelled"},
-            {"id": "3", "label": "Overbooking", "button": "🚫 Overbooking"},
-        ]
-    else:
-        body = "⚖️ *Que s'est-il passé sur ce vol ?*"
-        options = [
-            {"id": "1", "label": "Retard (+3 h à l'arrivée)", "button": "⏱ Retard"},
-            {"id": "2", "label": "Vol annulé", "button": "❌ Annulé"},
-            {"id": "3", "label": "Surbooking", "button": "🚫 Surbooking"},
-        ]
-    send_tunnel_poll(phone, conv, body, options)
-
-def q_airline(phone, lang, conv=None):
-    conv = conv or conversations.get(phone) or {"data": {"lang": lang}}
-    options = []
-    for k, v in AIRLINES_MAP.items():
-        short = v[:22] if len(v) > 22 else v
-        options.append(
-            {
-                "id": k,
-                "label": v,
-                "list_title": short,
-            }
-        )
-    options.append(
-        {
-            "id": "9",
-            "label": "Autre compagnie" if lang == "fr" else "Other airline",
-            "list_title": "Autre ✏️" if lang == "fr" else "Other ✏️",
-            "desc": "Tapez le nom" if lang == "fr" else "Type the name",
+        d   = conv["data"]
+        lang = d.get("language", "fr")
+        pax = d.get("passengers") or 1
+        montant = 600 * pax
+        relance = _relance_message(conv, lang, montant)
+        entry = {
+            "phone": phone,
+            "step": step,
+            "idle_hours": round(idle_hours, 1),
+            "threshold": threshold,
+            "montant": montant,
+            "relance_count": count,
+            "relance": relance,
         }
-    )
-    if lang == "en":
-        body = "🛫 *Which airline?*\n\n_Open the list — or type the name / send a boarding pass photo._"
-        lbtn = "Airlines"
-    else:
-        body = "🛫 *Quelle compagnie aérienne ?*\n\n_Ouvrez la liste — ou tapez le nom / envoyez une photo de carte._"
-        lbtn = "Compagnies"
-    send_tunnel_poll(phone, conv, body, options, list_button_text=lbtn)
-
-def q_pnr(phone, lang, airline):
-    if lang == "en":
-        msg = (
-            f"✅ *{airline}* noted!\n\n"
-            "📋 *PNR / Booking reference*\n"
-            "(often 5–6 characters on your confirmation email; sometimes 4)\n\n"
-            "Example: *ABC12* or *ABC123*\n\n"
-            "_(Don't have it? Reply *SKIP* — photo also works.)_"
-        )
-    else:
-        msg = (
-            f"✅ *{airline}* noté !\n\n"
-            "📋 *PNR / Code de réservation*\n"
-            "(souvent 5–6 caractères sur l'email de confirmation ; parfois 4)\n\n"
-            "Exemple : *ABC12* ou *ABC123*\n\n"
-            "_(Pas le code ? Répondez *SKIP* — une photo de billet suffit aussi.)_"
-        )
-    send(phone, msg)
-
-def next_after_airline_pick(phone, lang, conv):
-    """Après choix de la compagnie : ne redemande pas PNR / n° de vol / date déjà fusionnés depuis la carte."""
-    d = conv["data"]
-    air = d.get("airline") or ""
-    pnr_clean = re.sub(r"[^A-Za-z0-9]", "", (d.get("pnr") or "").upper())
-    if len(pnr_clean) >= MIN_PNR_LEN:
-        d["pnr"] = pnr_clean[:8]
-    if d.get("flight_number") and d.get("flight_date"):
-        advance_after_flight_date_complete(phone, conv, lang)
-        return
-    if d.get("flight_number"):
-        conv["step"] = "flight_date"
-        q_flight_date(phone, lang, conv)
-        return
-    if len(pnr_clean) >= MIN_PNR_LEN:
-        conv["step"] = "flight_number"
-        q_flight_number(phone, lang)
-    else:
-        conv["step"] = "pnr_input"
-        q_pnr(phone, lang, air)
-
-def advance_after_incident(phone, lang, conv):
-    """
-    Après la preuve billet (ou saisie manuelle sans photo) : ne pas afficher le menu compagnie si déjà connu
-    (données fusionnées depuis la carte, ou n° de vol suffisant pour deviner l'IATA).
-    """
-    d = conv["data"]
-    if not (d.get("airline") or "").strip():
-        fn_raw = re.sub(r"[\s]+", "", (d.get("flight_number") or "").upper())
-        guess = airline_guess_from_flight_number(fn_raw) if fn_raw else None
-        if guess:
-            d["airline"] = guess
-    if (d.get("airline") or "").strip():
-        nm = (d.get("airline") or "").strip()
-        send(
-            phone,
-            f"✅ *{nm}* retenue pour la suite _(billet ou n° de vol)_ — pas besoin de la resaisir."
-            if lang == "fr"
-            else f"✅ Keeping *{nm}* _(from your pass or flight number)_ — no need to enter it again.",
-        )
-        next_after_airline_pick(phone, lang, conv)
-    else:
-        conv["step"] = "airline"
-        q_airline(phone, lang, conv)
-
-def q_flight_number(phone, lang):
-    if lang == "en":
-        msg = "✈️ *Flight number?*\nE.g. *SN271* — or send a boarding pass photo."
-    else:
-        msg = "✈️ *Numéro de vol ?*\nEx. *SN271* — ou une photo de carte d'embarquement."
-    send(phone, msg)
-
-def _claim_window_min_date(today=None):
-    """Date minimale indicative (rétroactivité ~5 ans)."""
-    t = today or date.today()
-    return t - timedelta(days=5 * 366)
-
-def _years_for_partial_ticket_dm(dm, today=None):
-    """
-    Jour/mois sans année : années où la date complète est déjà passée et pas hors fenêtre 5 ans.
-    Ex. 7 oct. + aujourd'hui 12 mai 2026 → 2026 exclu (vol « dans le futur »).
-    """
-    t = today or date.today()
-    tmin = _claim_window_min_date(t)
-    if not (dm and isinstance(dm, (list, tuple)) and len(dm) == 2):
-        return None
-    day_s, mon_s = dm[0], dm[1]
-    try:
-        di = int(str(day_s).lstrip("0") or "0")
-        mi = int(str(mon_s).lstrip("0") or "0")
-    except (TypeError, ValueError):
-        return None
-    if not (1 <= mi <= 12 and 1 <= di <= 31):
-        return None
-    out = []
-    for y in range(t.year, t.year - 14, -1):
-        try:
-            dt = date(y, mi, di)
-        except ValueError:
-            continue
-        if dt > t:
-            continue
-        if dt < tmin:
-            continue
-        out.append(y)
-        if len(out) >= 5:
-            break
-    return out
-
-def _parsed_dd_mm_yyyy_to_date(s):
-    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})\s*$", (s or "").strip())
-    if not m:
-        return None
-    d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    try:
-        return date(y, mo, d)
-    except ValueError:
-        return None
-
-def _is_valid_claim_flight_date_str(parsed):
-    """Date JJ/MM/AAAA : passée et pas manifestement hors fenêtre 5 ans."""
-    dt = _parsed_dd_mm_yyyy_to_date(parsed)
-    if not dt:
-        return True
-    t = date.today()
-    if dt > t:
-        return False
-    if dt < _claim_window_min_date(t):
-        return False
-    return True
-
-def q_flight_date(phone, lang, conv):
-    cy = datetime.now().year
-    today = date.today()
-    dm = conv["data"].get("pending_ticket_dm")
-    ticket_dm = bool(dm and isinstance(dm, (list, tuple)) and len(dm) == 2)
-
-    # Sans indice jour/mois billet : privilégier la date complète en un message (exemples sur une ligne).
-    if not ticket_dm:
-        conv["data"]["temp_years"] = [cy, cy - 1, cy - 2, cy - 3, cy - 4]
-        lines = "\n".join(f"{i + 1}️⃣  {conv['data']['temp_years'][i]}" for i in range(5))
-        tail_fr = f"\n\n6️⃣  Avant {cy - 4} _(hors rétroactivité 5 ans)_"
-        tail_en = f"\n\n6️⃣  Before {cy - 4} _(outside 5-year limit)_"
-        if lang == "en":
-            msg = (
-                "📅 *Flight date*\n\n"
-                "In *one message*, e.g. `12/05/2024`, `2024-05-12` or `12 May 2024`.\n\n"
-                "_Or_ pick the *year* first with the buttons below.\n\n"
-            ) + lines + tail_en
-        else:
-            msg = (
-                "📅 *Date du vol*\n\n"
-                "En *un message* : `12/05/2024`, `2024-05-12` ou `12 mai 2024`.\n\n"
-                "_Sinon_, choisissez d’abord l’*année* avec les touches ci-dessous.\n\n"
-            ) + lines + tail_fr
-        send(phone, msg)
-        return
-
-    partial_years = _years_for_partial_ticket_dm(dm, today)
-    if partial_years is not None:
-        yrs = partial_years if partial_years else [cy - 1, cy - 2, cy - 3]
-        conv["data"]["temp_years"] = yrs
-        lines = "\n".join(f"{i + 1}️⃣  {y}" for i, y in enumerate(yrs))
-    else:
-        conv["data"]["temp_years"] = [cy, cy - 1, cy - 2, cy - 3, cy - 4]
-        lines = "\n".join(f"{i + 1}️⃣  {conv['data']['temp_years'][i]}" for i in range(5))
-
-    intro_en = intro_fr = ""
-    if ticket_dm:
-        day_s, mon_s = dm[0], dm[1]
-        try:
-            mw = month_word(mon_s, lang)
-            di = int(day_s.lstrip("0") or "0")
-        except ValueError:
-            mw, di = mon_s, day_s
-        if lang == "en":
-            intro_en = (
-                f"🎫 Your boarding pass shows *{mw} {di}*, but **not the year**.\n"
-                f"*Which calendar year* was this flight?\n\n"
-            )
-        else:
-            intro_fr = (
-                f"🎫 *{di} {mw}* est indiqué sur votre carte d'embarquement, **sans l'année**.\n"
-                f"*De quelle année* s'agit-il ?\n\n"
-            )
-    shortcut_en = (
-        "\n\n💡 *Or type the full date in one message:* `DD/MM/YYYY` or `YYYY-MM-DD` "
-        "_(e.g. `12/05/2024` or `2024-05-12`) — skips the menus._"
-    )
-    shortcut_fr = (
-        "\n\n💡 *Ou tapez la date complète d’un coup :* `JJ/MM/AAAA` ou `AAAA-MM-JJ` "
-        "_(ex. `12/05/2024` ou `2024-05-12`, ou `12 mai 2024`) — sans passer par les menus._"
-    )
-
-    if partial_years is not None:
-        tail_fr = "\n\n💡 _Si votre année ne figure pas, envoyez la *date complète* (JJ/MM/AAAA)._"
-        tail_en = "\n\n💡 _If your year isn’t listed, send the *full date* (DD/MM/YYYY)._"
-    else:
-        tail_fr = f"\n\n6️⃣  Avant {cy - 4} _(hors rétroactivité 5 ans)_"
-        tail_en = f"\n\n6️⃣  Before {cy - 4} _(outside 5-year limit)_"
-
-    if lang == "en":
-        msg = (intro_en or "📅 *Which year* did you take this flight?\n\n") + lines + tail_en
-        msg += shortcut_en
-    else:
-        msg = (intro_fr or "📅 *Quelle année* avez-vous pris ce vol ?\n\n") + lines + tail_fr
-        msg += shortcut_fr
-    send(phone, msg)
-
-def q_flight_month(phone, lang, year):
-    y = (year or "").strip() or "?"
-    if lang == "en":
-        msg = (
-            f"📅 *Month?* ({y})\n\n"
-            "1️⃣ Jan  2️⃣ Feb  3️⃣ Mar  4️⃣ Apr\n"
-            "5️⃣ May  6️⃣ Jun  7️⃣ Jul  8️⃣ Aug\n"
-            "9️⃣ Sep  *10* Oct  *11* Nov  *12* Dec\n\n"
-            "💡 Or type the name, e.g. *October*."
-        )
-    else:
-        msg = (
-            f"📅 *Mois ?* ({y})\n\n"
-            "1️⃣ Jan  2️⃣ Fév  3️⃣ Mar  4️⃣ Avr\n"
-            "5️⃣ Mai  6️⃣ Juin  7️⃣ Juil  8️⃣ Août\n"
-            "9️⃣ Sep  *10* Oct  *11* Nov  *12* Déc\n\n"
-            "💡 Ou le nom du mois, ex. *mai*."
-        )
-    send(phone, msg)
-
-def q_flight_day(phone, lang, year, month_mm):
-    y = (year or "").strip() or "?"
-    mw = month_word(month_mm, lang)
-    if lang == "en":
-        msg = f"📅 *Day?* ({mw} {y}) — reply *1–31*"
-    else:
-        msg = f"📅 *Jour ?* ({mw} {y}) — *1 à 31*"
-    send(phone, msg)
-
-def _flight_brief_for_prompt(conv):
-    """Résumé vol + date pour les questions itinéraire (évite la confusion avec le récap carte)."""
-    d = conv["data"]
-    lang = d.get("lang", "fr")
-    fn = (d.get("flight_number") or "").strip() or "—"
-    fd = (d.get("flight_date") or "").strip()
-    if not fd:
-        dm = d.get("pending_ticket_dm")
-        if dm and isinstance(dm, (list, tuple)) and len(dm) == 2:
+        if do_send:
             try:
-                di = int(dm[0].lstrip("0") or "0")
-                mw = month_word(dm[1], lang)
-                fd = f"{di} {mw} (?)" if lang == "fr" else f"{mw} {di} (?)"
-            except (ValueError, TypeError):
-                fd = "?"
-        else:
-            fd = "?" if lang == "fr" else "?"
-    return fn, fd
-
-def q_itinerary_route_kind(phone, lang, conv):
-    """Avant départ/arrivée manuels : type de parcours (direct / escale / aller-retour sur même doc)."""
-    fn, fd = _flight_brief_for_prompt(conv)
-    if lang == "en":
-        body = (
-            "🛤️ *How was your trip routed?*\n\n"
-            f"We have *{fn}* · *{fd}* (flight + date). We still need the *airports* for the segment you claim."
-        )
-        options = [
-            {"id": "1", "label": "Non-stop", "button": "✈️ Direct"},
-            {"id": "2", "label": "With connection", "button": "🔄 Connection"},
-            {"id": "3", "label": "Round trip", "button": "🔁 Round trip"},
-        ]
-    else:
-        body = (
-            "🛤️ *Comment était le trajet ?*\n\n"
-            f"Nous avons *{fn}* · *{fd}* (vol + date). Il nous manque les *aéroports* du segment à indemniser."
-        )
-        options = [
-            {"id": "1", "label": "Vol direct", "button": "✈️ Direct"},
-            {"id": "2", "label": "Avec escale", "button": "🔄 Escale"},
-            {"id": "3", "label": "Aller-retour", "button": "🔁 A/R"},
-        ]
-    send_tunnel_poll(phone, conv, body, options)
-
-def q_itinerary_rt_pick(phone, lang, conv):
-    if lang == "en":
-        body = "🔁 *Which leg was affected?*"
-        options = [
-            {"id": "1", "label": "Outbound", "button": "→ Outbound"},
-            {"id": "2", "label": "Return", "button": "← Return"},
-            {"id": "3", "label": "Both directions", "button": "↔ Both"},
-        ]
-    else:
-        body = "🔁 *Quel sens du voyage est concerné ?*"
-        options = [
-            {"id": "1", "label": "Vol aller", "button": "→ Aller"},
-            {"id": "2", "label": "Vol retour", "button": "← Retour"},
-            {"id": "3", "label": "Les deux sens", "button": "↔ Les deux"},
-        ]
-    send_tunnel_poll(phone, conv, body, options)
-
-def q_itinerary_freeline(phone, lang, conv):
-    d = conv["data"]
-    mode = d.get("itin_collect_mode") or "connection"
-    fn, fd = _flight_brief_for_prompt(conv)
-    if mode == "connection":
-        if lang == "en":
-            msg = (
-                "📎 *Connecting / multi-segment route*\n\n"
-                f"Ticket line: *{fn}* · *{fd}*.\n\n"
-                "Send a **photo of the boarding pass for the disrupted segment**, "
-                "or type the **full route** with arrows, e.g.:\n"
-                "*BRU → CDG → ABJ*\n"
-                "or IATA only: *BRU CDG ABJ*"
-            )
-        else:
-            msg = (
-                "📎 *Escale / plusieurs segments*\n\n"
-                f"Ligne sur le billet : *{fn}* · *{fd}*.\n\n"
-                "Envoyez la **photo de la carte d’embarquement du tronçon où le problème s’est produit**, "
-                "ou tapez le **trajet complet** avec des flèches, par ex. :\n"
-                "*BRU → CDG → ABJ*\n"
-                "ou uniquement les codes IATA : *BRU CDG ABJ*"
-            )
-    elif mode == "rt_both":
-        if lang == "en":
-            msg = (
-                "📎 *Both outbound and return on the same booking*\n\n"
-                f"Flight line on ticket: *{fn}* · *{fd}*.\n\n"
-                "Type **both routes** separated by *|*, **most impacted leg first**, e.g.:\n"
-                "*CDG → ABJ | ABJ → CDG*\n\n"
-                "Or send **two boarding-pass photos** (we’ll ask you to confirm after the first read).\n\n"
-                "_For the claim file we mainly register the **first segment you type** before *|*._"
-            )
-        else:
-            msg = (
-                "📎 *Aller-retour sur la même réservation*\n\n"
-                f"Ligne sur le billet : *{fn}* · *{fd}*.\n\n"
-                "Indiquez les **deux trajets** séparés par *|*, **le vol le plus impacté en premier**, ex. :\n"
-                "*CDG → ABJ | ABJ → CDG*\n\n"
-                "Vous pouvez aussi envoyer **deux cartes d’embarquement** à la suite (nous vous ferons confirmer après la 1ʳᵉ lecture).\n\n"
-                "_Pour le dossier, on enregistre d’abord le **segment écrit avant le « | »** (vol principal de la réclamation)._"
-            )
-    elif mode in ("rt_out", "rt_in"):
-        if mode == "rt_out":
-            leg_fr, leg_en = "aller", "outbound"
-        else:
-            leg_fr, leg_en = "retour", "return"
-        if lang == "en":
-            msg = (
-                f"📎 *{leg_en.title()} — route for that leg only*\n\n"
-                f"Flight line on ticket: *{fn}* · *{fd}*.\n\n"
-                "Send the **boarding pass for that leg**, or type **departure → arrival** "
-                "for that segment only (e.g. *CDG → ABJ*)."
-            )
-        else:
-            msg = (
-                f"📎 *Vol {leg_fr} — trajet de ce segment uniquement*\n\n"
-                f"Ligne sur le billet : *{fn}* · *{fd}*.\n\n"
-                "Envoyez la **carte d’embarquement de ce vol**, ou tapez **départ → arrivée** "
-                "uniquement pour ce segment (ex. *CDG → ABJ*)."
-            )
-    else:
-        if lang == "en":
-            msg = (
-                "📎 *Route*\n\n"
-                f"Flight line: *{fn}* · *{fd}*.\n\n"
-                "Send a **boarding pass photo** or type a route with arrows."
-            )
-        else:
-            msg = (
-                "📎 *Trajet*\n\n"
-                f"Ligne sur le billet : *{fn}* · *{fd}*.\n\n"
-                "Envoyez une **photo de carte** ou tapez un trajet avec des flèches."
-            )
-    send(phone, msg)
-
-def q_itinerary_departure(phone, lang, conv):
-    fn, fd = _flight_brief_for_prompt(conv)
-    if lang == "en":
-        msg = (
-            "🛫 *Departure — disrupted segment*\n\n"
-            f"From your ticket we have: ✈️ *{fn}* on *{fd}*.\n"
-            "That is the **flight identity**; we still need the **departure airport** of the leg you claim for.\n\n"
-            "👉 Type **city or IATA code** (e.g. *BRU* or *Brussels*)."
-        )
-    else:
-        msg = (
-            "🛫 *Départ — segment du vol à indemniser*\n\n"
-            f"Sur votre billet nous avons : ✈️ *{fn}* · *{fd}*.\n"
-            "Ce sont le **numéro et la date** du vol ; il nous manque encore **l’aéroport de départ** du **même segment** que vous réclamez (celui du retard / annulation / surbooking).\n\n"
-            "👉 Indiquez la **ville ou le code IATA** (ex. *BRU*, *Bruxelles*)."
-        )
-    send(phone, msg)
-
-def q_itinerary_arrival(phone, lang, conv):
-    dep = (conv["data"].get("temp_itin_dep") or "").strip() or "?"
-    if lang == "en":
-        msg = (
-            "🛬 *Arrival — same segment*\n\n"
-            f"Departure you entered: *{dep}*.\n"
-            "👉 Now the **arrival** of this **same** flight (final airport of the segment, not your next connection unless that’s the claim).\n\n"
-            "_Example: *ABJ* or *Abidjan*_"
-        )
-    else:
-        msg = (
-            "🛬 *Arrivée — même segment*\n\n"
-            f"Départ indiqué : *{dep}*.\n"
-            "👉 Indiquez maintenant l’**arrivée** de **ce même vol** (aéroport final du segment indemnisable — pas la correspondance suivante, sauf si c’est elle qui fait l’objet du litige).\n\n"
-            "_Ex. *ABJ* ou *Abidjan*_"
-        )
-    send(phone, msg)
-
-def q_passenger_name(phone, lang, idx, pax, names_so_far):
-    already = ""
-    if names_so_far:
-        already = "\n".join([f"✅ {i+1}. {n}" for i, n in enumerate(names_so_far)]) + "\n\n"
-    same_vol_note = ""
-    if pax > 1 and names_so_far:
-        same_vol_note = (
-            "\nℹ️ _Même vol pour tout le monde : indiquez seulement le *prénom* et le *nom* de ce passager._\n"
-            if lang == "fr"
-            else "\nℹ️ _Same flight for everyone — just this passenger’s *first and last name*._\n"
-        )
-    if pax > 1:
-        pax_hdr = (
-            f"👤 *Passenger {idx} of {pax}*"
-            if lang == "en"
-            else f"👤 *Passager {idx} sur {pax}*"
-        )
-    else:
-        pax_hdr = "👤 *Passenger*" if lang == "en" else "👤 *Passager*"
-    if lang == "en":
-        msg = (
-            f"{already}"
-            f"{pax_hdr}{same_vol_note}\n"
-            "Send *First LAST* (last name in caps)\n"
-            "Example: *Fatou SALL*"
-        )
-    else:
-        msg = (
-            f"{already}"
-            f"{pax_hdr}{same_vol_note}\n"
-            "Envoyez *Prénom NOM* (nom en majuscules)\n"
-            "Exemple : *Aminata TRAORE*"
-        )
-    send(phone, msg)
-
-def q_passenger_names_confirm(phone, lang, conv):
-    """Après le 3ᵉ passager (si pax>3) ou après le dernier : liste à valider avant la suite."""
-    d = conv["data"]
-    names = d.get("passenger_names") or []
-    pax = d.get("passengers") or 1
-    lines = "\n".join(f"  {i+1}. *{n}*" for i, n in enumerate(names))
-    n_done = len(names)
-    partial = n_done < pax
-    if lang == "en":
-        if partial:
-            body = f"{pax_names_confirm_heading(pax, 'en', partial=True, n_done=n_done)}\n\n{lines}"
-            options = [
-                {"id": "1", "label": f"OK — passenger {n_done + 1}", "button": "✅ Continue"},
-                {"id": "2", "label": f"Fix passenger {n_done}", "button": "✏️ Fix"},
-            ]
-        else:
-            body = f"{pax_names_confirm_heading(pax, 'en')}\n\n{lines}"
-            options = [
-                {"id": "1", "label": "All correct", "button": "✅ Continue"},
-                {"id": "2", "label": "Fix last name", "button": "✏️ Fix"},
-            ]
-    else:
-        if partial:
-            body = f"{pax_names_confirm_heading(pax, 'fr', partial=True, n_done=n_done)}\n\n{lines}"
-            options = [
-                {"id": "1", "label": f"OK — passager {n_done + 1}", "button": "✅ Continuer"},
-                {"id": "2", "label": f"Corriger passager {n_done}", "button": "✏️ Corriger"},
-            ]
-        else:
-            body = f"{pax_names_confirm_heading(pax, 'fr')}\n\n{lines}"
-            options = [
-                {"id": "1", "label": "Tout est correct", "button": "✅ Continuer"},
-                {"id": "2", "label": "Corriger le dernier", "button": "✏️ Corriger"},
-            ]
-    send_tunnel_poll(phone, conv, body, options)
-
-def goto_passenger_names_confirm(phone, conv, lang):
-    conv["step"] = "passenger_names_confirm"
-    q_passenger_names_confirm(phone, lang, conv)
-
-def q_minors(phone, lang, conv):
-    """Question mineurs (mandat / représentation légale) avant le message de dépôt final."""
-    d = conv["data"]
-    names = d.get("passenger_names") or []
-    names_lines = "\n".join(f"• *{n}*" for n in names) if names else "• …"
-    pax = d.get("passengers") or 1
-    if lang == "en":
-        body = (
-            "👶 *Important legal question*\n\n"
-            f"{pax_minors_intro(pax, 'en')}\n\n"
-            f"{names_lines}\n\n"
-            "⚖️ Required to prepare the correct signing mandate."
-        )
-        options = [
-            {"id": "1", "label": "No — all adults", "button": "✅ All adults"},
-            {"id": "2", "label": "Yes — at least one minor", "button": "👶 Minor(s)"},
-        ]
-    else:
-        body = (
-            "👶 *Question juridique importante*\n\n"
-            f"{pax_minors_intro(pax, 'fr')}\n\n"
-            f"{names_lines}\n\n"
-            "⚖️ Obligation légale pour préparer le bon mandat de signature."
-        )
-        options = [
-            {"id": "1", "label": "Non — tous majeurs", "button": "✅ Tous majeurs"},
-            {"id": "2", "label": "Oui — au moins un mineur", "button": "👶 Mineur(s)"},
-        ]
-    send_tunnel_poll(phone, conv, body, options)
-
-def show_summary(phone, conv):
-    """
-    Message « dossier prêt » : mandat + demande de pièces (identité + billet si besoin),
-    aligné LegalTech / UX (2 étapes rapides).
-    """
-    d    = conv["data"]
-    lang = d.get("lang", "fr")
-    pax  = d.get("passengers") or 1
-    ref  = conv.get("ref") or make_ref(phone)
-    conv["ref"] = ref
-
-    _, net, _, _ = calc_amounts(pax)
-    net_s = fmt_money_space(net)
-    names = d.get("passenger_names") or []
-
-    params = {
-        "ref":       ref,
-        "pax":       pax,
-        "vol":       d.get("flight_number", ""),
-        "date":      d.get("flight_date", ""),
-        "compagnie": d.get("airline", ""),
-        "incident":  d.get("incident_type", ""),
-        "noms":      ",".join(names),
-        "source":    "whatsapp_bot",
-    }
-    if d.get("pnr"):
-        params["pnr"] = d["pnr"]
-    dep, arr, via = split_itinerary_for_mandat(d.get("itinerary") or "")
-    if dep:
-        params["dep"] = dep
-    if arr:
-        params["arr"] = arr
-    if via:
-        params["esc1"] = via
-    if d.get("has_minors"):
-        params["mineurs"] = "1"
-    mandat_link = mandat_signing_link(params)
-    sign_link = register_mandate_short_link(mandat_link) or mandat_link
-    recap_lines = _summary_recap_lines(d, lang)
-    recap_block = ""
-    if recap_lines:
-        title = "*Récapitulatif dossier*" if lang == "fr" else "*Your claim summary*"
-        recap_block = f"📋 {title}\n" + "\n".join(recap_lines) + "\n\n"
-
-    if lang == "en":
-        msg = (
-            "🎉 *Your file is ready to be filed!*\n\n"
-            f"{recap_block}"
-            f"📁 *File ref:* *{ref}*\n"
-            f"💵 *Target net amount (group, indicative):* *{net_s} €*\n\n"
-            "Two quick steps left:\n\n"
-            "1️⃣ *Sign the mandate* — secure Robin des Airs page, then your signature:\n"
-            f"{sign_link}\n\n"
-            "2️⃣ *Send proof in this chat:* a readable photo of your *passport or national ID* "
-            "+ *boarding pass* or booking confirmation *if we still need it*.\n\n"
-            f"🔒 We use your documents *only* for this claim. *Privacy:* {PRIVACY_POLICY_URL}"
-        )
-    else:
-        msg = (
-            "🎉 *Dossier prêt à être déposé !*\n\n"
-            f"{recap_block}"
-            f"📁 *Réf. dossier :* *{ref}*\n"
-            f"💵 *Montant net visé (groupe, indicatif) :* *{net_s} €*\n\n"
-            "Il reste *2 étapes rapides* :\n\n"
-            "1️⃣ *Signature du mandat* — page sécurisée *Robin des Airs*, puis votre signature :\n"
-            f"{sign_link}\n\n"
-            "2️⃣ *Justificatifs en photos* sur ce fil : *passeport ou CNI lisible* "
-            "+ *carte d’embarquement* ou confirmation *si nécessaire*.\n\n"
-            f"🔒 Vos pièces ne servent *qu’à ce dossier*. *Confidentialité :* {PRIVACY_POLICY_URL}"
-        )
-    send(phone, msg)
-    at_save(phone, conv)
-    conv["step"] = "completed"
-    d["_post_submit"] = {
-        "active": True,
-        "summary_at": time.time(),
-        "relances_sent": [],
-        "template_mode": False,
-        "last_template_at": 0,
-        "mandate_ack": False,
-        "mandate_signed_server": False,
-        "images_after_summary": 0,
-        "post_submit_has_id_image": False,
-        "post_submit_has_boarding_image": False,
-        "air_boarding_attachment": False,
-        "air_id_attachment": False,
-        "air_mandat_signed": False,
-        "_at_sync_at": 0,
-        "needs_boarding_hint": not bool(d.get("boarding_evidence_in_flow")),
-        "mandat_params": dict(params),
-        "short_sign_url": sign_link,
-        "air_relance_halt_airtable": False,
-    }
-    refresh_post_submit_airtable_flags(conv)
-
-# ===== OPENAI (photo carte d'embarquement) =====
-
-def _extract_json_from_gpt(txt):
-    """Parse un objet JSON dans la réponse modèle (fences ``` ou bloc brut)."""
-    if not txt:
-        return None
-    s = txt.strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```[a-zA-Z]*\n?", "", s)
-        s = re.sub(r"\n?```\s*$", "", s).strip()
-    i0, i1 = s.find("{"), s.rfind("}")
-    if i0 < 0 or i1 <= i0:
-        return None
-    try:
-        return json.loads(s[i0 : i1 + 1])
-    except Exception:
-        return None
-
-def _pnr_from_vision_info(info):
-    """PNR / record locator depuis le JSON vision (plusieurs clés possibles)."""
-    if not info or not isinstance(info, dict):
-        return ""
-    raw = (info.get("pnr") or info.get("booking_reference") or info.get("record_locator") or "")
-    return re.sub(r"[^A-Za-z0-9]", "", (raw or "").upper())
-
-def gpt_read_boarding_pass(image_b64):
-    if not OPENAI_API_KEY:
-        return {}
-    prompt = (
-        "Extract data from this boarding pass, mobile boarding pass, or e-ticket screenshot. "
-        "Reply with ONLY a JSON object (no markdown), keys:\n"
-        '{"flight_number":"","date":"","flight_day":null,"flight_month":null,"airline":"","airline_iata":"","marketing_carrier_iata":"","operating_carrier_iata":"","pnr":"","booking_reference":"","departure":"","arrival":"","route":"","passenger_names":[],"service_direction_guess":"unknown","other_legs_summary":""}\n'
-        "- flight_number: exactly as printed (usually the **marketing** flight number; its airline prefix often matches the **ticketing** carrier even if another airline **operates** the flight).\n"
-        "- date: ONLY if the full calendar date with year is printed, as DD/MM/YYYY (European). "
-        "If the ticket shows day+month but NO year (very common), set date to \"\" and set flight_day + flight_month as integers.\n"
-        "- flight_day / flight_month: integers 1-31 and 1-12 when day and month are visible but year is missing or unclear; else null.\n"
-        "- airline: **marketing / ticketing** carrier name as printed (larger logo or \"flight by X\"); NOT the \"operated by\" line alone.\n"
-        "- airline_iata: 2-letter code of the **marketing** (ticketing) carrier if visible.\n"
-        "- marketing_carrier_iata: same as airline_iata if codeshare; else \"\".\n"
-        "- operating_carrier_iata: if **codeshare** (\"Operated by / Opéré par / wet lease\"), 2-letter code of the **operating** carrier; else \"\".\n"
-        '- pnr: 6-character record locator if visible. Use booking_reference only if the label on the ticket says so; otherwise put the code in pnr (same value in both is OK).\n'
-        "- departure / arrival: city or IATA if readable (also fill if you can infer from route).\n"
-        "- route: one line e.g. BRU → ABJ or BRU-ABJ or BRUABJ (two IATA codes); use → when possible.\n"
-        "- passenger_names: array of ALL passenger names visible on the document, each as \"FirstName LASTNAME\" "
-        "(Latin script; if 2 passengers on same pass, two strings; if only surname visible, still include best guess). "
-        "Use [] if none readable.\n"
-        "- service_direction_guess: if this boarding pass is clearly the **outbound** leg of a round trip on the same booking, \"outbound\"; if clearly **return/inbound**, \"return\"; otherwise \"unknown\".\n"
-        "- other_legs_summary: if the same document shows **another flight** (return leg, connection, or second coupon), one short line per extra leg, e.g. \"AF702 CDG-ABJ 10/12\"; else \"\".\n"
-        'Use "" for unknown string fields; null for unknown flight_day/flight_month; [] for passenger_names if unknown.'
-    )
-    try:
-        r = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "gpt-4o",
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-                    ]
-                }],
-                "max_tokens": 520,
-            },
-            timeout=45,
-        )
-        txt = r.json()["choices"][0]["message"]["content"]
-        return _extract_json_from_gpt(txt) or {}
-    except Exception as e:
-        print(f"GPT vision error: {e}")
-        return {}
-
-def _julian_to_dd_mm_yyyy(jul3: str):
-    """
-    Date de vol BCBP (jour julien 001–366 sur 3 chiffres) → DD/MM/AAAA.
-    Heuristique d'année : parmi les années proches, celle qui minimise l'écart à aujourd'hui.
-    """
-    try:
-        j = int((jul3 or "").strip())
-        if j < 1 or j > 366:
-            return None
-    except (TypeError, ValueError):
-        return None
-    today = datetime.now().date()
-    best_dt = None
-    best_abs = None
-    for ydelta in range(-3, 4):
-        y = today.year + ydelta
-        try:
-            dt = datetime.strptime(f"{y}-{j:03d}", "%Y-%j")
-            d = dt.date()
-            ad = abs((d - today).days)
-            if best_abs is None or ad < best_abs:
-                best_abs = ad
-                best_dt = dt
-        except ValueError:
-            continue
-    if not best_dt:
-        return None
-    return best_dt.strftime("%d/%m/%Y")
-
-def _parse_bcbp_payload_to_dict(pdata: str):
-    """
-    Extrait vol / PNR / trajet / date / nom depuis une chaîne BCBP type M (ex. IATA test data).
-    Le champ « compagnie » dans le segment M1 est le **transporteur opérationnel** → operating_carrier_iata.
-    """
-    out = {}
-    if not pdata or ("M1" not in pdata and "M2" not in pdata):
-        return out
-    raw = re.sub(r"[\r\n]+", "", pdata).upper()
-    # Exemple IATA : M1DESMARAIS/LUC       EABC123 YULFRAAC 0834 326J001A0025 100
-    m = re.search(
-        r"M[12]([A-Z]+/[A-Z]+)\s+E([A-Z0-9]{6})\s+([A-Z]{3})([A-Z]{3})([A-Z]{2})\s*(\d{4})\s+(\d{3})",
-        raw,
-    )
-    if not m:
-        # Variante sans « E » explicite (rare)
-        m = re.search(
-            r"M[12]([A-Z]+/[A-Z]+)\s+([A-Z0-9]{6})\s+([A-Z]{3})([A-Z]{3})([A-Z]{2})\s*(\d{4})\s+(\d{3})",
-            raw,
-        )
-        if not m:
-            return out
-        last, pnr, dep, arr, cx, fn, jul = m.groups()
-    else:
-        last, pnr, dep, arr, cx, fn, jul = m.groups()
-    nm = _bcbp_name_field_to_passenger(last)
-    if nm:
-        out["passenger_names"] = [nm]
-    if pnr and len(pnr) >= 6:
-        out["pnr"] = pnr[:8]
-    if dep and arr:
-        out["departure"] = dep
-        out["arrival"] = arr
-        out["route"] = f"{dep} → {arr}"
-    cx2 = (cx or "").strip().upper()[:2]
-    if cx2 and fn:
-        fn4 = fn[-4:] if len(fn) >= 4 else fn.zfill(4)
-        out["flight_number"] = f"{cx2}{fn4}"
-        out["operating_carrier_iata"] = cx2
-    dfull = _julian_to_dd_mm_yyyy(jul)
-    if dfull:
-        out["date"] = dfull
-    return out
-
-def _bcbp_name_field_to_passenger(last_first_field: str):
-    """Champ nom BCBP LAST/FIRST… → 'Prénom NOM' comme le tunnel."""
-    s = (last_first_field or "").strip()
-    if "/" not in s:
-        return None
-    last, first = s.split("/", 1)
-    last = re.sub(r"\s+", " ", last).strip()
-    first = re.sub(r"\s+", " ", first).strip()
-    if len(last) < 2 or len(first) < 1:
-        return None
-    return f"{first.title()} {last.upper()}"
-
-def try_decode_bcbp_from_image_b64(image_b64):
-    """
-    Tente de lire un QR / code-barres IATA (BCBP type M1/M2) sur l'image.
-    Nécessite pyzbar + Pillow (pip install pyzbar pillow). Aucun appel Internet.
-    Extrait : vol, PNR, départ/arrivée, date (julien), nom passager, opérateur IATA si présent.
-    """
-    out = {}
-    try:
-        import io
-        from PIL import Image
-        from pyzbar.pyzbar import decode as zdecode
-    except ImportError:
-        return out
-    try:
-        raw = base64.b64decode(image_b64, validate=False)
-        im = Image.open(io.BytesIO(raw))
-        for sym in zdecode(im):
-            pdata = None
-            for enc in ("utf-8", "latin-1", "iso-8859-1"):
-                try:
-                    pdata = sym.data.decode(enc, "replace")
-                    break
-                except Exception:
-                    continue
-            if not pdata or ("M1" not in pdata and "M2" not in pdata):
-                continue
-            parsed = _parse_bcbp_payload_to_dict(pdata)
-            for k, v in parsed.items():
-                if v in (None, "", [], {}):
-                    continue
-                if k not in out or out.get(k) in (None, "", []):
-                    out[k] = v
-                elif k == "passenger_names" and isinstance(v, list):
-                    combined, seen = [], set()
-                    for n in (out.get("passenger_names") or []) + v:
-                        if n and str(n).strip().lower() not in seen:
-                            seen.add(str(n).strip().lower())
-                            combined.append(n)
-                    out["passenger_names"] = combined
-            # Fallback historique : n° de vol + nom si parseur structuré incomplet
-            if not out.get("flight_number"):
-                for m in re.finditer(r"\b([A-Z]{2})(\d{3,4})\b", pdata.upper()):
-                    if airline_from_iata(m.group(1)):
-                        out["flight_number"] = m.group(1) + m.group(2)
-                        break
-            if not out.get("passenger_names"):
-                mname = re.search(r"M[12]([A-Z]+)/([A-Z]+)", pdata.upper())
-                if mname:
-                    last, first = mname.group(1).strip(), mname.group(2).strip()
-                    if len(last) >= 2 and len(first) >= 1:
-                        nm = f"{first.title()} {last.upper()}"
-                        out.setdefault("passenger_names", []).append(nm)
-    except Exception as e:
-        print(f"QR/BCBP scan: {e}")
-    return out
-
-def read_boarding_pass_merged(image_b64):
-    """Vision OpenAI + QR/BCBP local (pyzbar) : le BCBP structure prime sur l'OCR pour les champs stables."""
-    qr = try_decode_bcbp_from_image_b64(image_b64)
-    gpt = gpt_read_boarding_pass(image_b64) if OPENAI_API_KEY else {}
-    merged = dict(gpt) if isinstance(gpt, dict) else {}
-    # Données machine-lisibles : priorité au QR quand présent (souvent plus fiable que l'image seule).
-    bcbp_priority_keys = frozenset({
-        "pnr", "date", "departure", "arrival", "route",
-        "flight_number", "operating_carrier_iata",
-    })
-    for k, v in (qr or {}).items():
-        if v in (None, "", [], {}):
-            continue
-        if k in bcbp_priority_keys:
-            merged[k] = v
-        elif k == "passenger_names" and isinstance(v, list):
-            combined, seen = [], set()
-            for n in (merged.get("passenger_names") or []) + v:
-                if n and str(n).strip().lower() not in seen:
-                    seen.add(str(n).strip().lower())
-                    combined.append(n)
-            merged["passenger_names"] = combined
-        elif k not in merged or merged.get(k) in (None, "", []):
-            merged[k] = v
-    return merged
-
-def boarding_pass_info_usable(info):
-    if not info or not isinstance(info, dict):
-        return False
-    if (info.get("flight_number") or "").strip():
-        return True
-    dt = (info.get("date") or "").strip()
-    if dt and re.match(r"^\d{2}/\d{2}/\d{4}$", dt):
-        return True
-    fd = info.get("flight_day")
-    if fd is None:
-        fd = info.get("day")
-    fm = info.get("flight_month")
-    if fm is None:
-        fm = info.get("month")
-    try:
-        if fd is not None and fm is not None and 1 <= int(fd) <= 31 and 1 <= int(fm) <= 12:
-            return True
-    except (TypeError, ValueError):
-        pass
-    if dt and re.match(r"^\d{1,2}/\d{1,2}$", dt):
-        return True
-    if len((info.get("airline") or "").strip()) > 2:
-        return True
-    for key in ("airline_iata", "marketing_carrier_iata", "operating_carrier_iata"):
-        raw = re.sub(r"[^A-Z]", "", (info.get(key) or "").upper())
-        if len(raw) >= 2 and airline_from_iata(raw):
-            return True
-    air_short = re.sub(r"[^A-Za-z]", "", (info.get("airline") or "").upper())
-    if 2 <= len((info.get("airline") or "").strip()) <= 3 and len(air_short) <= 3 and airline_from_iata(air_short):
-        return True
-    pnr = _pnr_from_vision_info(info)
-    return len(pnr) >= MIN_PNR_LEN
-
-def _format_passenger_name_token(s):
-    """Une ligne 'Prénom NOM' / 'FIRST LAST' → même format que le tunnel manuel."""
-    s = (s or "").strip()
-    if not s:
-        return None
-    parts = re.split(r"\s+", s)
-    if len(parts) < 2:
-        return None
-    prenom = parts[0].title()
-    nom    = " ".join(parts[1:]).upper()
-    return f"{prenom} {nom}"
-
-def _passenger_names_from_vision(info, max_pax):
-    """Extrait 0..max_pax noms depuis le JSON vision (liste, dicts, ou chaîne)."""
-    out = []
-    raw = info.get("passenger_names")
-    if isinstance(raw, list):
-        for item in raw:
-            if isinstance(item, str) and item.strip():
-                f = _format_passenger_name_token(item)
-                if f:
-                    out.append(f)
-            elif isinstance(item, dict):
-                fn = (item.get("first") or item.get("firstName") or item.get("prenom") or "").strip()
-                ln = (item.get("last") or item.get("lastName") or item.get("nom") or "").strip()
-                if fn and ln:
-                    out.append(f"{fn.title()} {ln.upper()}")
-                elif (item.get("full") or item.get("name") or "").strip():
-                    f = _format_passenger_name_token(str(item.get("full") or item.get("name")))
-                    if f:
-                        out.append(f)
-    elif isinstance(raw, str) and raw.strip():
-        for part in re.split(r"[,;/]|(?:\s+et\s+)", raw, flags=re.I):
-            part = part.strip()
-            if part:
-                f = _format_passenger_name_token(part)
-                if f:
-                    out.append(f)
-    seen = set()
-    uniq = []
-    for n in out:
-        k = n.lower()
-        if k not in seen:
-            seen.add(k)
-            uniq.append(n)
-        if len(uniq) >= max_pax:
-            break
-    return uniq[:max_pax]
-
-def _passenger_names_complete(data):
-    pax   = data.get("passengers") or 1
-    names = data.get("passenger_names") or []
-    return len(names) >= pax
-
-def _parse_date_from_vision(info):
-    """
-    Retourne ("full", "DD/MM/YYYY") | ("partial", ("DD","MM")) | (None, None).
-    Beaucoup de billets n'affichent pas l'année : jour/mois seuls → partial.
-    """
-    date = (info.get("date") or "").strip()
-    if date:
-        m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})\s*$", date)
-        if m:
-            d, mo, y = m.groups()
-            return "full", f"{int(d):02d}/{int(mo):02d}/{y}"
-        m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{2})\s*$", date)
-        if m:
-            d, mo, yy = m.groups()
-            yi = int(yy)
-            yi = 2000 + yi if yi < 70 else 1900 + yi
-            return "full", f"{int(d):02d}/{int(mo):02d}/{yi}"
-        m = re.match(r"^(\d{1,2})/(\d{1,2})\s*$", date)
-        if m:
-            return "partial", (f"{int(m.group(1)):02d}", f"{int(m.group(2)):02d}")
-    fd = info.get("flight_day")
-    if fd is None:
-        fd = info.get("day")
-    fm = info.get("flight_month")
-    if fm is None:
-        fm = info.get("month")
-    try:
-        if fd is not None and fm is not None:
-            d = int(fd)
-            mo = int(fm)
-            if 1 <= d <= 31 and 1 <= mo <= 12:
-                return "partial", (f"{d:02d}", f"{mo:02d}")
-    except (TypeError, ValueError):
-        pass
-    return None, None
-
-def advance_after_itinerary_collected(phone, conv, lang):
-    """Itinéraire complet : noms passagers ou question mineurs."""
-    d = conv["data"]
-    d.pop("itin_collect_mode", None)
-    pax = d.get("passengers") or 1
-    if _passenger_names_complete(d):
-        goto_passenger_names_confirm(phone, conv, lang)
-    else:
-        names = list(d.get("passenger_names") or [])
-        conv["step"] = "passenger_names"
-        if names:
-            nxt = len(names) + 1
-            d["pax_collect_idx"] = nxt
-            if nxt >= 2:
-                q_boarding_next_passenger(phone, lang, nxt, pax)
-            q_passenger_name(phone, lang, nxt, pax, names)
-        else:
-            d["pax_collect_idx"] = 1
-            q_passenger_name(phone, lang, 1, pax, [])
-
-def advance_after_flight_date_complete(phone, conv, lang):
-    """Vol + date complètes : enchaîne itinéraire / noms / mineurs selon le remplissage."""
-    d = conv["data"]
-    if not (d.get("flight_number") and d.get("flight_date")):
-        return
-    itin = (d.get("itinerary") or "").strip()
-    dep_m, arr_m, _ = split_itinerary_for_mandat(itin)
-    route_ok = bool(itin and dep_m and arr_m)
-    if route_ok:
-        d.pop("itin_collect_mode", None)
-    pax = d.get("passengers") or 1
-    names = d.get("passenger_names") or []
-    if route_ok:
-        if _passenger_names_complete(d):
-            goto_passenger_names_confirm(phone, conv, lang)
-        elif names:
-            conv["step"] = "passenger_names"
-            nxt = len(names) + 1
-            conv["data"]["pax_collect_idx"] = nxt
-            if nxt >= 2:
-                q_boarding_next_passenger(phone, lang, nxt, pax)
-            q_passenger_name(phone, lang, nxt, pax, names)
-        else:
-            conv["step"] = "passenger_names"
-            conv["data"]["pax_collect_idx"] = 1
-            q_passenger_name(phone, lang, 1, pax, [])
-    else:
-        conv["step"] = "itinerary_kind"
-        q_itinerary_route_kind(phone, lang, conv)
-
-def _unify_route_display(s):
-    """Normalise affichage trajet (→) pour stockage / mandat / Airtable."""
-    s = (s or "").strip()
-    if not s:
-        return s
-    s = re.sub(r"\b([A-Za-z]{3})\s*-\s*([A-Za-z]{3})\b", r"\1 → \2", s)
-    s = s.replace("➝", "→").replace("⇒", "→")
-    s = re.sub(r"\s*->\s*", " → ", s, flags=re.I)
-    s = re.sub(r"\s*[–—]\s*", " → ", s)
-    compact = re.sub(r"\s+", "", s)
-    if re.match(r"^[A-Za-z]{6}$", compact) and "→" not in s:
-        u = compact.upper()
-        return f"{u[:3]} → {u[3:]}"
-    return s
-
-def _itinerary_from_vision_info(info):
-    """Construit une ligne d’itinéraire depuis le JSON vision (clés / formats variables)."""
-    if not isinstance(info, dict):
-        return None
-    dep = (
-        (info.get("departure") or info.get("from") or info.get("origin") or info.get("departure_airport")
-         or info.get("from_airport") or info.get("dep") or info.get("departure_iata") or "")
-    )
-    arr = (
-        (info.get("arrival") or info.get("to") or info.get("destination") or info.get("arrival_airport")
-         or info.get("to_airport") or info.get("arr") or info.get("arrival_iata") or "")
-    )
-    if isinstance(dep, str):
-        dep = dep.strip()
-    else:
-        dep = ""
-    if isinstance(arr, str):
-        arr = arr.strip()
-    else:
-        arr = ""
-    rt = (info.get("route") or info.get("routing") or info.get("itinéraire") or info.get("itineraire") or "")
-    if isinstance(rt, str):
-        rt = rt.strip()
-    else:
-        rt = ""
-    if not rt and isinstance(info.get("itinerary"), str):
-        rt = (info.get("itinerary") or "").strip()
-    if rt:
-        rt = _unify_route_display(rt)
-        if len(rt) >= 3:
-            return rt
-    if dep and arr:
-        return f"{dep} → {arr}"
-    return None
-
-def merge_boarding_pass_info(conv, info):
-    """Fusionne les champs reconnus (écrase si la vision renvoie une valeur non vide)."""
-    d = conv["data"]
-    fn = (info.get("flight_number") or "").strip().upper()
-    fn = re.sub(r"[\s]+", "", fn)
-    if fn:
-        m = re.search(r"\b([A-Z]{1,3}\d{1,4}[A-Z]?)\b", fn)
-        d["flight_number"] = m.group(1) if m else fn[:12]
-    d.pop("codeshare_note", None)
-    d.pop("flight_number_prefix_hint", None)
-    mark_raw = re.sub(r"[^A-Za-z]", "", (info.get("marketing_carrier_iata") or info.get("airline_iata") or "").upper())
-    op_raw = re.sub(r"[^A-Za-z]", "", (info.get("operating_carrier_iata") or "").upper())
-    air = (info.get("airline") or "").strip()
-
-    marketing_name = None
-    if air:
-        al = re.sub(r"[^A-Za-z]", "", air).upper()
-        if len(al) <= 3 and len(air) <= 4 and air.replace(" ", "").upper() == al:
-            marketing_name = airline_from_iata(al) or air
-        else:
-            marketing_name = air
-    elif len(mark_raw) >= 2:
-        marketing_name = airline_from_iata(mark_raw) or mark_raw[:2]
-
-    operating_name = None
-    if len(op_raw) >= 2:
-        operating_name = airline_from_iata(op_raw) or op_raw[:2]
-
-    if marketing_name:
-        d["airline"] = marketing_name
-    elif operating_name:
-        d["airline"] = operating_name
-    elif d.get("flight_number"):
-        # Pas d'indice commercial/opérateur sur la carte : devinette par préfixe du n° de vol uniquement dans ce cas
-        guess = airline_guess_from_flight_number(d["flight_number"])
-        if guess:
-            d["airline"] = guess
-
-    d.pop("operating_airline", None)
-    if operating_name and marketing_name and operating_name.strip().lower() != marketing_name.strip().lower():
-        d["operating_airline"] = operating_name
-    elif operating_name and not marketing_name:
-        d.pop("operating_airline", None)
-
-    if mark_raw and op_raw and mark_raw[:2] != op_raw[:2]:
-        mn = airline_from_iata(mark_raw) or mark_raw[:2]
-        on = airline_from_iata(op_raw) or op_raw[:2]
-        d["codeshare_note"] = f"Code-share : commercial {mn} ({mark_raw[:2]}) / opéré par {on} ({op_raw[:2]})"
-
-    guess_air = airline_guess_from_flight_number(d.get("flight_number") or "")
-    if (
-        guess_air
-        and d.get("airline")
-        and guess_air.strip().lower() != d["airline"].strip().lower()
-        and not d.get("operating_airline")
-        and not (mark_raw and op_raw and mark_raw[:2] != op_raw[:2])
-    ):
-        d["flight_number_prefix_hint"] = guess_air
-
-    d.pop("pending_ticket_dm", None)
-    kind, dval = _parse_date_from_vision(info)
-    if kind == "full":
-        d["flight_date"] = dval
-    elif kind == "partial":
-        d["pending_ticket_dm"] = dval
-    pnr = _pnr_from_vision_info(info)
-    if len(pnr) >= MIN_PNR_LEN:
-        d["pnr"] = pnr[:8]
-    itin_merged = _itinerary_from_vision_info(info)
-    if itin_merged:
-        d["itinerary"] = itin_merged
-        d.pop("temp_itin_dep", None)
-        d.pop("itinerary_compl_note", None)
-    d["vision_leg_hint"] = None
-    d.pop("ticket_other_legs_hint", None)
-    sdg = (info.get("service_direction_guess") or info.get("service_direction") or "").strip().lower()
-    if sdg in ("outbound", "out", "aller", "all"):
-        d["vision_leg_hint"] = "outbound"
-    elif sdg in ("return", "inbound", "in", "retour"):
-        d["vision_leg_hint"] = "return"
-    oth = (info.get("other_legs_summary") or "").strip()
-    if oth and len(oth) > 5:
-        d["ticket_other_legs_hint"] = oth[:280]
-    # Noms passagers (1 ou plusieurs sur la même carte)
-    max_pax = int(d.get("passengers") or 6)
-    if max_pax < 1:
-        max_pax = 1
-    vis_names = _passenger_names_from_vision(info, max_pax)
-    if vis_names:
-        d["passenger_names"] = vis_names
-        if len(vis_names) < max_pax:
-            d["pax_collect_idx"] = len(vis_names) + 1
-        else:
-            d["pax_collect_idx"] = max_pax
-
-def _carte_field_disp(d, key):
-    if key == "passenger_names":
-        names = d.get("passenger_names") or []
-        return ", ".join(names) if names else "—"
-    if key == "operating_airline":
-        return str(d.get("operating_airline") or "").strip() or "—"
-    v = d.get(key)
-    return str(v).strip() if v else "—"
-
-def _carte_date_recap_line(d, lang):
-    """Une ligne 🎫 pour la date (lisible + gras ; si jour/mois sans année → rappel année)."""
-    if d.get("flight_date"):
-        fd = (d["flight_date"] or "").strip()
-        m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})\s*$", fd)
-        if m:
-            di, mo, y = int(m.group(1)), int(m.group(2)), m.group(3)
-            mw = month_word(f"{mo:02d}", lang)
-            if lang == "en":
-                return f"🎫 *{mw} {di}, {y}*"
-            return f"🎫 *{di} {mw} {y}*"
-        return f"🎫 *{fd}*"
-    dm = d.get("pending_ticket_dm")
-    if dm and isinstance(dm, (list, tuple)) and len(dm) == 2:
-        try:
-            di = int(dm[0].lstrip("0") or "0")
-            mw = month_word(dm[1], lang)
-            if lang == "en":
-                return (
-                    f"🎫 *{mw} {di}*\n"
-                    "_(day/month on the ticket — we'll ask the year next.)_"
-                )
-            return (
-                f"🎫 *{di} {mw}*\n"
-                "_(jour/mois sur le billet — l’année est demandée juste après.)_"
-            )
-        except (ValueError, TypeError):
-            return "🎫 *…*"
-    return None
-
-def _carte_recap_lines(d, lang, extra_lines=None):
-    """Lignes de récap lecture carte / billet (sans titre « lu ! »)."""
-    bits = []
-    if d.get("flight_number"):
-        bits.append(f"✈️ *{d['flight_number']}*")
-    if d.get("airline"):
-        if d.get("operating_airline"):
-            bits.append(
-                f"🏷️ *{'Commercial' if lang == 'fr' else 'Ticketing'} :* {d['airline']}"
-            )
-            bits.append(
-                f"🛫 *{'Opéré par' if lang == 'fr' else 'Operated by'} :* {d['operating_airline']}"
-            )
-        else:
-            bits.append(str(d["airline"]))
-    if d.get("flight_number_prefix_hint"):
-        gh = d["flight_number_prefix_hint"]
-        bits.append(
-            f"ℹ️ *{'Le préfixe du n° de vol évoque' if lang == 'fr' else 'Flight number prefix suggests'}* {gh} "
-            f"*{'(souvent le commercial en code-share)' if lang == 'fr' else '(often the marketing carrier on codeshares)'}*"
-        )
-    if d.get("codeshare_note") and not d.get("operating_airline"):
-        bits.append(d["codeshare_note"])
-    date_line = _carte_date_recap_line(d, lang)
-    if date_line:
-        bits.append(date_line)
-    if d.get("pnr"):
-        bits.append(f"📋 *{d['pnr']}*")
-    if d.get("itinerary"):
-        bits.append(f"🛤️ *{d['itinerary']}*")
-    if d.get("ticket_other_legs_hint"):
-        bits.append(
-            f"ℹ️ _Autres vols visibles sur le document : {d['ticket_other_legs_hint']}_"
-            if lang == "fr"
-            else f"ℹ️ _Other flights visible on the document: {d['ticket_other_legs_hint']}_"
-        )
-    vh = d.get("vision_leg_hint")
-    if vh == "outbound":
-        bits.append(
-            "ℹ️ _Segment détecté comme **aller** (outbound)._"
-            if lang == "fr"
-            else "ℹ️ _Detected as **outbound** segment._"
-        )
-    elif vh == "return":
-        bits.append(
-            "ℹ️ _Segment détecté comme **retour**._"
-            if lang == "fr"
-            else "ℹ️ _Detected as **return** segment._"
-        )
-    for n in d.get("passenger_names") or []:
-        bits.append(f"👤 *{n}*")
-    if extra_lines:
-        bits.extend(extra_lines)
-    return bits
-
-def _carte_confirm_poll_options(lang):
-    if lang == "en":
-        return [
-            {"id": "1", "label": "Yes, continue", "button": "✅ Continue"},
-            {"id": "2", "label": "Fix something", "button": "✏️ Fix"},
-        ]
-    return [
-        {"id": "1", "label": "Oui, continuer", "button": "✅ Continuer"},
-        {"id": "2", "label": "Corriger", "button": "✏️ Corriger"},
-    ]
-
-def _carte_modify_later_hint(lang):
-    """Rappel court sous le récap carte (correction immédiate)."""
-    if lang == "en":
-        return "\n\nℹ️ _If something is wrong, tap *Fix* below._"
-    return "\n\nℹ️ _Si une information est incorrecte : touchez *Corriger* ci-dessous._"
-
-def _carte_confirm_yes(text, choice, lang):
-    u = (text or "").strip()
-    low = u.lower()
-    if choice == "1":
-        return True
-    if re.match(r"^\s*1(?:\uFE0F\u20E3)?\s*$", u):
-        return True
-    if re.match(r"^\s*1[\.\)\:]", u):
-        return True
-    nk = _norm_choice_key(u)
-    if nk in ("continuer", "continue", "oui", "yes", "ok", "correct"):
-        return True
-    if lang == "fr":
-        return bool(re.match(r"^(oui|ok|exact|correct|dac|d'accord)\b", low))
-    return bool(re.match(r"^(yes|ok|correct|yep|yup)\b", low))
-
-def _carte_confirm_no(text, choice, lang):
-    u = (text or "").strip()
-    low = u.lower()
-    if choice == "2":
-        return True
-    if re.match(r"^\s*2(?:\uFE0F\u20E3)?\s*$", u):
-        return True
-    if re.match(r"^\s*2[\.\)\:]", u):
-        return True
-    nk = _norm_choice_key(u)
-    if nk in ("corriger", "fix", "modifier", "edit"):
-        return True
-    if lang == "fr":
-        return bool(re.match(r"^(non|nn|nope|erreur|faux|corriger)\b", low))
-    return bool(re.match(r"^(no|nope|wrong|incorrect|fix)\b", low))
-
-def finalize_boarding_pass_navigation(phone, conv, lang):
-    """Après validation des infos lues sur la carte : enchaîne sans redemander ce qui est déjà rempli."""
-    d = conv["data"]
-    if d.get("flight_number") and d.get("flight_date"):
-        advance_after_flight_date_complete(phone, conv, lang)
-    elif d.get("flight_number"):
-        conv["step"] = "flight_date"
-        q_flight_date(phone, lang, conv)
-    elif d.get("airline"):
-        if d.get("pnr"):
-            conv["step"] = "flight_number"
-            q_flight_number(phone, lang)
-        else:
-            conv["step"] = "pnr_input"
-            q_pnr(phone, lang, d["airline"])
-    else:
-        conv["step"] = "airline"
-        q_airline(phone, lang, conv)
-
-def q_carte_pick_field(phone, conv, lang):
-    """Menu pour choisir le champ à corriger (incl. opérateur en code-share)."""
-    d = conv["data"]
-    if lang == "en":
-        labels = (
-            "Ticketing / marketing airline",
-            "Flight number",
-            "Flight date (DD/MM/YYYY)",
-            "PNR / booking ref",
-            "Route (e.g. CDG → ABJ)",
-            "Passenger names (comma-separated)",
-            "Operating carrier (if different — codeshare)",
-        )
-    else:
-        labels = (
-            "Compagnie commerciale (sur le billet)",
-            "N° de vol",
-            "Date du vol (JJ/MM/AAAA)",
-            "PNR",
-            "Trajet (ex. CDG → ABJ)",
-            "Noms des passagers (séparés par des virgules)",
-            "Opérateur réel / « opéré par » (si différent)",
-        )
-    keys = list(CARTE_FIELD_KEYS)
-    lines = []
-    for i, (k, lab) in enumerate(zip(keys, labels), 1):
-        lines.append(f"{i}️⃣ {lab} — *{_carte_field_disp(d, k)}*")
-    d["_carte_field_keys"] = keys
-    conv["step"] = "carte_pick_field"
-    n = len(keys)
-    msg = (
-        f"✏️ *Quel champ voulez-vous corriger ?*\n\n" + "\n".join(lines) + f"\n\nRépondez par un *chiffre de 1 à {n}*."
-        if lang == "fr"
-        else f"✏️ *Which field should we fix?*\n\n" + "\n".join(lines) + f"\n\nReply with a *number from 1 to {n}*."
-    )
-    send(phone, msg)
-
-def q_carte_edit_prompt(phone, lang, key):
-    if key == "airline":
-        send(phone, "✍️ Indiquez la *compagnie* (nom complet ou code IATA, ex. *AF* ou *Air France*)." if lang == "fr" else "✍️ Type the *airline* (full name or IATA code, e.g. *AF* or *Air France*).")
-    elif key == "flight_number":
-        send(phone, "✍️ Indiquez le *numéro de vol* (ex. *AF703* ou *SN3638*)." if lang == "fr" else "✍️ Type the *flight number* (e.g. *AF703*).")
-    elif key == "flight_date":
-        send(
-            phone,
-            "✍️ Indiquez la *date du vol* (*JJ/MM/AAAA*, ou ex. *12 mai 2024*, *15 mai*)."
-            if lang == "fr"
-            else "✍️ Enter the *flight date* (*DD/MM/YYYY*, or e.g. *12 May 2024*).",
-        )
-    elif key == "pnr":
-        send(
-            phone,
-            f"✍️ Indiquez le *PNR* / code réservation (au moins *{MIN_PNR_LEN}* caractères alphanumériques)."
-            if lang == "fr"
-            else f"✍️ Type the *PNR* / booking code (at least *{MIN_PNR_LEN}* alphanumeric characters).",
-        )
-    elif key == "itinerary":
-        send(phone, "✍️ Indiquez le *trajet* (ex. *Paris CDG → Abidjan* ou *CDG → ABJ*)." if lang == "fr" else "✍️ Type the *route* (e.g. *Paris CDG → Abidjan*).")
-    elif key == "passenger_names":
-        send(
-            phone,
-            "✍️ Indiquez les *noms sur le billet*, séparés par des *virgules* (ex. *Aminata TRAORE, Kadiatou DIALLO*)."
-            if lang == "fr"
-            else "✍️ Type *passenger names* as on the ticket, *comma-separated* (e.g. *Fatou SALL, Amadou DIALLO*).",
-        )
-    elif key == "operating_airline":
-        send(
-            phone,
-            "✍️ Indiquez la compagnie *qui exploite le vol* (nom ou code IATA), ou *rien* / *—* si identique au commercial."
-            if lang == "fr"
-            else "✍️ Type the *operating carrier* (name or IATA), or *none* / *—* if same as ticketing.",
-        )
-
-def _apply_carte_field_edit(d, key, text, lang):
-    """Applique une correction saisie ; retourne (ok, message_erreur_fr_or_en)."""
-    raw = (text or "").strip()
-    if not raw:
-        return False, ("Texte vide." if lang == "fr" else "Empty text.")
-    if key == "airline":
-        d["airline"] = raw
-        d.pop("flight_number_prefix_hint", None)
-        return True, None
-    if key == "flight_number":
-        u = re.sub(r"[\s]+", "", raw.upper())
-        m = re.search(r"\b([A-Z]{1,3}\d{1,4}[A-Z]?)\b", u)
-        d["flight_number"] = (m.group(1) if m else u[:12])
-        d.pop("flight_number_prefix_hint", None)
-        return True, None
-    if key == "flight_date":
-        s = raw.strip()
-        parsed = try_parse_flight_date_message(s, lang)
-        if not parsed and re.match(r"^\d{2}/\d{2}/\d{4}$", s):
-            parsed = s
-        if not parsed:
-            return False, (
-                "Date non reconnue. Ex. *12/05/2024*, *2024-05-12* ou *15 mai*."
-                if lang == "fr"
-                else "Date not recognized. E.g. *12/05/2024*, *2024-05-12*, or *15 May*."
-            )
-        d["flight_date"] = parsed
-        d.pop("pending_ticket_dm", None)
-        return True, None
-    if key == "pnr":
-        p = re.sub(r"[^A-Za-z0-9]", "", raw.upper())
-        if len(p) < MIN_PNR_LEN:
-            return False, (
-                f"Le PNR doit contenir au moins {MIN_PNR_LEN} caractères."
-                if lang == "fr"
-                else f"PNR must be at least {MIN_PNR_LEN} characters."
-            )
-        d["pnr"] = p[:8]
-        return True, None
-    if key == "itinerary":
-        d["itinerary"] = raw
-        d.pop("temp_itin_dep", None)
-        return True, None
-    if key == "passenger_names":
-        parts = re.split(r"[,;\n]+", raw)
-        names = []
-        for p in parts:
-            fn = _format_passenger_name_token(p.strip())
-            if fn:
-                names.append(fn)
-        if not names:
-            return False, ("Au moins un nom *Prénom NOM* est nécessaire." if lang == "fr" else "At least one *First LAST* name is required.")
-        d["passenger_names"] = names
-        pax = int(d.get("passengers") or 1)
-        if len(names) >= pax:
-            d["pax_collect_idx"] = pax
-        else:
-            d["pax_collect_idx"] = len(names) + 1
-        return True, None
-    if key == "operating_airline":
-        low = raw.lower()
-        if low in ("-", "—", "none", "n/a", "rien", "egal", "égale", "identique", "same"):
-            d.pop("operating_airline", None)
-        else:
-            al = re.sub(r"[^A-Za-z]", "", raw).upper()
-            if len(al) <= 3 and len(raw.replace(" ", "")) <= 4:
-                d["operating_airline"] = airline_from_iata(al) or raw.strip()
-            else:
-                d["operating_airline"] = raw.strip()
-        return True, None
-    return False, ("Champ inconnu." if lang == "fr" else "Unknown field.")
-
-def send_carte_confirm_panel(phone, conv, lang):
-    """Rappel des infos + sondage Oui / Corriger."""
-    d = conv["data"]
-    bits = _carte_recap_lines(d, lang)
-    head = "📋 *Voici ce qu'on retient :*" if lang == "fr" else "📋 *Here's what we have:*"
-    recap = "\n".join(bits) if bits else (
-        "_(rien de détecté — corrigez ou renvoyez une photo)_"
-        if lang == "fr"
-        else "_(nothing detected — fix a field or send another photo)_"
-    )
-    body = f"{head}\n{recap}{_carte_modify_later_hint(lang)}\n\n*{'Tout est correct ?' if lang == 'fr' else 'Everything correct?'}*"
-    send_tunnel_poll(phone, conv, body, _carte_confirm_poll_options(lang))
-
-def send_boarding_read_failed_escapes(phone, lang, recap_followup=False, variant="blur"):
-    """
-    Photo floue / lecture ratée : ton calme, sans culpabiliser le client.
-    variant: 'blur' (OCR peu fiable) | 'no_vision' (API vision absente sur ce serveur).
-    recap_followup=True : rappel *1* / *2* pour l’écran de confirmation carte déjà affiché.
-    """
-    if variant == "no_vision":
-        intro_fr = "Oups ! 😅 Sur ce serveur, la lecture automatique des photos n’est pas disponible pour l’instant."
-        intro_en = "Oops! 😅 Auto-reading of photos isn’t available on this server right now."
-    else:
-        intro_fr = "Oups ! Désolé, la lecture automatique a fait une petite erreur de lecture. 😅"
-        intro_en = "Oops! Sorry — auto-read hit a small snag. 😅"
-
-    if lang == "en":
-        core = (
-            f"{intro_en}\n\n"
-            "No worries — two simple ways out:\n\n"
-            "*Option A*: Send another sharp photo — flat on the table, no glare.\n\n"
-            "⌨️ *Option B*: Enter the details yourself (reply *B* or *2* — a few quick questions).\n\n"
-            "What would you like to do?"
-        )
-        tail = (
-            "\n\n_If the summary we showed above is still fine, reply *1*. To fix a field, reply *2*._"
-            if recap_followup
-            else ""
-        )
-    else:
-        core = (
-            f"{intro_fr}\n\n"
-            "Pas de souci, on a deux solutions :\n\n"
-            "*Option A* : Reprenez une photo bien nette, bien à plat et sans reflets.\n\n"
-            "⌨️ *Option B* : Entrez les informations à la main (répondez *B* ou *2* et je vous pose 3 questions rapides).\n\n"
-            "Que préférez-vous ?"
-        )
-        tail = (
-            "\n\n_Si le récap affiché plus haut vous convient : *1*. Pour corriger une information : *2*._"
-            if recap_followup
-            else ""
-        )
-    send(phone, core + tail)
-
-def apply_boarding_pass_image(phone, conv, image_b64, lang, after_passengers=False):
-    """
-    Lit une carte / billet, fusionne les champs, envoie le récap puis enchaîne selon l’étape.
-
-    Si after_passengers=True : photo à l’étape « preuves » (incident déjà choisi) — même logique
-    de lecture ; l’upload Airtable cible surtout la 1ʳᵉ ligne passager.
-
-    Pour les étapes listées dans CARTE_CONFIRM_PAUSE_STEPS (dont boarding_after_pax), on demande
-    toujours *1* = tout bon / *2* = corriger avant finalize_boarding_pass_navigation.
-
-    Retourne True si au moins une info exploitable a été extraite.
-    """
-    step_before = conv.get("step")
-    idx_for_attach = max(0, (conv["data"].get("pax_collect_idx") or 1) - 1)
-    info = read_boarding_pass_merged(image_b64)
-    raw_probe = _boarding_image_bytes(image_b64)
-    if not boarding_pass_info_usable(info):
-        if raw_probe and len(raw_probe) > 5 * 1024 * 1024:
-            send(
-                phone,
-                "⚠️ *Image trop lourde* (max 5 Mo pour l’archivage du billet). Réduisez la taille ou renvoyez une capture plus légère."
-                if lang == "fr"
-                else "⚠️ *Image too large* (max 5 MB for boarding-pass storage). Please send a smaller file.",
-            )
-            return False
-        if image_b64 and not (OPENAI_API_KEY or "").strip():
-            # Message détaillé + sorties A/B : étape preuves (évite doublon avec send_boarding_read_failed_escapes).
-            if step_before != "boarding_after_pax":
-                send(
-                    phone,
-                    "📸 *Lecture automatique limitée* : le service « vision » n’est pas configuré sur ce serveur. "
-                    "Répondez *2* ou *B* pour saisir à la main, ou renvoyez une photo *très nette* avec le *QR code* du billet si présent."
-                    if lang == "fr"
-                    else "📸 *Auto-read is limited*: the vision API is not configured on this server. "
-                    "Reply *2* or *B* to type details manually, or resend a very sharp photo including the ticket *QR code* if visible.",
-                )
-            return False
-        # Lecture auto impossible : on enregistre quand même l’image sur Airtable (preuve), si configuré.
-        if image_b64 and raw_probe and len(raw_probe) <= 5 * 1024 * 1024:
-            if F_CARTE_EMBARQUEMENT and AIRTABLE_API_KEY:
-                d0 = conv["data"]
-                idx_plan = _boarding_attach_idx_plan(
-                    d0, info if isinstance(info, dict) else {}, step_before, after_passengers, idx_for_attach
-                )
-                h_att = hashlib.sha256(raw_probe).hexdigest()
-                if not (h_att and d0.get("_last_boarding_attach_hash") == h_att):
-                    n_arc = at_boarding_attach_to_indices(phone, conv, image_b64, idx_plan, lang)
-                    if n_arc:
-                        d0["boarding_evidence_in_flow"] = True
-                    if n_arc and h_att:
-                        d0["_last_boarding_attach_hash"] = h_att
-                    elif not n_arc:
-                        print(
-                            f"at_boarding_attach_to_indices: 0 uploads after unreadable pass "
-                            f"(step={step_before} ref={conv.get('ref')} tel={phone})"
-                        )
-        return False
-    merge_boarding_pass_info(conv, info)
-    conv["data"]["boarding_evidence_in_flow"] = True
-    d = conv["data"]
-    extras = []
-    n_att = 0
-    if F_CARTE_EMBARQUEMENT and image_b64:
-        idx_plan = _boarding_attach_idx_plan(d, info, step_before, after_passengers, idx_for_attach)
-        raw_att = _boarding_image_bytes(image_b64)
-        h_att = hashlib.sha256(raw_att).hexdigest() if raw_att else ""
-        if h_att and d.get("_last_boarding_attach_hash") == h_att:
-            n_att = 0
-            extras.append(
-                "📎 _Même fichier qu’à l’envoi précédent — pas de nouvel enregistrement Airtable._"
-                if lang == "fr"
-                else "📎 _Same file as before — no duplicate Airtable upload._"
-            )
-        else:
-            if h_att:
-                d["_last_boarding_attach_hash"] = h_att
-            n_att = at_boarding_attach_to_indices(phone, conv, image_b64, idx_plan, lang)
-    if n_att:
-        extras.append(
-            f"📎 Carte enregistrée dans Airtable ({n_att} ligne{'s' if n_att > 1 else ''})."
-            if lang == "fr"
-            else f"📎 Boarding pass saved to Airtable ({n_att} row{'s' if n_att > 1 else ''})."
-        )
-    recap_lines = _carte_recap_lines(d, lang, extras)
-    body = "\n".join(recap_lines)
-    head = "📸 *Carte / billet lu !*" if lang == "fr" else "📸 *Boarding pass read!*"
-
-    if step_before in CARTE_CONFIRM_PAUSE_STEPS:
-        intro = (
-            "\n\nVoici ce que nous avons détecté — *vérifiez avant de poursuivre* :"
-            if lang == "fr"
-            else "\n\nHere's what we detected — *please check before continuing*:"
-        )
-        hint = _carte_modify_later_hint(lang)
-        poll_body = f"{head}{intro}\n\n{body}{hint}\n\n*{'Tout est correct ?' if lang == 'fr' else 'Everything correct?'}*"
-        if not body:
-            poll_body = f"{head}{intro}{hint}\n\n*{'Tout est correct ?' if lang == 'fr' else 'Everything correct?'}*"
-        send_tunnel_poll(phone, conv, poll_body, _carte_confirm_poll_options(lang))
-        conv["step"] = "carte_confirm"
-        at_save(phone, conv)
-        return True
-
-    send(phone, f"{head}\n{body}" if body else head)
-    finalize_boarding_pass_navigation(phone, conv, lang)
-    at_save(phone, conv)
-    return True
-
-def gpt_tunnel_assist(phone, text, step, lang):
-    """
-    Pendant le tunnel : le message ne matche pas l'étape (mauvais format) OU c'est une question libre.
-    On répond utilement (EU261 / procédure / infos voyage) sans sortir brutalement du parcours.
-    """
-    if not OPENAI_API_KEY or not text or not step:
-        return None
-    system = (
-        "Tu es l'assistant de Robin des Airs (indemnisation vol EU261 / règlement CE 261/2004), sur WhatsApp.\n"
-        f"L'utilisateur est EN TRAIN de remplir le formulaire, à l'étape technique « {step} ». "
-        "Son message ne correspond pas au format attendu pour cette étape, OU c'est une question ouverte "
-        "(délais, droits, PNR, compagnie, surbooking, annulation, correspondance, mineurs, etc.).\n"
-        "Comportement :\n"
-        "- Si c'est une vraie question ou une demande d'information : réponds correctement et prudemment "
-        "(principes généraux, pas de promesse sur SON dossier ni montant chiffré personnalisé), *6 phrases maximum*.\n"
-        "- Si c'est surtout un mauvais format ou du bruit : explique calmement ce qu'il faut envoyer à cette étape "
-        "(chiffre proposé, Prénom NOM, photo nette, etc.).\n"
-        "- Ne colle pas de lien mandat / URL juridique longue ; termine par une courte phrase pour continuer le dossier "
-        "ou taper *menu* / *recommencer*.\n"
-        f"Langue : {'français' if lang == 'fr' else 'english'}. Pas de JSON. Pas de liste à puces excessive."
-    )
-    try:
-        r = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": text[:1200]},
-                ],
-                "max_tokens": 320,
-                "temperature": 0.4,
-            },
-            timeout=25,
-        )
-        data = r.json()
-        return (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip() or None
-    except Exception as e:
-        print(f"GPT tunnel assist error: {e}")
-        return None
-
-def gpt_free_reply(phone, text, conv, dossier_done=False):
-    """Réponse libre hors tunnel actif (nouveau contact ou dossier déjà terminé)."""
-    if not OPENAI_API_KEY or not (text or "").strip():
-        return None
-    lang = conv["data"].get("lang", "fr")
-    if dossier_done:
-        done_note = (
-            "mandat signé et pièces reçues côté Robin"
-            if post_submit_fully_done(conv)
-            else "tunnel WhatsApp terminé ; mandat et/ou pièces peuvent encore manquer"
-        )
-        system = (
-            f"Tu es l'assistant Robin des Airs (EU261). Le client a fini le questionnaire WhatsApp ({done_note}). "
-            f"Réponds en {'français' if lang == 'fr' else 'english'}. "
-            f"{_gpt_hors_tunnel_format_rules(lang)} "
-            "Contenu : réponds d’abord à sa question (pro, rassurant), sans montant personnalisé inventé. "
-            "Ne dis jamais « dossier complet » ou « tout est reçu » si le mandat n’est pas signé ou s’il manque la CNI. "
-            "Dernière puce si utile : 🔄 *menu* ou *recommencer* pour un nouveau dossier. "
-            "Ne termine pas par des URLs (site / suivi ajoutés après ta réponse)."
-        )
-    else:
-        system = (
-            f"Tu es l'assistant Robin des Airs (EU261). Le client n’est *pas encore* dans le formulaire WhatsApp. "
-            f"Réponds en {'français' if lang == 'fr' else 'english'}. "
-            f"{_gpt_hors_tunnel_format_rules(lang)} "
-            "Contenu : réponds à sa question ; pour ouvrir un dossier, puce avec 📋 *menu* ou *1* à *6* passagers. "
-            "Pas de montants inventés. Pas de JSON. Pas d’URLs en fin (liens ajoutés après)."
-        )
-    try:
-        r = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": text[:1200]},
-                ],
-                "max_tokens": 320,
-                "temperature": 0.5,
-            },
-            timeout=30,
-        )
-        data = r.json()
-        return (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip() or None
-    except Exception as e:
-        print(f"GPT error: {e}")
-        return None
-
-# ===== TRAITEMENT RÉPONSES =====
-
-def handle_reply(phone, text, conv, image_b64=None):
-    step = conv.get("step")
-    lang = conv["data"].get("lang", "fr")
-    t    = text.strip()
-    low  = t.lower()
-
-    # Choix : clic sondage, chiffre en tête (sauf date complète type 11/12/2025)
-    if looks_like_full_date_input(t):
-        choice = None
-    else:
-        m      = re.search(r"^(\d+)", t)
-        choice = m.group(1) if m else None
-    if not choice and step == "passengers" and t:
-        m2 = re.search(r"\b([1-6])\b", t)
-        if m2:
-            choice = m2.group(1)
-
-    print(f"[STEP={step}] text='{t[:30]}' choice={choice}")
-
-    if t and user_wants_fresh_start(t) and step and step != "completed":
-        conv["data"] = fresh_data(lang)
-        conv["step"] = "passengers"
-        conv["ref"]  = make_ref(phone)
-        send(
-            phone,
-            "🔄 *D'accord — on repart de zéro.* Choisissez à nouveau le nombre de passagers."
-            if lang == "fr"
-            else "🔄 *OK — starting fresh.* Pick the number of passengers again.",
-        )
-        q_passengers(phone, lang, conv)
-        return True
-
-    if t and user_wants_expertise_rappel(t) and step and step != "completed":
-        if step == "passengers":
-            send(
-                phone,
-                (
-                    "📞 *Rappel expertise*\n\n"
-                    "Pour *6 personnes ou plus*, répondez *6* : *un expert vous rappelle* (*Climbie*).\n\n"
-                    f"📱 {CLIMBIE_TEL}"
-                )
-                if lang == "fr"
-                else (
-                    "📞 *Expert callback*\n\n"
-                    "For *6+ people*, reply *6* — *an expert will call you* (*Climbie*).\n\n"
-                    f"📱 {CLIMBIE_TEL}"
-                ),
-            )
-        else:
-            send(
-                phone,
-                (
-                    "📞 *Rappel / expertise*\n\n"
-                    "Pour être rappelé ou échanger avec un conseiller :\n"
-                    f"📱 {CLIMBIE_TEL}\n\n"
-                    "_Vous pouvez aussi poursuivre votre dossier ici en répondant à la dernière question._"
-                )
-                if lang == "fr"
-                else (
-                    "📞 *Callback / expert*\n\n"
-                    f"📱 {CLIMBIE_TEL}\n\n"
-                    "_You can also continue your claim here by answering the last question._"
-                ),
-            )
-        return True
-
-    # ── VÉRIFICATION LECTURE CARTE / BILLET (réduit la friction) ─────
-    if step == "carte_confirm":
-        if image_b64:
-            if apply_boarding_pass_image(phone, conv, image_b64, lang):
-                return True
-            send_boarding_read_failed_escapes(phone, lang, recap_followup=True)
-            return True
-        if _carte_confirm_yes(t, choice, lang):
-            conv["data"].pop("_edit_field", None)
-            conv["data"].pop("_carte_field_keys", None)
-            finalize_boarding_pass_navigation(phone, conv, lang)
-            at_save(phone, conv)
-            return True
-        if _carte_confirm_no(t, choice, lang):
-            q_carte_pick_field(phone, conv, lang)
-            at_save(phone, conv)
-            return True
-        return False
-
-    if step == "carte_pick_field":
-        m_key = re.match(r"^\s*([1-9])(?:\uFE0F\u20E3)?\s*$", t.strip())
-        if not m_key:
-            return False
-        ix = int(m_key.group(1))
-        keys = conv["data"].get("_carte_field_keys") or list(CARTE_FIELD_KEYS)
-        if ix < 1 or ix > len(keys):
-            return False
-        conv["data"]["_edit_field"] = keys[ix - 1]
-        conv["step"] = "carte_edit_value"
-        q_carte_edit_prompt(phone, lang, keys[ix - 1])
-        at_save(phone, conv)
-        return True
-
-    if step == "carte_edit_value":
-        key = conv["data"].get("_edit_field")
-        if not key:
-            conv["step"] = "carte_confirm"
-            send_carte_confirm_panel(phone, conv, lang)
-            at_save(phone, conv)
-            return True
-        if image_b64:
-            if apply_boarding_pass_image(phone, conv, image_b64, lang):
-                conv["data"].pop("_edit_field", None)
-                conv["data"].pop("_carte_field_keys", None)
-                return True
-            send(
-                phone,
-                "📸 Photo illisible. Envoyez la correction en *texte* ou une image plus nette."
-                if lang == "fr"
-                else "📸 Unclear image. Send your fix as *text* or a sharper photo.",
-            )
-            return True
-        ok, err = _apply_carte_field_edit(conv["data"], key, t, lang)
-        if not ok:
-            send(phone, f"⚠️ {err}" + ("\n\nRéessayez." if lang == "fr" else "\n\nPlease try again."))
-            return True
-        conv["data"].pop("_edit_field", None)
-        conv["data"].pop("_carte_field_keys", None)
-        conv["step"] = "carte_confirm"
-        send_carte_confirm_panel(phone, conv, lang)
-        at_save(phone, conv)
-        return True
-
-    # ── ÉTAPE 1 : PASSAGERS ──────────────────────────────────────────
-    if step == "passengers":
-        if choice in ("1", "2", "3", "4", "5"):
-            pax = int(choice)
-            conv["data"]["passengers"] = pax
-            print(f"[tunnel] passengers_choice phone={phone} pax={pax} lang={lang}")
-            conv["step"] = "pax_ack_route"
-            q_pax_ack_route(phone, lang, conv)
-            at_save(phone, conv)
-            return True
-        if choice == "6":
-            send(
-                phone,
-                (
-                    "🙏 *6 personnes ou plus*\n\n"
-                    "*Un expert* vous rappelle pour étudier votre dossier.\n\n"
-                    f"📱 {CLIMBIE_TEL}"
-                )
-                if lang == "fr"
-                else (
-                    "🙏 *6+ people*\n\n"
-                    "*An expert* will call you back to review your case.\n\n"
-                    f"📱 {CLIMBIE_TEL}"
-                ),
-            )
-            return True
-        return False
-
-    # ── Après passagers : parcours → langue expert → confirmation vocale ──
-    if step == "pax_ack_route":
-        if choice == "1":
-            conv["data"]["early_route_shape"] = "direct"
-            conv["step"] = "pax_contact_lang"
-            q_pax_contact_lang(phone, lang, conv)
-            at_save(phone, conv)
-            return True
-        if choice == "2":
-            conv["data"]["early_route_shape"] = "connection"
-            conv["step"] = "pax_contact_lang"
-            q_pax_contact_lang(phone, lang, conv)
-            at_save(phone, conv)
-            return True
-        return False
-
-    if step == "pax_contact_lang":
-        n_lang = len(EXPERT_LANG_OPTIONS)
-        if choice in tuple(str(i) for i in range(1, n_lang + 1)):
-            ix = int(choice) - 1
-            conv["data"]["expert_phone_lang"] = EXPERT_LANG_OPTIONS[ix][0]
-            conv["step"] = "pax_voice_confirm"
-            q_pax_voice_confirm(phone, lang, conv)
-            at_save(phone, conv)
-            return True
-        return False
-
-    if step == "pax_voice_confirm":
-        ok_voice = low in (
-            "ok", "oui", "yes", "daccord", "dacord", "go", "continuer", "continue",
-            "c'est bon", "cest bon", "parfait", "👍",
-        ) or choice == "1"
-        if ok_voice:
-            conv["step"] = "incident_type"
-            q_incident(phone, lang, conv)
-            at_save(phone, conv)
-            return True
-        return False
-
-    # ── ÉTAPE 2 : INCIDENT (avant la photo) ─────────────────────────
-    if step == "incident_type":
-        mapping = {"1": "delay", "2": "cancel", "3": "denied"}
-        if choice in mapping:
-            conv["data"]["incident_type"] = mapping[choice]
-            conv["step"] = "boarding_after_pax"
-            q_boarding_after_pax(phone, lang, conv)
-            at_save(phone, conv)
-            return True
-        return False
-
-    # ── ÉTAPE 3 : CARTE D'EMBARQUEMENT (preuves) ─────────────────────
-    if step == "boarding_after_pax":
-        if image_b64:
-            if apply_boarding_pass_image(phone, conv, image_b64, lang, after_passengers=True):
-                return True
-            if not (OPENAI_API_KEY or "").strip():
-                send_boarding_read_failed_escapes(phone, lang, variant="no_vision")
-            else:
-                send_boarding_read_failed_escapes(phone, lang)
-            return True
-        if choice == "1":
-            send(
-                phone,
-                "👍 *Parfait.* Envoyez la *photo* maintenant : carte à plat, *sans reflets*."
-                if lang == "fr"
-                else "👍 *Great.* Send the *photo* now: pass flat on the table, *no glare*.",
-            )
-            return True
-        if choice == "2" or re.match(r"^\s*b\s*$", low) or re.match(r"^\s*option\s*b\s*$", low) or low in (
-            "continuer", "continue", "skip", "passer", "plus tard", "sans photo",
-            "no photo", "later", "pas de photo", "questions", "sans image",
-            "optionb", "manuel", "manuelle", "saisie manuelle", "à la main", "a la main",
-        ):
-            advance_after_incident(phone, lang, conv)
-            at_save(phone, conv)
-            return True
-        return False
-
-    # ── ÉTAPE 4 : COMPAGNIE ──────────────────────────────────────────
-    if step == "airline":
-        if image_b64:
-            if apply_boarding_pass_image(phone, conv, image_b64, lang):
-                return True
-            send(
-                phone,
-                "📸 Photo reçue mais peu lisible ou pas une carte/billet. Réessayez ou choisissez la compagnie (*1–9* / nom)."
-                if lang == "fr"
-                else "📸 Photo unclear or not a boarding pass. Retry or pick airline (*1–9* / name).",
-            )
-            return True
-        u = t.strip()
-        # Touche numérique seule (WhatsApp peut envoyer 1 + variation + keycap)
-        m_key = re.match(r"^\s*([1-9])(?:\uFE0F\u20E3)?\s*$", u)
-        d1    = m_key.group(1) if m_key else None
-        if d1 and d1 in AIRLINES_MAP:
-            conv["data"]["airline"] = AIRLINES_MAP[d1]
-            next_after_airline_pick(phone, lang, conv)
-            at_save(phone, conv)
-            return True
-        if d1 == "9" or low in ("autre", "other", "others", "otr"):
-            conv["step"] = "airline_other"
-            send(phone, "✍️ Tapez le nom de votre compagnie :" if lang=="fr" else "✍️ Type your airline name:")
-            return True
-        # Plusieurs chiffres seuls → pas un choix valide (évite blocage silencieux)
-        if u.isdigit() and len(u) > 1:
-            send(
-                phone,
-                "⚠️ *Ouvrez la liste* du message précédent, choisissez *Autre*, ou *tapez le nom* de la compagnie (ex. *EasyJet*)."
-                if lang == "fr"
-                else "⚠️ *Open the list* on the previous message, pick *Other*, or *type the airline name* (e.g. *EasyJet*).",
-            )
-            return True
-        # Nom tapé (lettres : évite interpréter "12" comme compagnie)
-        has_alpha = bool(re.search(r"[A-Za-zÀ-ÿ]", u))
-        if has_alpha and len(u) >= 2:
-            conv["data"]["airline"] = u
-            next_after_airline_pick(phone, lang, conv)
-            at_save(phone, conv)
-            return True
-        return False
-
-    # ── ÉTAPE 4b : AUTRE COMPAGNIE ───────────────────────────────────
-    if step == "airline_other":
-        if image_b64:
-            if apply_boarding_pass_image(phone, conv, image_b64, lang):
-                return True
-            send(
-                phone,
-                "📸 Photo illisible. Tapez le nom de la compagnie en toutes lettres."
-                if lang == "fr"
-                else "📸 Photo unclear. Please type the airline name.",
-            )
-            return True
-        conv["data"]["airline"] = t
-        next_after_airline_pick(phone, lang, conv)
-        at_save(phone, conv)
-        return True
-
-    # ── ÉTAPE 5 : PNR ────────────────────────────────────────────────
-    if step == "pnr_input":
-        if image_b64:
-            if apply_boarding_pass_image(phone, conv, image_b64, lang):
-                return True
-            send(
-                phone,
-                "📸 Photo non reconnue. Envoyez le *code PNR* (6 caractères) ou *SKIP*."
-                if lang == "fr"
-                else "📸 Photo not recognized. Send your *PNR* (6 chars) or *SKIP*.",
-            )
-            return True
-        pnr_clean = re.sub(r"[^A-Z0-9]", "", t.upper())
-        if low in ("skip", "passer", "aucun", "non", "no") or not pnr_clean:
-            conv["data"]["pnr"] = None
-        else:
-            conv["data"]["pnr"] = pnr_clean[:8]
-        if conv["data"].get("flight_number"):
-            conv["step"] = "flight_date"
-            q_flight_date(phone, lang, conv)
-        else:
-            conv["step"] = "flight_number"
-            q_flight_number(phone, lang)
-        at_save(phone, conv)
-        return True
-
-    # ── ÉTAPE 6 : NUMÉRO DE VOL ──────────────────────────────────────
-    if step == "flight_number":
-        if image_b64:
-            if apply_boarding_pass_image(phone, conv, image_b64, lang):
-                return True
-            send(
-                phone,
-                "📸 Impossible de lire la carte. Tapez le *numéro de vol* (ex. SN271) ou renvoyez une photo plus nette."
-                if lang == "fr"
-                else "📸 Could not read the pass. Type the *flight number* (e.g. SN271) or send a clearer photo.",
-            )
-            return True
-        # Texte
-        m2 = re.search(r"\b([A-Z]{1,2}\d{1,4})\b", t.upper())
-        conv["data"]["flight_number"] = m2.group(1) if m2 else t.upper()[:10]
-        conv["step"] = "flight_date"
-        q_flight_date(phone, lang, conv)
-        at_save(phone, conv)
-        return True
-
-    # ── ÉTAPE 7a : ANNÉE (ou date complète au clavier) ───────────────
-    if step == "flight_date":
-        parsed = try_parse_flight_date_message(t, lang)
-        if parsed:
-            if not _is_valid_claim_flight_date_str(parsed):
-                send(
-                    phone,
-                    "⚠️ Cette date est *dans le futur* ou *trop ancienne* pour la fenêtre habituelle (environ 5 ans). "
-                    "Vérifiez jour, mois et année — ou choisissez une année dans la liste."
-                    if lang == "fr"
-                    else "⚠️ That date is *in the future* or *too far back* for the usual window (~5 years). "
-                    "Check day, month and year — or pick a year from the list.",
-                )
-                return True
-            conv["data"]["flight_date"] = parsed
-            conv["data"].pop("pending_ticket_dm", None)
-            conv["data"].pop("temp_year", None)
-            conv["data"].pop("temp_years", None)
-            conv["data"].pop("temp_month", None)
-            advance_after_flight_date_complete(phone, conv, lang)
-            at_save(phone, conv)
-            return True
-        years = conv["data"].get("temp_years", [])
-        if choice == "6":
-            if conv["data"].get("pending_ticket_dm"):
-                send(
-                    phone,
-                    "⚠️ Répondez par un *chiffre de la liste* ou envoyez la *date complète* JJ/MM/AAAA."
-                    if lang == "fr"
-                    else "⚠️ Reply with a *listed number* or send the *full date* DD/MM/YYYY.",
-                )
-                return True
-            send(phone, f"😔 Rétroactivité 5 ans max. Votre vol est trop ancien.\n\n👉 {RDA_DOMAIN}")
-            return True
-        idx = int(choice) - 1 if choice and choice.isdigit() else -1
-        if 0 <= idx < len(years):
-            conv["data"]["temp_year"] = str(years[idx])
-            dm = conv["data"].get("pending_ticket_dm")
-            if dm and isinstance(dm, (list, tuple)) and len(dm) == 2:
-                day_s, month_s = dm[0], dm[1]
-                y = conv["data"]["temp_year"]
-                conv["data"]["flight_date"] = f"{day_s}/{month_s}/{y}"
-                conv["data"].pop("pending_ticket_dm", None)
-                conv["data"].pop("temp_year", None)
-                conv["data"].pop("temp_years", None)
-                advance_after_flight_date_complete(phone, conv, lang)
-                at_save(phone, conv)
-                return True
-            conv["step"] = "flight_month"
-            q_flight_month(phone, lang, conv["data"]["temp_year"])
-            return True
-        return False
-
-    # ── ÉTAPE 7b : MOIS ──────────────────────────────────────────────
-    if step == "flight_month":
-        parsed = try_parse_flight_date_message(t, lang)
-        if parsed:
-            if not _is_valid_claim_flight_date_str(parsed):
-                send(
-                    phone,
-                    "⚠️ Cette date est *dans le futur* ou *trop ancienne* pour la fenêtre habituelle (environ 5 ans). "
-                    "Vérifiez jour, mois et année — ou choisissez le mois dans la liste."
-                    if lang == "fr"
-                    else "⚠️ That date is *in the future* or *too far back* for the usual window (~5 years). "
-                    "Check day, month and year — or pick the month from the list.",
-                )
-                return True
-            conv["data"]["flight_date"] = parsed
-            conv["data"].pop("pending_ticket_dm", None)
-            conv["data"].pop("temp_year", None)
-            conv["data"].pop("temp_years", None)
-            conv["data"].pop("temp_month", None)
-            advance_after_flight_date_complete(phone, conv, lang)
-            at_save(phone, conv)
-            return True
-        if choice and choice.isdigit() and 1 <= int(choice) <= 12:
-            conv["data"]["temp_month"] = f"{int(choice):02d}"
-            conv["step"] = "flight_day"
-            q_flight_day(phone, lang, conv["data"].get("temp_year", ""), conv["data"]["temp_month"])
-            return True
-        mo = month_number_from_word_token(t, lang)
-        if mo is not None:
-            conv["data"]["temp_month"] = f"{mo:02d}"
-            conv["step"] = "flight_day"
-            q_flight_day(phone, lang, conv["data"].get("temp_year", ""), conv["data"]["temp_month"])
-            return True
-        return False
-
-    # ── ÉTAPE 7c : JOUR ──────────────────────────────────────────────
-    if step == "flight_day":
-        parsed = try_parse_flight_date_message(t, lang)
-        if parsed:
-            if not _is_valid_claim_flight_date_str(parsed):
-                send(
-                    phone,
-                    "⚠️ Cette date est *dans le futur* ou *trop ancienne* pour la fenêtre habituelle (environ 5 ans). "
-                    "Vérifiez jour, mois et année — ou répondez par un *jour* entre 1 et 31."
-                    if lang == "fr"
-                    else "⚠️ That date is *in the future* or *too far back* for the usual window (~5 years). "
-                    "Check day, month and year — or reply with a *day* from 1 to 31.",
-                )
-                return True
-            conv["data"]["flight_date"] = parsed
-            conv["data"].pop("pending_ticket_dm", None)
-            conv["data"].pop("temp_year", None)
-            conv["data"].pop("temp_years", None)
-            conv["data"].pop("temp_month", None)
-            advance_after_flight_date_complete(phone, conv, lang)
-            at_save(phone, conv)
-            return True
-        if choice and choice.isdigit() and 1 <= int(choice) <= 31:
-            day   = f"{int(choice):02d}"
-            year  = conv["data"].get("temp_year", "")
-            month = conv["data"].get("temp_month", "")
-            conv["data"]["flight_date"] = f"{day}/{month}/{year}"
-            advance_after_flight_date_complete(phone, conv, lang)
-            at_save(phone, conv)
-            return True
-        return False
-
-    # ── ITINÉRAIRE : type de parcours puis détail (direct / escale / aller-retour) ──
-    if step == "itinerary_kind":
-        if choice in ("1", "2", "3"):
-            d = conv["data"]
-            d.pop("itin_collect_mode", None)
-            d.pop("claim_rt_leg", None)
-            d.pop("itinerary_compl_note", None)
-            if choice == "1":
-                conv["step"] = "itinerary_dep"
-                q_itinerary_departure(phone, lang, conv)
-                at_save(phone, conv)
-                return True
-            if choice == "2":
-                d["itin_collect_mode"] = "connection"
-                conv["step"] = "itinerary_freeline"
-                q_itinerary_freeline(phone, lang, conv)
-                at_save(phone, conv)
-                return True
-            conv["step"] = "itinerary_rt_pick"
-            q_itinerary_rt_pick(phone, lang, conv)
-            at_save(phone, conv)
-            return True
-        return False
-
-    if step == "itinerary_rt_pick":
-        if choice == "1":
-            conv["data"]["claim_rt_leg"] = "outbound"
-            conv["data"]["itin_collect_mode"] = "rt_out"
-            conv["step"] = "itinerary_freeline"
-            q_itinerary_freeline(phone, lang, conv)
-            at_save(phone, conv)
-            return True
-        if choice == "2":
-            conv["data"]["claim_rt_leg"] = "return"
-            conv["data"]["itin_collect_mode"] = "rt_in"
-            conv["step"] = "itinerary_freeline"
-            q_itinerary_freeline(phone, lang, conv)
-            at_save(phone, conv)
-            return True
-        if choice == "3":
-            conv["data"]["claim_rt_leg"] = "both"
-            conv["data"]["itin_collect_mode"] = "rt_both"
-            conv["step"] = "itinerary_freeline"
-            q_itinerary_freeline(phone, lang, conv)
-            at_save(phone, conv)
-            return True
-        return False
-
-    if step == "itinerary_freeline":
-        if image_b64:
-            if apply_boarding_pass_image(phone, conv, image_b64, lang):
-                conv["data"].pop("temp_itin_dep", None)
-                return True
-            send(
-                phone,
-                "📸 Photo non reconnue comme billet. Tapez un *trajet* (ex. *BRU → CDG → ABJ*) ou des codes *BRU CDG ABJ*."
-                if lang == "fr"
-                else "📸 Not read as a boarding pass. Type a *route* (e.g. *BRU → CDG → ABJ*) or codes *BRU CDG ABJ*.",
-            )
-            return True
-        u = (t or "").strip()
-        if try_set_itinerary_from_freeform(conv, u):
-            conv["data"].pop("temp_itin_dep", None)
-            advance_after_itinerary_collected(phone, conv, lang)
-            at_save(phone, conv)
-            return True
-        send(
-            phone,
-            "🛤️ Je n’ai pas compris le trajet. Exemples : *BRU → CDG → ABJ*, *CDG ABJ*, "
-            "ou *CDG → ABJ | ABJ → CDG* pour un aller-retour. Vous pouvez aussi envoyer une *photo de carte*."
-            if lang == "fr"
-            else "🛤️ I couldn’t read the route. Examples: *BRU → CDG → ABJ*, *CDG ABJ*, "
-            "or *CDG → ABJ | ABJ → CDG* for round trip. You can also send a *boarding pass photo*.",
-        )
-        return True
-
-    # ── ITINÉRAIRE (sans carte : départ puis arrivée ; avec carte déjà fusionné → étape sautée) ──
-    if step == "itinerary_dep":
-        if image_b64:
-            if apply_boarding_pass_image(phone, conv, image_b64, lang):
-                conv["data"].pop("temp_itin_dep", None)
-                return True
-            send(
-                phone,
-                "📸 Photo non reconnue comme billet. Tapez la *ville ou code* de départ (ex. *BRU*)."
-                if lang == "fr"
-                else "📸 Not read as a boarding pass. Type *departure* city or code (e.g. *BRU*).",
-            )
-            return True
-        u = t.strip()
-        if len(u) < 2:
-            send(
-                phone,
-                "🛫 Indiquez au moins le nom de la ville ou le code IATA (ex. *Bruxelles* ou *BRU*)."
-                if lang == "fr"
-                else "🛫 Please enter a city or IATA code (e.g. *Brussels* or *BRU*).",
-            )
-            return True
-        conv["data"]["temp_itin_dep"] = u
-        conv["step"] = "itinerary_arr"
-        q_itinerary_arrival(phone, lang, conv)
-        at_save(phone, conv)
-        return True
-
-    if step == "itinerary_arr":
-        if image_b64:
-            if apply_boarding_pass_image(phone, conv, image_b64, lang):
-                conv["data"].pop("temp_itin_dep", None)
-                return True
-            send(
-                phone,
-                "📸 Photo non reconnue. Tapez la *ville ou code* d'arrivée (ex. *ABJ*)."
-                if lang == "fr"
-                else "📸 Not recognized. Type *arrival* city or code (e.g. *ABJ*).",
-            )
-            return True
-        u = t.strip()
-        if len(u) < 2:
-            send(
-                phone,
-                "🛬 Indiquez la ville ou le code d'arrivée (ex. *Abidjan* ou *ABJ*)."
-                if lang == "fr"
-                else "🛬 Enter arrival city or code (e.g. *Abidjan* or *ABJ*).",
-            )
-            return True
-        dep = (conv["data"].get("temp_itin_dep") or "").strip()
-        conv["data"]["itinerary"] = f"{dep} → {u}"
-        conv["data"]["temp_itin_dep"] = None
-        advance_after_itinerary_collected(phone, conv, lang)
-        at_save(phone, conv)
-        return True
-
-    # ── Après saisie d'un nom : confirmer ou corriger avant le suivant ─
-    if step == "passenger_name_post_add":
-        names = list(conv["data"].get("passenger_names") or [])
-        pax = conv["data"].get("passengers") or 1
-        if _carte_confirm_yes(t, choice, lang):
-            nxt = len(names) + 1
-            conv["step"] = "passenger_names"
-            conv["data"]["pax_collect_idx"] = nxt
-            if nxt >= 2 and nxt <= pax:
-                q_boarding_next_passenger(phone, lang, nxt, pax)
-            q_passenger_name(phone, lang, nxt, pax, names)
-            at_save(phone, conv)
-            return True
-        if _carte_confirm_no(t, choice, lang):
-            if not names:
-                return False
-            names.pop()
-            conv["data"]["passenger_names"] = names
-            prev = len(names) + 1
-            conv["data"]["pax_collect_idx"] = prev
-            conv["step"] = "passenger_names"
-            q_passenger_name(phone, lang, prev, pax, names)
-            at_save(phone, conv)
-            return True
-        return False
-
-    # ── ÉTAPE 9 : NOMS PASSAGERS ─────────────────────────────────────
-    if step == "passenger_names":
-        pax = conv["data"].get("passengers") or 1
-        idx = conv["data"].get("pax_collect_idx") or 1
-
-        if image_b64:
-            merged = read_boarding_pass_merged(image_b64)
-            usable = boarding_pass_info_usable(merged)
-            if usable:
-                if apply_boarding_pass_image(phone, conv, image_b64, lang):
-                    return True
-            n_att = at_boarding_attach_to_indices(phone, conv, image_b64, [max(0, idx - 1)], lang)
-            if n_att:
-                send(
-                    phone,
-                    (
-                        "📎 *Photo / carte* enregistrée sur votre ligne passager dans Airtable.\n\n"
-                        "_(Envoyez *Prénom NOM* pour ce passager si besoin.)_"
-                        if lang == "fr"
-                        else "📎 *Photo / boarding pass* saved to your passenger row in Airtable.\n\n"
-                        "_(Send *First LAST* for this passenger if needed.)_"
-                    ),
-                )
-                return True
-
-        raw_in = (t or "").strip().split("\n")[0].strip()
-        raw_in = re.sub(r"^[\d\.\)\-\s]+", "", raw_in).strip()
-        low_in = raw_in.lower()
-        if not image_b64 and idx >= 2 and low_in in (
-            "2", "b", "option b", "optionb", "manuel", "manuelle",
-            "pas de carte", "pas carte", "no pass", "no card",
-        ):
-            send(
-                phone,
-                "⌨️ *Pas de carte pour l'instant* : envoyez maintenant *Prénom NOM* (nom en majuscules). "
-                "Nous vous demanderons une *photo du billet plus tard* pour compléter le dossier."
-                if lang == "fr"
-                else "⌨️ *No boarding pass right now*: send *First LAST* (LAST in caps). "
-                "We’ll ask for a *boarding-pass photo later* to complete the file.",
-            )
-            return True
-
-        # Nettoie la ligne
-        first = t.split("\n")[0].strip()
-        clean = re.sub(r"^[\d\.\)\-\s]+", "", first).strip()
-
-        # Format Prénom NOM
-        parts = re.split(r"\s+", clean)
-        if len(parts) >= 2:
-            prenom = parts[0].title()
-            nom    = " ".join(parts[1:]).upper()
-            formatted = f"{prenom} {nom}"
-        else:
-            # Nom trop court → redemande
-            send(
-                phone,
-                "👤 Envoyez *Prénom NOM* (2 mots minimum)\nEx. : *Aminata TRAORE*"
-                if lang == "fr"
-                else "👤 Send *First LAST* (2 words min)\nEx.: *Fatou SALL*",
-            )
-            return True
-
-        names = list(conv["data"].get("passenger_names") or [])
-        names.append(formatted)
-        conv["data"]["passenger_names"] = names
-
-        if len(names) >= pax:
-            goto_passenger_names_confirm(phone, conv, lang)
-        elif len(names) == 3 and pax > 3:
-            goto_passenger_names_confirm(phone, conv, lang)
-        else:
-            conv["step"] = "passenger_name_post_add"
-            q_passenger_name_post_add_confirm(phone, lang, conv, formatted)
-        at_save(phone, conv)
-        return True
-
-    if step == "passenger_names_confirm":
-        names = list(conv["data"].get("passenger_names") or [])
-        pax = conv["data"].get("passengers") or 1
-        if image_b64:
-            merged = read_boarding_pass_merged(image_b64)
-            if boarding_pass_info_usable(merged):
-                if apply_boarding_pass_image(phone, conv, image_b64, lang):
-                    return True
-            idxs = list(range(min(len(names), pax)))
-            n_att = at_boarding_attach_to_indices(phone, conv, image_b64, idxs, lang) if idxs else 0
-            if n_att:
-                send(
-                    phone,
-                    (
-                        (
-                            f"📎 Carte / photo enregistrée sur le passager dans Airtable."
-                            if n_att == 1 and lang == "fr"
-                            else (
-                                f"📎 *{n_att}* enregistrements carte / photo sur les passagers dans Airtable."
-                                if lang == "fr"
-                                else (
-                                    "📎 Boarding pass / photo saved to the passenger row in Airtable."
-                                    if n_att == 1
-                                    else f"📎 *{n_att}* boarding pass / photo attachments saved to passenger rows in Airtable."
-                                )
-                            )
-                        )
-                    ),
-                )
-                return True
-        partial = len(names) < pax
-        if choice == "1":
-            if partial:
-                conv["step"] = "passenger_names"
-                nxt = len(names) + 1
-                conv["data"]["pax_collect_idx"] = nxt
-                if nxt >= 2:
-                    q_boarding_next_passenger(phone, lang, nxt, pax)
-                q_passenger_name(phone, lang, nxt, pax, names)
-            else:
-                conv["step"] = "minor_check"
-                q_minors(phone, lang, conv)
-            at_save(phone, conv)
-            return True
-        if choice == "2":
-            if not names:
-                return False
-            names.pop()
-            conv["data"]["passenger_names"] = names
-            conv["data"]["pax_collect_idx"] = len(names) + 1
-            conv["step"] = "passenger_names"
-            q_passenger_name(phone, lang, len(names) + 1, pax, names)
-            at_save(phone, conv)
-            return True
-        return False
-
-    # ── ÉTAPE 10 : MINEURS ───────────────────────────────────────────
-    if step == "minor_check":
-        if choice == "1":
-            conv["data"]["has_minors"] = False
-            conv["step"] = "summary"
-            show_summary(phone, conv)
-            return True
-        if choice == "2":
-            conv["data"]["has_minors"] = True
-            if (conv["data"].get("passengers") or 1) == 1:
-                send(phone, f"👶 Mineur seul : un parent doit signer.\n📱 Climbie : {CLIMBIE_TEL}")
-            else:
-                send(phone, f"👶 Noté ! Un représentant légal devra co-signer le mandat.\n\nOn continue 👇" if lang=="fr" else f"👶 Noted! A legal guardian will need to co-sign.\n\nLet's continue 👇")
-            conv["step"] = "summary"
-            show_summary(phone, conv)
-            return True
-        return False
-
-    return False
-
-# ===== WEBHOOK =====
-
-TRIGGER_WORDS = [
-    "vol", "retard", "annul", "indemn", "flight", "delay", "cancel",
-    "compensation", "claim", "bonjour", "hello", "salut", "hi",
-    "start", "commencer", "menu", "aide", "help", "dossier", "mandat",
-]
+                code = send_whatsapp_text(phone, relance, skip_outbound_dedup=True)
+                entry["sent_status"] = code
+                conv["relance_count"] = count + 1
+            except Exception as e:
+                entry["sent_status"] = f"error: {e}"
+        abandoned.append(entry)
+    return jsonify({
+        "count": len(abandoned),
+        "thresholds_hours": RELANCE_THRESHOLDS_HOURS,
+        "abandoned": abandoned,
+    }), 200
+
+@app.route("/reset/<phone>", methods=["GET"])
+def reset(phone):
+    conversations.pop(phone, None)
+    return jsonify({"status": "reset", "phone": phone}), 200
+
+@app.route("/test", methods=["GET"])
+def test():
+    return jsonify({
+        "status": "running",
+        "version": "v9 — flux v8 optimisé + Airtable + codeshare lookup",
+        "active_conversations": len(conversations),
+        "airtable": "OK" if AIRTABLE_API_KEY else "MISSING",
+        "openai":   "OK" if OPENAI_API_KEY else "MISSING",
+        "wati":     "OK" if WATI_API_TOKEN else "MISSING",
+        "wati_post_submit_template": WATI_POST_SUBMIT_TEMPLATE_NAME or None,
+        "wati_template_channel_configured": bool(WATI_TEMPLATE_CHANNEL_NUMBER),
+        "airtable_f_carte_embarquement": F_CARTE_EMBARQUEMENT or None,
+        "airtable_f_identite": F_PIECE_IDENTITE or None,
+        "airtable_f_mandat_signe": F_MANDAT_SIGNE or None,
+        "airtable_f_stop_relance": F_STOP_RELANCE or None,
+        "airtable_f_sequence_active": F_SEQUENCE_ACTIVE or None,
+        "mandat_signed_webhook": "on" if MANDAT_SIGNED_WEBHOOK_SECRET else "off",
+    }), 200
 
 @app.route("/mandat_signed", methods=["POST"])
 def mandat_signed_webhook():
     """
-    Appelé par le site / Make / Zapier quand le mandat est signé.
-    Body JSON : {"ref":"RDA-YYYYMMDD-XXXX","secret":"…"} — secret = MANDAT_SIGNED_WEBHOOK_SECRET.
-    Optionnel : "waId" ou "phone" pour désambigüiser si plusieurs sessions (rare).
+    Notification signature mandat (site / Make / Zapier).
+    Body JSON : {"ref":"RDA-…","secret":"…"} — secret = MANDAT_SIGNED_WEBHOOK_SECRET.
+    Optionnel : "waId"/"phone" pour désambigüiser.
     """
     if not MANDAT_SIGNED_WEBHOOK_SECRET:
         return jsonify({"ok": False, "error": "MANDAT_SIGNED_WEBHOOK_SECRET not configured"}), 503
@@ -5026,240 +3132,23 @@ def mandat_signed_webhook():
     h_norm = _digits(phone_hint)
     updated = 0
     for p, c in list(conversations.items()):
-        if c.get("ref") != ref:
-            continue
-        ps = (c.get("data") or {}).get("_post_submit")
-        if not isinstance(ps, dict) or not ps.get("active"):
+        if c.get("ref_dossier") != ref:
             continue
         if h_norm:
             p_norm = _digits(str(p))
             if p_norm != h_norm and not (p_norm.endswith(h_norm) or h_norm.endswith(p_norm)):
                 continue
+        ps = (c.get("data") or {}).setdefault("_post_submit", {})
         ps["mandate_signed_server"] = True
+        ps["active"] = False
+        c["data"]["dossier_status"] = "complet"
+        upsert_airtable(p, c)
         updated += 1
-        if post_submit_fully_done(c):
-            ps["active"] = False
     return jsonify({"ok": True, "updated": updated}), 200
-
-@app.route("/webhook", methods=["GET", "POST"])
-def webhook():
-    try:
-        if request.method == "GET":
-            return jsonify({"ok": True, "service": "robin-des-airs-bot", "webhook": "ready"}), 200
-
-        raw_preview = (request.get_data(as_text=True) or "")[:800]
-        print(f"[webhook] IN POST preview={raw_preview!r}", flush=True)
-
-        data = request.get_json(silent=True) or {}
-        if not data and raw_preview.strip().startswith("{"):
-            try:
-                data = json.loads(raw_preview)
-            except (json.JSONDecodeError, TypeError):
-                data = {}
-        if not data:
-            print("[webhook] no JSON body", flush=True)
-            return jsonify({"status": "no data"}), 200
-
-        print(
-            f"[webhook] type={data.get('type')!r} event={data.get('eventType')!r} "
-            f"waId={data.get('waId')!r} text={(data.get('text') or '')[:80]!r} "
-            f"listReply={bool(data.get('listReply'))}",
-            flush=True,
-        )
-
-        phone = normalize_phone_key(
-            data.get("waId") or data.get("from") or data.get("phone")
-        )
-        if not phone:
-            return jsonify({"status": "no phone"}), 200
-        if data.get("owner") is True or str(data.get("owner", "")).lower() in ("true", "1", "yes"):
-            print("[webhook] ignored owner message", flush=True)
-            return jsonify({"status": "ignored own"}), 200
-
-        conv = get_conv(phone)
-
-        message_text, image_b64 = parse_wati_inbound_message(data)
-        message_text = enrich_message_from_wati_interactive(data, message_text)
-        poll_choice = resolve_tunnel_choice(conv, data, message_text)
-        if poll_choice and not looks_like_full_date_input(message_text):
-            message_text = poll_choice
-        message_text = (message_text or "").strip()
-
-        has_interactive = _has_wati_interactive(data)
-
-        if not message_text and not image_b64 and not has_interactive:
-            print(f"[webhook] ignored empty keys={list(data.keys())[:12]}")
-            return jsonify({"status": "ignored empty"}), 200
-
-        if not message_text and has_interactive and not poll_choice:
-            print(
-                f"[webhook] interactive sans choix résolu type={data.get('type')} "
-                f"listReply={data.get('listReply')} btn={data.get('interactiveButtonReply')}",
-                flush=True,
-            )
-            lang = (conv.get("data") or {}).get("lang", "fr")
-            hint = (
-                "👆 Choix non reçu. Ouvrez *Choisir* à nouveau ou tapez *1*, *2*, *3*… *6*."
-                if lang == "fr"
-                else "👆 Choice not received. Open *Choose* again or type *1*…*6*."
-            )
-            send(phone, hint)
-            return jsonify({"status": "ok", "note": "interactive_unparsed"}), 200
-
-        sig  = f"{message_text.lower()}|img:{bool(image_b64)}|poll:{poll_choice or ''}"
-        step = conv.get("step")
-        if is_dup(phone, data, sig, step):
-            return jsonify({"status": "duplicate"}), 200
-
-        touch_last_user_inbound(conv)
-
-        print(
-            f"[MSG] from={phone} step={step} text='{message_text[:50]}' "
-            f"poll={poll_choice!r} type={data.get('type')}"
-        )
-
-        # Détection langue
-        if message_text:
-            conv["data"]["lang"] = detect_lang(message_text)
-        lang = conv["data"].get("lang", "fr")
-
-        # ── Flux en cours ──
-        if step and step not in (None, "completed"):
-            handled = handle_reply(phone, message_text, conv, image_b64)
-            if not handled:
-                fallback = (
-                    "👆 *Appuyez sur un bouton* ou *ouvrez la liste* du dernier message.\n\n"
-                    "💡 *menu* ou *recommencer* = tout relancer depuis le début."
-                    if lang == "fr"
-                    else "👆 *Tap a button* or *open the list* on the last message.\n\n"
-                    "💡 *menu* or *restart* = start over from the beginning."
-                )
-                rep_ai = None
-                if message_text and len(message_text.strip()) >= 3:
-                    rep_ai = gpt_tunnel_assist(phone, message_text, step, lang)
-                send(phone, rep_ai or fallback)
-            return jsonify({"status": "ok"}), 200
-
-        is_trigger = any(w in (message_text or "").lower() for w in TRIGGER_WORDS)
-
-        # ── Dossier déjà terminé : ne pas relancer le tunnel sur chaque message court ──
-        if step == "completed":
-            update_post_submit_inbound(phone, conv, message_text, image_b64)
-            if image_b64:
-                ps0 = conv.get("data", {}).get("_post_submit") or {}
-                if ps0.get("post_submit_has_boarding_image"):
-                    at_save(phone, conv)
-                    at_boarding_attach_to_indices(phone, conv, image_b64, [0], lang)
-                    refresh_post_submit_airtable_flags(conv)
-                ack = post_submit_after_image_ack(conv, lang)
-                if ack:
-                    send(phone, ack)
-                    if post_submit_fully_done(conv):
-                        send(
-                            phone,
-                            (
-                                "✅ *Dossier complet*\n\n"
-                                "• ⚙️ Nous traitons votre dossier\n"
-                                "• 💬 Questions : écrivez ici"
-                            )
-                            if lang == "fr"
-                            else (
-                                "✅ *File complete*\n\n"
-                                "• ⚙️ We’re processing your claim\n"
-                                "• 💬 Questions: reply here"
-                            ),
-                        )
-                    return jsonify({"status": "ok", "post_submit_image": True}), 200
-            if is_trigger or (message_text and user_wants_fresh_start(message_text)):
-                conv["data"] = fresh_data(lang)
-                conv["step"] = "passengers"
-                conv["ref"] = make_ref(phone)
-                q_passengers(phone, lang, conv)
-                return jsonify({"status": "flow started"}), 200
-            rep = gpt_free_reply(phone, message_text, conv, dossier_done=True)
-            fallback_done = completed_phase_fallback_reply(conv, lang)
-            send(phone, ((rep or "").strip() or fallback_done) + site_mandat_links_footer(lang))
-            return jsonify({"status": "ok"}), 200
-
-        # ── Nouveau contact (step None) : démarrage si mot-clé ou message très court ──
-        if step is None:
-            if is_trigger or len((message_text or "").strip()) < 18:
-                conv["data"] = fresh_data(lang)
-                conv["step"] = "passengers"
-                conv["ref"] = make_ref(phone)
-                q_passengers(phone, lang, conv)
-                return jsonify({"status": "flow started"}), 200
-            rep = gpt_free_reply(phone, message_text, conv, dossier_done=False)
-            nudge = (
-                "\n• 💡 *menu* = ouvrir le formulaire (liste de choix)"
-                if lang == "fr"
-                else "\n• 💡 *menu* = open the form (pick from the list)"
-            )
-            fallback_new = (
-                "👋 *Bonjour*\n\n"
-                "• 💬 Réponse courte à votre message ci-dessous\n"
-                "• 📋 Dossier : tapez *menu* puis choisissez dans la liste"
-                if lang == "fr"
-                else (
-                    "👋 *Hello*\n\n"
-                    "• 💬 Short answer to your message below\n"
-                    "• 📋 Open a claim: type *menu* then pick from the list"
-                )
-            )
-            body = ((rep or "").strip() + nudge) if rep else (fallback_new + nudge)
-            send(phone, body + site_mandat_links_footer(lang))
-            return jsonify({"status": "ok"}), 200
-
-        # Sécurité (étape inconnue)
-        conv["data"] = fresh_data(lang)
-        conv["step"] = "passengers"
-        conv["ref"] = make_ref(phone)
-        q_passengers(phone, lang, conv)
-        return jsonify({"status": "flow started"}), 200
-
-    except Exception as e:
-        print(f"Webhook error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"status": "error"}), 500
-
-# ===== ROUTES UTILITAIRES =====
-
-@app.route("/test", methods=["GET"])
-def test():
-    return jsonify({
-        "status":  "running",
-        "version": "v11 — récap dossier + lien /sign + tunnel langue / parcours",
-        "airtable": "OK" if AIRTABLE_API_KEY else "MISSING",
-        "openai":   "OK" if OPENAI_API_KEY else "MISSING",
-        "wati":     "OK" if WATI_API_TOKEN else "MISSING",
-        "wati_post_submit_template": WATI_POST_SUBMIT_TEMPLATE_NAME or None,
-        "wati_template_channel_configured": bool(WATI_TEMPLATE_CHANNEL_NUMBER),
-        "airtable_f_identite": F_PIECE_IDENTITE or None,
-        "airtable_f_carte_embarquement": F_CARTE_EMBARQUEMENT or None,
-        "airtable_f_mandat_signe": F_MANDAT_SIGNE or None,
-        "airtable_f_stop_relance": F_STOP_RELANCE or None,
-        "airtable_f_sequence_active": F_SEQUENCE_ACTIVE or None,
-        "mandat_signed_webhook": "on" if MANDAT_SIGNED_WEBHOOK_SECRET else "off",
-        "convs":    len(conversations),
-        "terms_url": TERMS_URL,
-        "privacy_url": PRIVACY_POLICY_URL,
-        "stop_relances": "GET/POST /post_submit/cancel/<waId> (optionnel ?secret= si POST_SUBMIT_CANCEL_SECRET)",
-        "reset_conversation": "GET /reset/<waId>",
-    }), 200
-
-@app.route("/reset/<phone>", methods=["GET"])
-def reset(phone):
-    conversations.pop(phone, None)
-    return jsonify({"status": "reset", "phone": phone}), 200
 
 @app.route("/post_submit/cancel/<phone>", methods=["GET", "POST"])
 def post_submit_cancel(phone):
-    """
-    Arrête uniquement la séquence de relances (mandat + pièces) pour ce numéro WhatsApp.
-    Utile si la cliente a écrit par erreur après le message « dossier prêt » — sans effacer tout l’historique.
-    Optionnel : POST_SUBMIT_CANCEL_SECRET dans l’env + ?secret=… pour limiter l’accès.
-    """
+    """Arrête uniquement la séquence de relances post-soumission pour ce numéro WhatsApp."""
     want = (os.environ.get("POST_SUBMIT_CANCEL_SECRET") or "").strip()
     if want:
         got = (request.args.get("secret") or request.headers.get("X-Cancel-Secret") or "").strip()
@@ -5268,85 +3157,17 @@ def post_submit_cancel(phone):
     conv = conversations.get(phone)
     if not conv:
         return jsonify({"ok": False, "reason": "no_conversation", "phone": phone}), 404
-    d = conv.get("data") or {}
-    ps = d.get("_post_submit")
+    ps = (conv.get("data") or {}).get("_post_submit")
     if not isinstance(ps, dict):
         return jsonify({"ok": False, "reason": "no_post_submit", "phone": phone}), 200
     ps["active"] = False
     ps["cancelled_at"] = time.time()
     ps["cancel_reason"] = "operator"
-    return jsonify({"ok": True, "phone": phone, "ref": conv.get("ref")}), 200
-
-@app.route("/conversations", methods=["GET"])
-def list_convs():
-    return jsonify({p: {"step": c["step"], "ref": c["ref"], "data": c["data"]} for p, c in conversations.items()}), 200
-
-@app.route("/test_flow/<phone>", methods=["GET"])
-def test_flow(phone):
-    c = get_conv(phone)
-    c["data"] = fresh_data("fr")
-    c["step"] = "passengers"
-    c["ref"]  = make_ref(phone)
-    q_passengers(phone, "fr")
-    return jsonify({"status": "started", "phone": phone}), 200
+    return jsonify({"ok": True, "phone": phone, "ref": conv.get("ref_dossier")}), 200
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Robin des Airs Bot v11 + récap dossier + /sign", 200
-
-@app.route("/sign/<token>", methods=["GET"])
-def mandate_sign_landing(token):
-    """Page intermédiaire rassurante avant redirection vers l’URL mandat réelle."""
-    _sign_redirect_cleanup()
-    tok = (token or "").strip()
-    ent = SIGN_REDIRECTS.get(tok) if tok else None
-    if not ent or float(ent.get("exp") or 0) < time.time():
-        return (
-            "<!DOCTYPE html><html lang=\"fr\"><head><meta charset=\"utf-8\"><title>Robin des Airs</title></head>"
-            "<body style=\"font-family:system-ui,sans-serif;padding:2rem;\"><p>Lien expiré ou invalide.</p>"
-            f"<p><a href=\"{escape(RDA_DOMAIN, quote=True)}\">robindesairs.eu</a></p></body></html>",
-            410,
-            {"Content-Type": "text/html; charset=utf-8"},
-        )
-    target = (ent.get("url") or "").strip()
-    if not target:
-        return redirect(RDA_DOMAIN, code=302)
-    href = escape(target, quote=True)
-    body = f"""<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Robin des Airs — Signature sécurisée</title>
-</head>
-<body style="font-family:system-ui,-apple-system,sans-serif;max-width:520px;margin:48px auto;padding:0 16px;line-height:1.5;">
-  <p style="font-size:1.5rem;margin:0 0 8px;">🏹 Robin des Airs</p>
-  <h1 style="font-size:1.15rem;font-weight:600;margin:0 0 16px;">Signature sécurisée</h1>
-  <p>Vous allez ouvrir la page officielle de signature du mandat (même site sécurisé que robindesairs.eu).</p>
-  <p><a href="{href}" style="display:inline-block;padding:12px 20px;background:#0b5ed7;color:#fff;text-decoration:none;border-radius:8px;font-weight:600;">Continuer vers la signature</a></p>
-  <p style="color:#555;font-size:0.9rem;">En cas de problème, copiez-collez ce lien dans votre navigateur :<br><span style="word-break:break-all;">{href}</span></p>
-</body>
-</html>"""
-    return body, 200, {"Content-Type": "text/html; charset=utf-8"}
-
-@app.route("/m", methods=["GET"])
-def mandat_compressed_redirect():
-    """Décompresse ?c=… et redirige vers mandat.html avec les mêmes paramètres qu'avant."""
-    c = (request.args.get("c") or "").strip().replace(" ", "+")
-    if not c:
-        return redirect(MANDAT_URL, code=302)
-    pad = "=" * ((4 - len(c) % 4) % 4)
-    try:
-        raw = zlib.decompress(base64.urlsafe_b64decode(c.encode("ascii") + pad.encode("ascii")))
-        loaded = json.loads(raw.decode("utf-8"))
-        if not isinstance(loaded, dict):
-            raise ValueError("payload not an object")
-        query = urlencode({k: str(v) for k, v in loaded.items() if v not in (None, "")})
-        target = f"{MANDAT_URL}?{query}" if query else MANDAT_URL
-        return redirect(target, code=302)
-    except Exception as ex:
-        print(f"mandat /m decode error: {ex}")
-        return redirect(MANDAT_URL, code=302)
+    return "Robin des Airs Bot v9 - Running!", 200
 
 start_post_submit_reminder_thread()
 
