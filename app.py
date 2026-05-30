@@ -17,6 +17,15 @@ app = Flask(__name__)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 WATI_API_TOKEN = os.environ.get("WATI_API_TOKEN", "")
 WATI_BASE_URL  = os.environ.get("WATI_BASE_URL", "")
+
+# Session Wati qui maintient POST après redirect 301 (app.wati.io → auth.wati.io)
+class _PostRedirectSession(requests.Session):
+    def rebuild_method(self, prepared_request, response):
+        """Forcer POST même après 301/302."""
+        prepared_request.method = "POST"
+        return prepared_request
+
+_wati_session = _PostRedirectSession()
 RDA_SITE       = os.environ.get("RDA_SITE", "https://robindesairs.eu")
 MANDAT_BASE_URL = os.environ.get("MANDAT_BASE_URL", f"{RDA_SITE}/mandat.html")
 
@@ -411,7 +420,7 @@ def send_whatsapp_text(phone, message, *, skip_outbound_dedup=False):
     if not skip_outbound_dedup and _outbound_should_block(phone, step, "text", fp): return 429
     url  = f"{WATI_BASE_URL}/api/v1/sendSessionMessage/{phone}"
     hdrs = {"Authorization": f"Bearer {WATI_API_TOKEN}", "accept": "*/*"}
-    r = requests.post(url, headers=hdrs, params={"messageText": message}, timeout=30)
+    r = _wati_session.post(url, headers=hdrs, params={"messageText": message}, timeout=30)
     print(f"Wati TEXT: {r.status_code}")
     if r.status_code == 200 and not skip_outbound_dedup:
         _register_outbound_success(phone, step, "text", fp)
@@ -427,7 +436,7 @@ def send_whatsapp_buttons(phone, body_text, buttons, header_text=None, footer_te
     step = _conversation_step_for_phone(phone)
     fp   = _fp_buttons(body_text, buttons, header_text, footer_text)
     if _outbound_should_block(phone, step, "buttons", fp): return 429
-    r = requests.post(url, headers=hdrs, params={"whatsappNumber": phone}, json=payload, timeout=30)
+    r = _wati_session.post(url, headers=hdrs, params={"whatsappNumber": phone}, json=payload, timeout=30)
     print(f"Wati BUTTONS: {r.status_code} - {r.text[:150]}")
     if r.status_code != 200:
         fallback = body_text + "\n\n" + "\n".join(f"{i+1}. {b['title']}" for i, b in enumerate(buttons))
@@ -454,7 +463,7 @@ def send_whatsapp_list(phone, body_text, button_label, sections, header_text=Non
     step = _conversation_step_for_phone(phone)
     fp   = _fp_list(body_text, button_label, sections, header_text, footer_text)
     if _outbound_should_block(phone, step, "list", fp): return 429
-    r = requests.post(url, headers=hdrs, params={"whatsappNumber": phone}, json=payload, timeout=30)
+    r = _wati_session.post(url, headers=hdrs, params={"whatsappNumber": phone}, json=payload, timeout=30)
     print(f"Wati LIST: {r.status_code} - {r.text[:150]}")
     if r.status_code != 200:
         fallback = body_text + "\n\n"
