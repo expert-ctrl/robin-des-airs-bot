@@ -623,7 +623,7 @@ def send_welcome_hook(phone, conv):
             "• *Vers l'Europe* — si la compagnie est européenne\n\n"
             "*0€ si on ne gagne pas. Aucun risque pour vous.*"
         ))
-        buttons = [{"id": "start_check", "title": "🚀 Vérifier mes droits"}]
+        buttons = [{"id": "start_check", "title": "Vérifier mes droits"}]
     send_whatsapp_buttons(phone, body, buttons)
 
 
@@ -643,18 +643,18 @@ def ask_route_qualify(phone, lang="fr"):
     if lang == "en":
         body = with_bar("route_qualify", "🗺️ Where was your flight?\n\nThis determines if EU regulation CE 261/2004 applies.")
         buttons = [
-            {"id": "zone_africa_europe", "title": "🌍 Africa ↔ Europe — our specialty"},
+            {"id": "zone_africa_europe", "title": "🌍 Africa ↔ Europe"},
             {"id": "zone_europe",        "title": "🇪🇺 Europe ↔ Europe"},
-            {"id": "zone_depart_europe", "title": "🛫 Departure/arrival in Europe"},
-            {"id": "zone_other",         "title": "🌐 Other"},
+            {"id": "zone_depart_europe", "title": "🛫 Via Europe"},
+            {"id": "zone_other",         "title": "🌐 Other route"},
         ]
     else:
         body = with_bar("route_qualify", "🗺️ Votre vol était sur quelle route ?\n\nCela détermine si le règlement européen CE 261/2004 s'applique.")
         buttons = [
-            {"id": "zone_africa_europe", "title": "🌍 Afrique ↔ Europe — notre spécialité"},
+            {"id": "zone_africa_europe", "title": "🌍 Afrique ↔ Europe"},
             {"id": "zone_europe",        "title": "🇪🇺 Europe ↔ Europe"},
-            {"id": "zone_depart_europe", "title": "🛫 Départ ou arrivée en Europe"},
-            {"id": "zone_other",         "title": "🌐 Autre"},
+            {"id": "zone_depart_europe", "title": "🛫 Via Europe"},
+            {"id": "zone_other",         "title": "🌐 Autre route"},
         ]
     # WhatsApp = max 3 boutons → on bascule en liste si 4
     if len(buttons) > 3:
@@ -677,9 +677,9 @@ def ask_incident_type(phone, lang="fr"):
     else:
         body = with_bar("incident_type", "✈️ Que s'est-il passé avec votre vol ?")
         buttons = [
-            {"id": "inc_delay",  "title": "⏱️ Retard à l'arrivée"},
+            {"id": "inc_delay",  "title": "⏱️ Retard"},
             {"id": "inc_cancel", "title": "❌ Annulation"},
-            {"id": "inc_denied", "title": "🚫 Refus d'embarquement"},
+            {"id": "inc_denied", "title": "🚫 Refus embarquement"},
         ]
     send_whatsapp_buttons(phone, body, buttons)
 
@@ -1007,7 +1007,7 @@ def ask_minors(phone, conv):
             body    = with_bar("minor_check", "👤 Êtes-vous majeur(e) (18+ ans) ?")
             buttons = [
                 {"id": "minor_no",   "title": "✅ Oui, majeur(e)"},
-                {"id": "minor_self", "title": "👶 Non, je suis mineur(e)"},
+                {"id": "minor_self", "title": "👶 Je suis mineur(e)"},
             ]
     else:
         if lang == "en":
