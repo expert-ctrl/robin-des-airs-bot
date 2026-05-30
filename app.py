@@ -2580,9 +2580,11 @@ def webhook():
                         # Confirmer les infos lues
                         airline_display = conv["data"].get("airline","?")
                         route_display   = conv["data"].get("route","")
+                        pnr_display = conv["data"].get("pnr", "")
                         if lang == "en":
                             confirm = with_bar("doc_confirm", (
                                 f"✅ *Document read!*\n\n"
+                                + (f"🔑 PNR : *{pnr_display}*\n" if pnr_display else "") +
                                 f"✈️ Flight: *{fn or '?'}* — {airline_display}\n"
                                 f"📅 Date: *{conv['data'].get('flight_date','?')}*\n"
                                 f"👤 Passenger: *{info.get('passenger_name','?')}*\n"
@@ -2592,6 +2594,7 @@ def webhook():
                         else:
                             confirm = with_bar("doc_confirm", (
                                 f"✅ *Document lu !*\n\n"
+                                + (f"🔑 PNR : *{pnr_display}*\n" if pnr_display else "") +
                                 f"✈️ Vol : *{fn or '?'}* — {airline_display}\n"
                                 f"📅 Date : *{conv['data'].get('flight_date','?')}*\n"
                                 f"👤 Passager : *{info.get('passenger_name','?')}*\n"
