@@ -1920,7 +1920,9 @@ def process_button_reply(phone, button_id, button_title, conv):
     touch_activity(conv)
 
     # ── MSG 1 — ACCROCHE → LANGUE ───────────────────────────────
-    if button_id == "start_check":
+    # Wati peut envoyer l'ID "start_check" OU le titre du bouton OU "1"
+    check_keywords = ("vérifier", "verifier", "check", "start", "commencer", "droits", "rights", "indemnité", "indemnite")
+    if button_id in ("start_check", "1") or button_title in ("start_check",) or any(k in button_title for k in check_keywords):
         conv["current_step"] = "language"
         ask_language(phone)
         return
