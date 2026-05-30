@@ -412,6 +412,23 @@ def _fp_list(body, label, sections, hdr, ftr):
 # WATI — ENVOI
 # ============================================
 
+def _wati_ok(r):
+    """True si Wati a réellement accepté le message (HTTP 200 ET ok:true/result:success)."""
+    if r.status_code != 200:
+        return False
+    try:
+        j = r.json()
+        # Format nouveau : {"ok": true, ...}
+        if "ok" in j:
+            return bool(j["ok"])
+        # Format ancien : {"result": "success"} ou {"result": false, "info": "..."}
+        if "result" in j:
+            return j["result"] not in (False, "false", "error")
+    except Exception:
+        pass
+    return True  # pas de JSON → on fait confiance au HTTP 200
+
+
 def send_whatsapp_text(phone, message, *, skip_outbound_dedup=False):
     message = message.strip()
     if not message: return 0
@@ -421,24 +438,29 @@ def send_whatsapp_text(phone, message, *, skip_outbound_dedup=False):
     url  = f"{WATI_BASE_URL}/api/v1/sendSessionMessage/{phone}"
     hdrs = {"Authorization": f"Bearer {WATI_API_TOKEN}", "accept": "*/*"}
     r = _wati_session.post(url, headers=hdrs, params={"messageText": message}, timeout=30)
-    print(f"Wati TEXT: {r.status_code}")
-    if r.status_code == 200 and not skip_outbound_dedup:
+    ok = _wati_ok(r)
+    print(f"Wati TEXT: {r.status_code} ok={ok}")
+    if ok and not skip_outbound_dedup:
         _register_outbound_success(phone, step, "text", fp)
-    return r.status_code
+    return r.status_code if ok else 0
 
 
 def send_whatsapp_buttons(phone, body_text, buttons, header_text=None, footer_text=None):
     url  = f"{WATI_BASE_URL}/api/v1/sendInteractiveButtonsMessage"
     hdrs = {"Authorization": f"Bearer {WATI_API_TOKEN}", "Content-Type": "application/json", "accept": "*/*"}
-    payload = {"body": body_text, "buttons": [{"text": b["title"]} for b in buttons[:3]]}
+    # Tronquer les titres à 20 chars (limite Wati)
+    safe_buttons = [{"text": b["title"][:20]} for b in buttons[:3]]
+    payload = {"body": body_text, "buttons": safe_buttons}
     if header_text: payload["header"] = header_text
     if footer_text: payload["footer"] = footer_text
     step = _conversation_step_for_phone(phone)
     fp   = _fp_buttons(body_text, buttons, header_text, footer_text)
     if _outbound_should_block(phone, step, "buttons", fp): return 429
     r = _wati_session.post(url, headers=hdrs, params={"whatsappNumber": phone}, json=payload, timeout=30)
-    print(f"Wati BUTTONS: {r.status_code} - {r.text[:150]}")
-    if r.status_code != 200:
+    ok = _wati_ok(r)
+    print(f"Wati BUTTONS: {r.status_code} ok={ok} - {r.text[:150]}")
+    if not ok:
+        # Fallback texte numéroté
         fallback = body_text + "\n\n" + "\n".join(f"{i+1}. {b['title']}" for i, b in enumerate(buttons))
         fallback += "\n\nRépondez avec le numéro de votre choix."
         send_whatsapp_text(phone, fallback, skip_outbound_dedup=True)
@@ -450,27 +472,38 @@ def send_whatsapp_buttons(phone, body_text, buttons, header_text=None, footer_te
 def send_whatsapp_list(phone, body_text, button_label, sections, header_text=None, footer_text=None):
     url  = f"{WATI_BASE_URL}/api/v1/sendInteractiveListMessage"
     hdrs = {"Authorization": f"Bearer {WATI_API_TOKEN}", "Content-Type": "application/json", "accept": "*/*"}
+    # Limites Wati : max 10 rows total, titres ≤ 24 chars, label bouton ≤ 20 chars
     normalized = []
+    total_rows = 0
     for sec in sections:
         rows = []
         for row in sec.get("rows", []):
+            if total_rows >= 10: break
             rid = row.get("id") or row.get("rowId") or ""
-            rows.append({"id": rid, "rowId": rid, "title": row.get("title",""), "description": row.get("description","")})
-        normalized.append({"title": sec.get("title",""), "rows": rows})
-    payload = {"body": body_text, "buttonText": button_label, "sections": normalized}
+            rows.append({
+                "id": rid, "rowId": rid,
+                "title": row.get("title","")[:24],
+                "description": row.get("description","")[:72]
+            })
+            total_rows += 1
+        if rows:
+            normalized.append({"title": sec.get("title","")[:24], "rows": rows})
+    payload = {"body": body_text, "buttonText": button_label[:20], "sections": normalized}
     if header_text: payload["header"] = header_text
     if footer_text: payload["footer"] = footer_text
     step = _conversation_step_for_phone(phone)
     fp   = _fp_list(body_text, button_label, sections, header_text, footer_text)
     if _outbound_should_block(phone, step, "list", fp): return 429
     r = _wati_session.post(url, headers=hdrs, params={"whatsappNumber": phone}, json=payload, timeout=30)
-    print(f"Wati LIST: {r.status_code} - {r.text[:150]}")
-    if r.status_code != 200:
+    ok = _wati_ok(r)
+    print(f"Wati LIST: {r.status_code} ok={ok} - {r.text[:150]}")
+    if not ok:
         fallback = body_text + "\n\n"
         idx = 1
         for sec in sections:
-            for row in sec["rows"]:
-                fallback += f"{idx}. {row['title']}\n"
+            for row in sec.get("rows",[]):
+                if idx > 10: break
+                fallback += f"{idx}. {row.get('title','')}\n"
                 idx += 1
         fallback += "\nRépondez avec le numéro de votre choix."
         send_whatsapp_text(phone, fallback, skip_outbound_dedup=True)
