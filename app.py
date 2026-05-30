@@ -1919,6 +1919,62 @@ def process_button_reply(phone, button_id, button_title, conv):
     lang = conv["data"].get("language", "fr")
     touch_activity(conv)
 
+    # ── NORMALISATION POSITION → ID ─────────────────────────────
+    # Wati renvoie parfois la position du bouton ("1","2","3","4")
+    # au lieu de l'ID configuré. On convertit selon l'étape courante.
+    current_step = conv.get("current_step")
+    step_position_map = {
+        "route_qualify":         {"1": "zone_africa_europe", "2": "zone_europe", "3": "zone_depart_europe", "4": "zone_other"},
+        "incident_type":         {"1": "inc_delay",     "2": "inc_cancel",     "3": "inc_denied"},
+        "delay_duration":        {"1": "delay_3plus",   "2": "delay_lt3",      "3": "delay_unknown"},
+        "flight_type":           {"1": "type_direct",   "2": "type_connection"},
+        "doc_confirm":           {"1": "doc_confirm_yes",  "2": "doc_confirm_no"},
+        "passenger_confirm":     {"1": "pax_confirm_yes",  "2": "pax_confirm_no"},
+        "flight_number_confirm": {"1": "fn_confirm_yes",   "2": "fn_confirm_no"},
+        "flight_date_confirm":   {"1": "date_confirm_yes", "2": "date_confirm_no"},
+        "minor_check":           {"1": "minor_no",      "2": "minor_yes"},
+        "recap":                 {"1": "recap_ok",      "2": "recap_modify"},
+        "trip_select":           {"1": "trip_outbound", "2": "trip_return",    "3": "trip_both"},
+    }
+    if button_id in ("1", "2", "3", "4") and current_step in step_position_map:
+        button_id = step_position_map[current_step].get(button_id, button_id)
+    # Passagers (liste 1-6) : position → pax_N (6 = pax_more)
+    if current_step == "passengers" and button_id in ("1", "2", "3", "4", "5", "6"):
+        button_id = "pax_more" if button_id == "6" else f"pax_{button_id}"
+    # Cas particulier mineurs : avec 1 seul passager, le 2e bouton = "minor_self"
+    if current_step == "minor_check" and button_id == "minor_yes" and conv["data"].get("passengers") == 1:
+        button_id = "minor_self"
+
+    # ── FALLBACK MOTS-CLÉS pour les confirmations OUI/NON ───────
+    _yes_kw = ("oui", "yes", "correct", "bon", "ok")
+    _no_kw  = ("corriger", "correct it", "non", "no", "modif", "modify")
+    _confirm_steps = {
+        "passenger_confirm":     ("pax_confirm_yes", "pax_confirm_no"),
+        "flight_number_confirm": ("fn_confirm_yes", "fn_confirm_no"),
+        "flight_date_confirm":   ("date_confirm_yes", "date_confirm_no"),
+        "doc_confirm":           ("doc_confirm_yes", "doc_confirm_no"),
+    }
+    if current_step in _confirm_steps and button_id not in _confirm_steps[current_step]:
+        yes_id, no_id = _confirm_steps[current_step]
+        if any(k in button_title for k in _no_kw):
+            button_id = no_id
+        elif any(k in button_title for k in _yes_kw):
+            button_id = yes_id
+
+    # ── FALLBACK MOTS-CLÉS pour le récap ────────────────────────
+    if current_step == "recap" and button_id not in ("recap_ok", "recap_modify"):
+        if any(k in button_title for k in ("modif", "modify", "corriger")):
+            button_id = "recap_modify"
+        elif any(k in button_title for k in ("correct", "tout", "all")):
+            button_id = "recap_ok"
+
+    # ── FALLBACK MOTS-CLÉS pour les mineurs ─────────────────────
+    if current_step == "minor_check" and button_id not in ("minor_no", "minor_yes", "minor_self"):
+        if any(k in button_title for k in ("majeur", "adult", "tous", "over 18")):
+            button_id = "minor_no"
+        elif any(k in button_title for k in ("mineur", "minor")):
+            button_id = "minor_self" if conv["data"].get("passengers") == 1 else "minor_yes"
+
     # ── MSG 1 — ACCROCHE → LANGUE ───────────────────────────────
     # Wati peut envoyer l'ID "start_check" OU le titre du bouton OU "1"
     check_keywords = ("vérifier", "verifier", "check", "start", "commencer", "droits", "rights", "indemnité", "indemnite")
@@ -1928,7 +1984,7 @@ def process_button_reply(phone, button_id, button_title, conv):
         return
 
     # ── FALLBACK IA — DEMANDE RAPPEL EXPERT ─────────────────────
-    if button_id == "rappel_expert":
+    if button_id == "rappel_expert" or any(k in button_title for k in ("rappel", "call", "expert", "rappelé", "called back")):
         conv["data"]["dossier_status"] = "escalade_expert"
         conv["data"]["escalade_reason"] = "demande_rappel"
         if lang == "en":
@@ -1984,13 +2040,13 @@ def process_button_reply(phone, button_id, button_title, conv):
         return
 
     # ── MSG 3 — ZONE (qualification route) ──────────────────────
-    if button_id == "zone_africa_europe":
+    if button_id == "zone_africa_europe" or (current_step == "route_qualify" and any(k in button_title for k in ("afrique", "africa", "europe", "spécialité", "specialite"))):
         conv["data"]["route_zone"]  = "africa_europe"
         conv["current_step"]        = "incident_type"
         ask_incident_type(phone, lang)
         return
 
-    if button_id == "zone_europe":
+    if button_id == "zone_europe" or (current_step == "route_qualify" and any(k in button_title for k in ("intra", "within"))):
         conv["data"]["route_zone"]  = "europe"
         conv["current_step"]        = "incident_type"
         if lang == "en":
@@ -2001,7 +2057,7 @@ def process_button_reply(phone, button_id, button_title, conv):
         ask_incident_type(phone, lang)
         return
 
-    if button_id == "zone_depart_europe":
+    if button_id == "zone_depart_europe" or (current_step == "route_qualify" and any(k in button_title for k in ("via", "départ", "depart", "arrivée", "arrivee", "departure"))):
         conv["data"]["route_zone"]  = "depart_europe"
         conv["current_step"]        = "incident_type"
         if lang == "en":
@@ -2012,7 +2068,7 @@ def process_button_reply(phone, button_id, button_title, conv):
         ask_incident_type(phone, lang)
         return
 
-    if button_id == "zone_other":
+    if button_id == "zone_other" or (current_step == "route_qualify" and any(k in button_title for k in ("autre", "other"))):
         conv["data"]["dossier_status"] = "non_eligible"
         conv["data"]["non_eligibility_reason"] = "route_hors_europe"
         if lang == "en":
@@ -2039,6 +2095,13 @@ def process_button_reply(phone, button_id, button_title, conv):
         return
 
     # ── MSG 4 — INCIDENT ────────────────────────────────────────
+    if current_step == "incident_type" and button_id not in ("inc_delay", "inc_cancel", "inc_denied"):
+        if any(k in button_title for k in ("retard", "delay")):
+            button_id = "inc_delay"
+        elif any(k in button_title for k in ("annul", "cancel")):
+            button_id = "inc_cancel"
+        elif any(k in button_title for k in ("refus", "denied", "surbooking", "boarding")):
+            button_id = "inc_denied"
     if button_id in ("inc_delay", "inc_cancel", "inc_denied"):
         mapping = {"inc_delay": "delay", "inc_cancel": "cancel", "inc_denied": "denied"}
         conv["data"]["incident_type"] = mapping[button_id]
@@ -2053,6 +2116,13 @@ def process_button_reply(phone, button_id, button_title, conv):
         return
 
     # ── MSG 4 — DURÉE RETARD ────────────────────────────────────
+    if current_step == "delay_duration" and button_id not in ("delay_3plus", "delay_lt3", "delay_unknown"):
+        if any(k in button_title for k in ("plus", "more", "3h", "3 h")):
+            button_id = "delay_3plus"
+        elif any(k in button_title for k in ("moins", "less", "1h", "2h")):
+            button_id = "delay_lt3"
+        elif any(k in button_title for k in ("sais", "sure", "remember")):
+            button_id = "delay_unknown"
     if button_id == "delay_lt3":
         conv["data"]["dossier_status"] = "non_eligible"
         conv["data"]["non_eligibility_reason"] = "retard_trop_court"
@@ -2228,6 +2298,11 @@ def process_button_reply(phone, button_id, button_title, conv):
         return
 
     # ── MSG 6 — TYPE VOL → SCAN ─────────────────────────────────
+    if current_step == "flight_type" and button_id not in ("type_direct", "type_connection"):
+        if "direct" in button_title:
+            button_id = "type_direct"
+        elif any(k in button_title for k in ("escale", "connection", "correspondance")):
+            button_id = "type_connection"
     if button_id in ("type_direct", "type_connection"):
         conv["data"]["flight_type"] = "direct" if button_id == "type_direct" else "connection"
         send_motivation(phone, conv)
@@ -2371,11 +2446,34 @@ def webhook():
             btn_title = button_reply.get("title") or button_reply.get("text") or ""
             if is_duplicate_event(phone, data, f"button|{btn_id}|{btn_title}"):
                 return jsonify({"status": "duplicate"}), 200
-            if btn_id in ("trip_outbound", "trip_return", "trip_both"):
+            # Normalisation position → ID pour les boutons interceptés tôt
+            _step = conv.get("current_step")
+            if btn_id in ("1", "2", "3"):
+                if _step == "trip_select":
+                    btn_id = {"1": "trip_outbound", "2": "trip_return", "3": "trip_both"}.get(btn_id, btn_id)
+                elif _step == "doc_confirm":
+                    btn_id = {"1": "doc_confirm_yes", "2": "doc_confirm_no"}.get(btn_id, btn_id)
+            _btn_title_l = (btn_title or "").strip().lower()
+            if btn_id in ("trip_outbound", "trip_return", "trip_both") or (_step == "trip_select" and any(k in _btn_title_l for k in ("deux", "both", "aller", "outbound", "retour", "return"))):
+                if btn_id not in ("trip_outbound", "trip_return", "trip_both"):
+                    if any(k in _btn_title_l for k in ("deux", "both")):
+                        btn_id = "trip_both"
+                    elif any(k in _btn_title_l for k in ("retour", "return")):
+                        btn_id = "trip_return"
+                    else:
+                        btn_id = "trip_outbound"
                 _handle_trip_select(phone, btn_id, conv)
                 return jsonify({"status": "ok"}), 200
-            if btn_id in ("doc_confirm_yes", "doc_confirm_no"):
-                _handle_doc_confirm(phone, btn_id == "doc_confirm_yes", conv)
+            _doc_no  = any(k in _btn_title_l for k in ("corriger", "correct it", "non", "no"))
+            _doc_yes = any(k in _btn_title_l for k in ("oui", "yes", "bon")) and not _doc_no
+            if btn_id in ("doc_confirm_yes", "doc_confirm_no") or (_step == "doc_confirm" and (_doc_yes or _doc_no)):
+                if btn_id == "doc_confirm_yes":
+                    _yes = True
+                elif btn_id == "doc_confirm_no":
+                    _yes = False
+                else:
+                    _yes = _doc_yes
+                _handle_doc_confirm(phone, _yes, conv)
                 return jsonify({"status": "ok"}), 200
             process_button_reply(phone, btn_id, btn_title, conv)
             return jsonify({"status": "ok"}), 200
