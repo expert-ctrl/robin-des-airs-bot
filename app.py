@@ -623,7 +623,7 @@ def send_welcome_hook(phone, conv):
             "• *Vers l'Europe* — si la compagnie est européenne\n\n"
             "*0€ si on ne gagne pas. Aucun risque pour vous.*"
         ))
-        buttons = [{"id": "start_check", "title": "✈️ Vérifier mes droits"}]
+        buttons = [{"id": "start_check", "title": "✅ Vérifier droits"}]
     send_whatsapp_buttons(phone, body, buttons)
 
 
@@ -2465,6 +2465,7 @@ def webhook():
                 phone,
                 'Extract from this travel document and reply ONLY with valid JSON: '
                 '{"flight_number":"...","date":"DD/MM/YYYY","departure_time":"HH:MM","passenger_name":"...","airline":"...","marketing_carrier_iata":"...","operating_carrier_iata":"...","pnr":"...","origin":"IATA_CODE","destination":"IATA_CODE","return_flight_number":"...","return_date":"..."}. '
+                'For date: boarding passes often show only DD/MM or DD MON (e.g. "30 MAI" or "30/05") without the year — in that case infer the most likely year: if the date has not yet passed this year use current year, else use previous year. Always output full DD/MM/YYYY. '
                 'departure_time = scheduled departure time on the card (HH:MM). origin/destination = 3-letter IATA airport codes. '
                 'marketing_carrier_iata = 2-letter code of the marketing/ticketing carrier. '
                 'operating_carrier_iata = 2-letter code of the operating carrier ONLY if "Operated by / Opéré par" is printed (codeshare), else "". '
@@ -2481,7 +2482,21 @@ def webhook():
                             conv["data"]["flight_number"] = fn
                             guessed = guess_airline(fn)
                             if guessed: conv["data"]["airline"] = guessed
-                        if info.get("date"):    conv["data"]["flight_date"] = info["date"]
+                        if info.get("date"):
+                            raw_date = info["date"].strip()
+                            # Si pas d'année (ex: "30/05" ou "30 MAI"), déduire l'année
+                            if raw_date and not re.search(r'\b(20\d{2})\b', raw_date):
+                                try:
+                                    now = datetime.now()
+                                    # Essayer DD/MM
+                                    dt = datetime.strptime(raw_date, "%d/%m")
+                                    dt = dt.replace(year=now.year)
+                                    if dt < now:
+                                        dt = dt.replace(year=now.year - 1)
+                                    raw_date = dt.strftime("%d/%m/%Y")
+                                except ValueError:
+                                    pass  # Garder tel quel si format inconnu
+                            conv["data"]["flight_date"] = raw_date
                         if info.get("airline"): conv["data"]["airline"]     = info["airline"]
                         if info.get("marketing_carrier_iata"):
                             conv["data"]["marketing_carrier_iata"] = re.sub(r"[^A-Za-z]", "", info["marketing_carrier_iata"]).upper()
