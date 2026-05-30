@@ -610,7 +610,7 @@ def send_welcome_hook(phone, conv):
             "• Flights *arriving in Europe* with a *European airline*\n\n"
             "*€0 if we don't win. No risk for you.*"
         ))
-        buttons = [{"id": "start_check", "title": "🚀 Check my rights"}]
+        buttons = [{"id": "start_check", "title": "✈️ Check my rights"}]
     else:
         stat = STAT_VARIANTS[idx % len(STAT_VARIANTS)]
         body = with_bar("welcome", (
@@ -623,7 +623,7 @@ def send_welcome_hook(phone, conv):
             "• *Vers l'Europe* — si la compagnie est européenne\n\n"
             "*0€ si on ne gagne pas. Aucun risque pour vous.*"
         ))
-        buttons = [{"id": "start_check", "title": "Vérifier mes droits"}]
+        buttons = [{"id": "start_check", "title": "✈️ Vérifier mes droits"}]
     send_whatsapp_buttons(phone, body, buttons)
 
 
