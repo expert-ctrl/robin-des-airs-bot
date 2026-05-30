@@ -610,7 +610,7 @@ def send_welcome_hook(phone, conv):
             "• Flights *arriving in Europe* with a *European airline*\n\n"
             "*€0 if we don't win. No risk for you.*"
         ))
-        buttons = [{"id": "start_check", "title": "🚀 Check my compensation"}]
+        buttons = [{"id": "start_check", "title": "🚀 Check my rights"}]
     else:
         stat = STAT_VARIANTS[idx % len(STAT_VARIANTS)]
         body = with_bar("welcome", (
@@ -623,7 +623,7 @@ def send_welcome_hook(phone, conv):
             "• *Vers l'Europe* — si la compagnie est européenne\n\n"
             "*0€ si on ne gagne pas. Aucun risque pour vous.*"
         ))
-        buttons = [{"id": "start_check", "title": "🚀 Vérifier mon indemnité"}]
+        buttons = [{"id": "start_check", "title": "🚀 Vérifier mes droits"}]
     send_whatsapp_buttons(phone, body, buttons)
 
 
@@ -1277,7 +1277,7 @@ def send_ia_fallback(phone, lang="fr"):
             "Or would you prefer an *expert to call you back*?"
         )
         buttons = [
-            {"id": "start_check",  "title": "📋 Start my file"},
+            {"id": "start_check",  "title": "📋 Start my file"},  # 15 chars OK
             {"id": "rappel_expert","title": "📞 Be called back"},
         ]
     else:
@@ -1288,7 +1288,7 @@ def send_ia_fallback(phone, lang="fr"):
             "Ou préférez-vous qu'un *expert vous rappelle* ?"
         )
         buttons = [
-            {"id": "start_check",  "title": "📋 Démarrer mon dossier"},
+            {"id": "start_check",  "title": "📋 Mon dossier"},
             {"id": "rappel_expert","title": "📞 Être rappelé"},
         ]
     send_whatsapp_buttons(phone, body, buttons)
@@ -2563,9 +2563,11 @@ def webhook():
                                     f"({info.get('return_date','?')})\n\n"
                                     f"Which trip are you claiming for?"
                                 ))
+                                orig = info.get('origin','?')[:3]
+                                dest = info.get('destination','?')[:3]
                                 buttons = [
-                                    {"id": "trip_outbound", "title": f"1️⃣ {info.get('origin','?')} → {info.get('destination','?')}"[:24]},
-                                    {"id": "trip_return",   "title": f"2️⃣ {info.get('destination','?')} → {info.get('origin','?')}"[:24]},
+                                    {"id": "trip_outbound", "title": f"1️⃣ {orig} → {dest}"},
+                                    {"id": "trip_return",   "title": f"2️⃣ {dest} → {orig}"},
                                     {"id": "trip_both",     "title": "🔄 Both trips"},
                                 ]
                             else:
@@ -2577,9 +2579,11 @@ def webhook():
                                     f"({info.get('return_date','?')})\n\n"
                                     f"Pour quel trajet réclamez-vous ?"
                                 ))
+                                orig = info.get('origin','?')[:3]
+                                dest = info.get('destination','?')[:3]
                                 buttons = [
-                                    {"id": "trip_outbound", "title": f"1️⃣ {info.get('origin','?')} → {info.get('destination','?')}"[:24]},
-                                    {"id": "trip_return",   "title": f"2️⃣ {info.get('destination','?')} → {info.get('origin','?')}"[:24]},
+                                    {"id": "trip_outbound", "title": f"1️⃣ {orig} → {dest}"},
+                                    {"id": "trip_return",   "title": f"2️⃣ {dest} → {orig}"},
                                     {"id": "trip_both",     "title": "🔄 Les deux trajets"},
                                 ]
                             send_whatsapp_buttons(phone, body, buttons)
