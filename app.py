@@ -1987,19 +1987,25 @@ def process_button_reply(phone, button_id, button_title, conv):
     if button_id == "rappel_expert" or any(k in button_title for k in ("rappel", "call", "expert", "rappelé", "called back")):
         conv["data"]["dossier_status"] = "escalade_expert"
         conv["data"]["escalade_reason"] = "demande_rappel"
+        conv["current_step"] = "rappel_numero"
         if lang == "en":
             send_whatsapp_text(phone, (
-                "📱 *A Robin des Airs expert is contacting you.*\n"
-                "Keep this conversation open — they'll write to you directly here.\n"
-                "_The Robin des Airs team_"
+                "📱 *An expert will call you back!*\n\n"
+                "We'll call you on this WhatsApp number by default.\n\n"
+                "📞 Is this the right number, or would you prefer another?\n"
+                "_(Type your number or reply *yes* to confirm this one)_"
             ))
         else:
             send_whatsapp_text(phone, (
-                "📱 *Un expert Robin des Airs vous contacte.*\n"
-                "Laissez cette conversation ouverte — il vous écrit directement ici.\n"
-                "_L'équipe Robin des Airs_"
+                "📱 *Un expert vous rappelle !*\n\n"
+                "Nous vous rappelons sur ce numéro WhatsApp par défaut.\n\n"
+                "📞 C'est le bon numéro ou vous préférez un autre ?\n"
+                "_(Tapez votre numéro ou répondez *oui* pour confirmer celui-ci)_"
             ))
         return
+
+    # ── RAPPEL — CONFIRMATION NUMÉRO ────────────────────────────
+    # (géré dans le webhook section texte, step="rappel_numero")
 
     # ── MSG 2 — LANGUE ──────────────────────────────────────────
     if button_id.startswith("lang_soon_"):
@@ -2521,6 +2527,23 @@ def webhook():
         current_step = conv.get("current_step")
         txt_lower    = message_text.strip().lower()
 
+        # ── CONFIRMATION NUMÉRO RAPPEL ───────────────────────────
+        if current_step == "rappel_numero":
+            is_confirm = txt_lower in ("oui", "yes", "ok", "correct", "ce numéro", "ce numero", "celui-ci")
+            import re as _re
+            phone_match = _re.search(r'\+?\d[\d\s\-]{7,}', message_text)
+            if is_confirm or not phone_match:
+                rappel_phone = _mandat_wa_display(phone)
+            else:
+                rappel_phone = _re.sub(r'[\s\-]', '', phone_match.group())
+            conv["data"]["rappel_phone"] = rappel_phone
+            conv["current_step"] = None
+            if lang == "en":
+                send_whatsapp_text(phone, f"✅ *Got it!* An expert will call you at *{rappel_phone}* shortly.\n\nIn the meantime, you can open your file by typing *menu*. 👇")
+            else:
+                send_whatsapp_text(phone, f"✅ *Noté !* Un expert vous rappelle au *{rappel_phone}* très prochainement.\n\nEn attendant, vous pouvez ouvrir votre dossier en tapant *menu*. 👇")
+            return jsonify({"status": "ok"}), 200
+
         # ── RESET / MENU ─────────────────────────────────────────
         if txt_lower in ("nouveau", "new", "reset", "/reset", "recommencer"):
             if phone in conversations:
@@ -2553,6 +2576,13 @@ def webhook():
             conv["current_step"] = "welcome"
             send_welcome_hook(phone, conv)
             return jsonify({"status": "flow started"}), 200
+
+        # ── CLIENT TAPE UN NUMÉRO BRUT → OUVRIR DOSSIER ──────────
+        if current_step == "welcome" and re.match(r'^\+?\d[\d\s\-]{6,}$', message_text.strip()):
+            # Numéro de téléphone → démarrer le flux directement
+            conv["current_step"] = "language"
+            ask_language(phone)
+            return jsonify({"status": "ok"}), 200
 
         if message_text and not conv["data"].get("preferred_language"):
             conv["data"]["language"] = detect_language(message_text)
